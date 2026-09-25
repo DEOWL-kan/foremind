@@ -1,0 +1,26 @@
+{
+  "session_id": "7e068738-6aef-451c-88b8-d9fc42ff3c5e",
+  "transcript_path": "~/.claude/projects/-Users-me-foremind-wt-M1-0-research-m1-0-sandbox-hooks-log/7e068738-6aef-451c-88b8-d9fc42ff3c5e.jsonl",
+  "cwd": "~/foremind-wt/M1-0/research/m1-0/sandbox/hooks-log",
+  "prompt_id": "46047e2b-aada-44eb-b193-9cf89a9f360d",
+  "permission_mode": "default",
+  "effort": {
+    "level": "low"
+  },
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Write",
+  "tool_input": {
+    "file_path": "~/foremind-wt/M1-0/research/m1-0/sandbox/hooks-log/hello.txt",
+    "content": "hi"
+  },
+  "tool_response": {
+    "type": "update",
+    "filePath": "~/foremind-wt/M1-0/research/m1-0/sandbox/hooks-log/hello.txt",
+    "content": "hi",
+    "structuredPatch": [],
+    "originalFile": "hi",
+    "userModified": false
+  },
+  "tool_use_id": "toolu_01KpWKM72NxMiYEe6A7hUwaM",
+  "duration_ms": 13
+}

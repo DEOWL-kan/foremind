@@ -1,0 +1,25 @@
+{
+  "session_id": "7e068738-6aef-451c-88b8-d9fc42ff3c5e",
+  "transcript_path": "~/.claude/projects/-Users-me-foremind-wt-M1-0-research-m1-0-sandbox-hooks-log/7e068738-6aef-451c-88b8-d9fc42ff3c5e.jsonl",
+  "cwd": "~/foremind-wt/M1-0/research/m1-0/sandbox/hooks-log",
+  "prompt_id": "46047e2b-aada-44eb-b193-9cf89a9f360d",
+  "permission_mode": "default",
+  "effort": {
+    "level": "low"
+  },
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "echo done",
+    "description": "Print done"
+  },
+  "tool_response": {
+    "stdout": "done",
+    "stderr": "",
+    "interrupted": false,
+    "isImage": false,
+    "noOutputExpected": false
+  },
+  "tool_use_id": "toolu_0199zm5c2S1CWYdbmthMoaF4",
+  "duration_ms": 149
+}

@@ -1,0 +1,42 @@
+{
+  "session_id": "7e068738-6aef-451c-88b8-d9fc42ff3c5e",
+  "transcript_path": "~/.claude/projects/-Users-me-foremind-wt-M1-0-research-m1-0-sandbox-hooks-log/7e068738-6aef-451c-88b8-d9fc42ff3c5e.jsonl",
+  "cwd": "~/foremind-wt/M1-0/research/m1-0/sandbox/hooks-log",
+  "prompt_id": "46047e2b-aada-44eb-b193-9cf89a9f360d",
+  "permission_mode": "default",
+  "effort": {
+    "level": "low"
+  },
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Edit",
+  "tool_input": {
+    "file_path": "~/foremind-wt/M1-0/research/m1-0/sandbox/hooks-log/hello.txt",
+    "old_string": "hi",
+    "new_string": "hello",
+    "replace_all": false
+  },
+  "tool_response": {
+    "filePath": "~/foremind-wt/M1-0/research/m1-0/sandbox/hooks-log/hello.txt",
+    "oldString": "hi",
+    "newString": "hello",
+    "originalFile": "hi",
+    "structuredPatch": [
+      {
+        "oldStart": 1,
+        "oldLines": 1,
+        "newStart": 1,
+        "newLines": 1,
+        "lines": [
+          "-hi",
+          "\\ No newline at end of file",
+          "+hello",
+          "\\ No newline at end of file"
+        ]
+      }
+    ],
+    "userModified": false,
+    "replaceAll": false
+  },
+  "tool_use_id": "toolu_01EhaPH4zKu2isUgL3Z9C69q",
+  "duration_ms": 2
+}

@@ -1,0 +1,5 @@
+.foremind/
+.wt/
+__pycache__/
+*.pyc
+ref/
