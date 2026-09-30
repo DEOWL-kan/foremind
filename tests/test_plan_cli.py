@@ -81,6 +81,7 @@ class PlanCliTest(ProjectCase):
             self.assertIn(f'<details id="b-{b}">', page)
             self.assertIn(f'href="#b-{b}"', page)
         self.assertIn("&lt;b&gt;粗体&lt;/b&gt;", page)
+        self.assertIn("<h2>目标</h2><pre>REQ-1: 做一件事\n</pre>", page)
         self.assertNotIn("<b>粗体", page)
 
     def test_html_marks_critical_path(self):
@@ -89,3 +90,7 @@ class PlanCliTest(ProjectCase):
         page = render.html(plan, validate(self.root, plan))
         self.assertEqual(page.count('class="node crit"'), 2)
         self.assertEqual(page.count('<line class="crit"'), 1)
+
+    def test_approve_prints_what_it_widens(self):
+        self.save(make_plan("w", [header("w.1", ["main:w.md"], config={"delivery": {"level": "merge_dev"}})]))
+        self.assertEqual(run(["plan", "approve", "w"])[:2], (0, "w: approved\n提示：批准将放宽 w.1 的 delivery.level\n"))

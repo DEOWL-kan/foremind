@@ -25,6 +25,15 @@ tools: [{"name": "<工具>", "step": "<用在哪一步>"}]
 
 <做成什么样算完；覆盖哪些 REQ；不做什么。>
 
+## 依据与未决
+
+每条标来源（用户确认 · 代码核实 · 实验验证 · 假设 · 未知），附指针；模型推断过的结论不写成用户确认。
+
+- 已确认的约束：<…>（来源）
+- 不能改变的：<必须保留的现有行为、接口>
+- 假设：<…>（影响小、可撤回才可沿用；否则先 `foremind decide --new`）
+- 未知：<…>（先查代码或做小实验；只有用户能定的走待决）
+
 ## 起点命令
 
 开工后先跑，结果应与下方「当前状态」一致（开席机械核验用同一套）：
@@ -73,5 +82,17 @@ tools: [{"name": "<工具>", "step": "<用在哪一步>"}]
   "next": ["<5. 最优先的下一步>", "<其余未完成义务>"],
   "unverified": ["<6. 待验证：…>"],
   "pointers": {"transcript": "<7. transcript 路径>", "turns": ["<关键轮次>"], "files": ["<仓库id>:<路径>:<行>"]}
+}
+```
+
+## 交付
+
+验收命令全部通过、在本批分支 commit 之后，`foremind review` 之前，用 `foremind log <批次> --file <文件>` 写一段 `## 交付说明`，其后跟一个 json 块（schema `delivery_notes`，三项必填，没有内容就写空列表；不合格时 `foremind log` 拒绝追加）。总控合入时由 `foremind land` 汇总：
+
+```json
+{
+  "config_keys": [{"key": "<新配置键>", "merge_class": "plain|union|repo_convention|authz", "default": "<缺省值，可省>", "why": "<用途>"}],
+  "design": [{"where": "<DESIGN 章节>", "text": "<补项>"}],
+  "leftovers": [{"item": "<转遗留条目>", "why": "<为什么这批不做>"}]
 }
 ```

@@ -16,6 +16,7 @@ from foremind.carriers import Carrier, SessionState
 from foremind.events import EventLog
 from foremind.lock import ExitEvidence
 from foremind.plan import model
+from foremind.supervisor import machine
 from foremind.supervisor import tick as sv
 from foremind.vendors import claude
 
@@ -29,19 +30,23 @@ def iso(t):
 
 
 class FakeJobs:
-    """job.start / job.status stand-ins: jobs run until the test finishes them."""
+    """job.start / job.status stand-ins: jobs run until the test finishes them. Ids stay j1, j2 …; one the caller
+    chose (`job_id`, tick.start_job's) reads the same job."""
 
     def __init__(self):
-        self.started, self.state, self.dirs = [], {}, {}
+        self.started, self.state, self.dirs, self.alias = [], {}, {}, {}
 
-    def start(self, job_dir, argv, *, cwd, env=None, timeout_s=None):
+    def start(self, job_dir, argv, *, cwd, env=None, timeout_s=None, job_id=None):
         jid = f"j{len(self.started) + 1}"
-        self.started.append({"id": jid, "argv": list(argv), "env": env or {}, "timeout_s": timeout_s})
+        self.started.append({"id": jid, "argv": list(argv), "env": env or {}, "timeout_s": timeout_s,
+                             "job_id": job_id})
         self.state[jid], self.dirs[jid] = {"state": "running"}, Path(job_dir) / jid
+        if job_id:
+            self.alias[job_id] = jid
         return jid
 
     def status(self, job_dir, jid):
-        return self.state[jid]
+        return self.state[self.alias.get(jid, jid)]
 
     def finish(self, n, code=0, stdout=""):
         jid = self.started[n]["id"]
@@ -104,8 +109,8 @@ class Base(unittest.TestCase):
                                                        "FOREMIND_WT_ROOT": str(self.tmp / "wt"),
                                                        "GIT_CONFIG_GLOBAL": str(self.tmp / "gitconfig"),
                                                        "GIT_CONFIG_NOSYSTEM": "1"}))
-        for k in ("FOREMIND_PROJECT", "FOREMIND_SESSION", "FOREMIND_ROLE", "FOREMIND_BATCH", "GIT_SSH_COMMAND",
-                  "GIT_SSH"):
+        for k in ("FOREMIND_PROJECT", "FOREMIND_SESSION", "FOREMIND_ROLE", "FOREMIND_BATCH", "FOREMIND_JOB",
+                  "GIT_SSH_COMMAND", "GIT_SSH"):
             os.environ.pop(k, None)
         self.enterContext(mock.patch("os.dup2"))  # the commands point fd 0 at /dev/null: not the test runner's
         self.now = time.time()
@@ -117,6 +122,8 @@ class Base(unittest.TestCase):
         self.rec = Recorder()
         self.enterContext(mock.patch.object(notify, "get", lambda root, cfg: self.rec))
         self.enterContext(mock.patch.object(review, "TIMEOUT_S", review.TIMEOUT_S))  # the commands set it
+        self.machine = {"load1": 0.5, "cpus": 8, "avail_mb": 65536.0, "errors": {}}  # REQ-6: never this host's
+        self.enterContext(mock.patch.object(machine, "read", lambda: dict(self.machine)))
 
     def user_config(self, text):
         (self.cfg_home / "config.toml").write_text(text)
@@ -434,15 +441,18 @@ class OnceTest(Base):
         lock.acquire(self.root, "p.1", "fm-s")
         self.beat("fm-s", "p.1", self.now)
         (self.root / ".foremind" / "batches" / "p.1.review.r2.json").write_text(json.dumps({
-            "verdict": "changes_requested", "issues": [{"severity": "must_fix", "location": "a.py:3",
-                                                        "summary": "off by one"}]}))
+            "verdict": "changes_requested", "issues": [
+                {"severity": "must_fix", "location": "a.py:3", "summary": "off by one"},
+                {"severity": "should_fix", "was": "must_fix", "filtered": "outside_delta", "location": "b.py:1",
+                 "summary": "old"}]}))
         self.carrier.idle = False
         self.tick()
         self.tick(30)
         msgs = self.pending("fm-s")
         self.assertEqual(len(msgs), 1)
-        self.assertIn("第 2 轮", msgs[0].text)
-        self.assertIn("a.py:3", msgs[0].text)
+        self.assertEqual(msgs[0].text, "Foremind：审查第 2 轮要求修改：\n- [must_fix] a.py:3：off by one\n"
+                                       "- [should_fix，原为 must_fix，outside_delta] b.py:1：old\n"
+                                       "改完提交，再执行 `foremind review`。", "m2e REQ-8: lowered ones show so")
         self.assertEqual(self.header("p.1")["state"], "running", "SF-1: fixing is running")
         self.carrier.alive["fm-s"] = False  # the seat dies while fixing
         self.tick(60)
@@ -480,13 +490,16 @@ class OnceTest(Base):
         self.assertEqual(self.jobs.cmds(), [["gate", "p.1"]] * 2)
         self.assertEqual(self.rec.sent, [], "not a full block: the supervisor itself merges it")
         self.jobs.finish(1, code=1)
-        for at in (11, 21, 31):
+        self.tick(21 * M)
+        self.assertEqual(len(self.jobs.started), 3, "an error (exit 2) is no failed check (M1-7-r3 note 7)")
+        self.jobs.finish(2, code=1)
+        for at in (31, 41):
             self.tick(at * M)
-        self.assertEqual(len(self.jobs.started), 2, "retries used up (supervisor.seat_retries)")
+        self.assertEqual(len(self.jobs.started), 3, "retries used up (supervisor.seat_retries)")
         self.assertEqual([t for t, _, _ in self.rec.sent if "合入" in t], ["p.1 合入失败"])
         sv.request_run(self.root, ["p.1"])
-        self.tick(32 * M)
-        self.assertEqual(self.jobs.cmds(), [["gate", "p.1"]] * 3, "`foremind run` starts over")
+        self.tick(42 * M)
+        self.assertEqual(self.jobs.cmds(), [["gate", "p.1"]] * 4, "`foremind run` starts over")
 
 
 class RecoveryTest(Base):
@@ -521,7 +534,7 @@ class RecoveryTest(Base):
         self.tick(five=None)
         self.assertEqual([e.get("sent", "?") for e in self.events("notify", "result")], [None])
         self.assertEqual([(e["key"], e["title"], e["unknown"]) for e in self.events("notify_unsent")],
-                         [("k", "p.1 卡住", True)], "SF-11: the morning report sees it")
+                         [("k", "p.1 卡住", True)], "SF-11: the run report sees it")
         self.assertIsNone(notify.notify(self.root, {}, "k", "t", "b"))
         self.assertEqual(self.rec.sent, [])
 
@@ -665,6 +678,15 @@ class QuotaTickTest(Base):
         self.tick(60, five=None)
         self.assertEqual(self.jobs.cmds(), [["/usr/bin/true"], ["seat", "p.1"]])
 
+    def test_a_probe_success_with_the_7d_window_ahead_of_its_share_opens_no_seat(self):  # finding 27
+        self.plan("p")
+        self.telemetry(None, self.now, seven={"used_percentage": 50, "resets_at": self.now + 6 * 86400})  # share 29%
+        self.tick(five=None)  # 5h null (its window just reset): unknown, a probe
+        self.jobs.finish(0)
+        self.tick(60, five=None)
+        self.assertEqual(self.jobs.cmds(), [["/usr/bin/true"]], "low: no new seat")
+        self.assertIn(("long", "low"), [(e["group"], e["to"]) for e in self.events("quota_state")])
+
     def test_no_probe_on_an_excluded_model(self):
         self.user_config('[exclude]\nmodels = ["claude-opus-*"]\n')  # the default probe: the reviewer's model
         self.plan("p")
@@ -701,7 +723,7 @@ class QuotaTickTest(Base):
         self.hold("p.2", "fm-b")
         self.carrier.idle = False
         self.tick(five=95)
-        q = json.loads((self.root / ".foremind" / "quota.json").read_text())
+        q = json.loads((self.cfg_home / "quota.json").read_text())  # the account's, at the user level (m2b.10)
         self.assertEqual((q["groups"]["claude/long"]["state"], q["paused"]), ("exhausted", ["fm-a", "fm-b"]))
         self.assertEqual(q["groups"]["claude/oneshot"]["state"], "exhausted")
         self.tick(2 * H, five=None)
@@ -738,7 +760,8 @@ class StuckTickTest(Base):
         self.assertEqual(self.header("p.1")["state_prior"], "running")
         self.assertEqual((self.carrier.closed, lock.holder(self.root, "p.1")), (["fm-s"], None))
         self.assertEqual(self.jobs.cmds(), [["_successor", "p.1"]])
-        self.assertEqual([t for t, _, _ in self.rec.sent], ["p.1 卡住"])
+        self.assertEqual(self.rec.sent[0][:2], ("p.1 卡住", "已标记 stuck。旧会话已确认退出，正在开继任会话。"))
+        self.assertEqual(len(self.rec.sent), 1)
         self.tick(63 * M)
         self.assertEqual(len(self.jobs.started), 1)
         # MF-1: the successor is open (running again) but has not run `handoff --accept`: no second one
@@ -756,6 +779,26 @@ class StuckTickTest(Base):
         self.tick(125 * M)
         self.assertEqual(self.carrier.closed, ["fm-s", "fm-s2"])
         self.assertEqual(self.jobs.cmds(), [["_successor", "p.1"]] * 2)
+
+    def test_the_stuck_notice_says_what_the_successor_waits_for(self):  # m2e REQ-9
+        self.user_config('[quota]\nprobe_command = ["/usr/bin/true"]\n[supervisor]\nmax_seats = 1\n')
+        self.plan("q")
+        self.hold("p.1", "fm-s")
+        self.hold("q.1", "fm-q")
+        self.beat("fm-q", "q.1", self.now + 60 * M)
+        for at in (21, 41, 62):
+            self.tick(at * M)
+        self.assertEqual(self.header("p.1")["state"], "stuck")
+        self.assertEqual((self.jobs.started, [b for t, b, _ in self.rec.sent if t == "p.1 卡住"]),
+                         ([], ["已标记 stuck。旧会话已确认退出；继任在等名额（1/1）。"]))
+
+    def test_the_stuck_notice_says_the_successor_waits_for_the_machine(self):  # m2e REQ-9
+        self.hold("p.1", "fm-s")
+        self.machine.update(load1=100.0)
+        for at in (21, 41, 62):
+            self.tick(at * M)
+        self.assertEqual((self.jobs.started, [b for t, b, _ in self.rec.sent if t == "p.1 卡住"]),
+                         ([], ["已标记 stuck。旧会话已确认退出；继任在等整机负载降下来。"]))
 
     def test_no_exit_evidence_no_lock_break_until_the_close_is_confirmed(self):
         self.hold("p.1", "fm-s")

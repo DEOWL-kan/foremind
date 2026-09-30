@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import os
 import subprocess
 import sys
@@ -47,6 +48,24 @@ class CliTest(unittest.TestCase):
         self.addCleanup(sys.modules.pop, "foremind.commands.zz_probe", None)
         with mock.patch.object(commands, "__path__", [*commands.__path__, str(self.tmp)]):
             self.assertEqual(run(["zz-probe"]), (0, "probed\n", ""))
+
+    def test_a_broken_command_module_does_not_take_the_hook_down(self):  # m2b.2 item 10 (M1-5-r2 N-d)
+        root = self.tmp / "proj"
+        (root / ".foremind").mkdir(parents=True)
+        (self.tmp / "aa_broken.py").write_text("raise ImportError('boom')\n")
+        self.addCleanup(sys.modules.pop, "foremind.commands.aa_broken", None)
+        env = {"FOREMIND_PROJECT": str(root), "FOREMIND_SESSION": "fm-proj-b_1-1", "FOREMIND_ROLE": "seat",
+               "FOREMIND_BATCH": "", "FOREMIND_CONFIG_HOME": str(self.tmp / "cfg"),
+               "FOREMIND_WT_ROOT": str(self.tmp / "wt")}
+        data = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "cwd": str(root),
+                "tool_input": {"command": "foremind catalog apply out.json"}}
+        stdin = io.TextIOWrapper(io.BytesIO(json.dumps(data).encode()))
+        with mock.patch.object(commands, "__path__", [*commands.__path__, str(self.tmp)]), \
+                mock.patch.dict(os.environ, env), mock.patch("sys.stdin", stdin):
+            code, out, err = run(["hook", "PreToolUse"])
+        self.assertEqual(code, 0)
+        self.assertIn("skipped command module aa_broken: ImportError: boom", err)
+        self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "deny")
 
     def test_log(self):
         (self.tmp / ".foremind").mkdir()

@@ -4,11 +4,13 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from foremind import telemetry
+from foremind.commands import statusline
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -119,6 +121,52 @@ class StatuslineTest(unittest.TestCase):
         self.input["cwd"] = "/"
         self.assertEqual(self.statusline().returncode, 0)
         self.assertIsNone(telemetry.record_statusline(b"garbage"))
+
+    def test_wrong_types_are_ignored(self):
+        self.enterContext(mock.patch.dict(os.environ, self.env, clear=True))
+        for data in ({"cwd": 5, "session_id": "x"}, {"cwd": ["a"]}, {"cwd": str(self.root), "session_id": 7}, [1]):
+            self.assertIsNone(telemetry.record_statusline(json.dumps(data).encode()), data)
+
+    def test_command_runs_in_its_own_process_group(self):
+        self.assertNotEqual(int(statusline.run_wrapped("ps -o pgid= -p $$", b"")), os.getpgrp())
+
+    def test_timeout_kills_what_the_command_started(self):
+        pid_file, t = self.root / "pid", time.monotonic()
+        with mock.patch.object(statusline, "TIMEOUT_S", 0.5):  # the shell exits, its background child keeps stdout
+            self.assertIsNone(statusline.run_wrapped(f"sleep 30 & echo $! > {shlex.quote(str(pid_file))}", b""))
+        self.assertLess(time.monotonic() - t, 5)
+        pid = int(pid_file.read_text())
+        for _ in range(50):  # killed, then reaped by init
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            os.kill(pid, 9)
+            self.fail("the command's child outlived the timeout")
+
+    def test_stale_readings_of_other_sessions_go(self):
+        tel = self.root / ".foremind" / "telemetry"
+        tel.mkdir()
+        files = {"old-1": {"session": None, "agent_session_id": "old-1"},  # the only one to go
+                 "new-1": {"session": None, "agent_session_id": "new-1"},
+                 "fm-p-p.1-1": {"session": "fm-p-p.1-1", "agent_session_id": "old-2"},
+                 "renamed": {"session": None, "agent_session_id": "old-3"},
+                 "held": {"session": "fm-p-p.1-1", "agent_session_id": "held"},
+                 "nokey": {"agent_session_id": "nokey"}}
+        old = time.time() - (telemetry.STALE_DAYS + 1) * 86400
+        for name, s in files.items():
+            (tel / f"{name}.statusline.json").write_text(json.dumps(s))
+            if name != "new-1":
+                os.utime(tel / f"{name}.statusline.json", (old, old))
+        (tel / "junk.statusline.json").write_text("not json")
+        os.utime(tel / "junk.statusline.json", (old, old))
+        self.statusline(FOREMIND_SESSION="fm-p-p.2-1")  # a Foremind session's reading deletes nothing
+        self.assertTrue((tel / "old-1.statusline.json").exists())
+        self.statusline()
+        left = sorted(p.name.removesuffix(".statusline.json") for p in tel.glob("*.statusline.json"))
+        self.assertEqual(left, sorted(["abc-123", "fm-p-p.2-1", "junk", *files.keys() - {"old-1"}]))
 
     def test_project_config_cannot_set_the_command(self):
         (self.root / "foremind.toml").write_text('[statusline]\ncommand = "echo PWNED"\n')

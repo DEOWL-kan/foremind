@@ -1,4 +1,4 @@
-"""Builders shared by the test_plan_* modules (no tests here)."""
+"""Builders shared by the test_plan_* modules, and model.spec's own test."""
 import os
 import tempfile
 import unittest
@@ -48,3 +48,16 @@ class ProjectCase(unittest.TestCase):
         model.write_goal(self.root, plan.id, plan.goal)
         model.write(self.root, plan)
         return plan
+
+
+class SpecTest(unittest.TestCase):
+    def test_status_inside_a_fence_is_text(self):
+        body = "做什么\n```\n## 状态\n```\n~~~~md\n## 状态\n~~~\n仍在块里\n~~~~\n中间\n## 状态\n席位写的\n"
+        self.assertEqual(model.spec(body), "做什么\n```\n## 状态\n```\n~~~~md\n## 状态\n~~~\n仍在块里\n~~~~\n中间\n")
+        self.assertEqual(model.spec("a\n## 状态 \t\nb"), "a\n")
+        self.assertEqual(model.spec("## 状态"), "")
+        # a fence open to the end fences nothing: the section set_state appends after it is cut, every time
+        self.assertEqual(model.spec("a\n## 状态说明\n```\n## 状态\n"), "a\n## 状态说明\n```\n")
+        self.assertEqual(model.spec("a\n````\nb\n```\n## 状态\nx\n## 状态\ny\n"), "a\n````\nb\n```\n")
+        self.assertEqual(model.spec("a\n```\nb"), "a\n```\nb")
+        self.assertEqual(model.spec("a\r\n## 状态\r\n"), "a\r\n## 状态\r\n")  # as before: only \n ends a line

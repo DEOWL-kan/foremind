@@ -9,7 +9,8 @@ Presence is read with `list-panes`, which fails when the target is missing. Only
 evidence (MF-1). Empty output from a successful call is read as absent too.
 Text goes in as a bracketed paste (load-buffer + paste-buffer -p) and then Enter, so multi-line messages are not
 submitted line by line; tmux cannot confirm delivery, so send() returns None. Idle is a rough read: no window
-activity for quiet_s seconds (§10.3).
+activity for quiet_s seconds (§10.3). close() watches the pane processes, then the session's own process
+(Carrier._settled): a claude under a pane shell may outlive the pane.
 """
 import os
 import shlex
@@ -31,7 +32,6 @@ def _absent(stderr) -> bool:
 class TmuxCarrier(Carrier):
     name = "tmux"
     quiet_s = 3
-    exit_timeout_s = 15
 
     def __init__(self, root, cfg=None):
         super().__init__(root, cfg)
@@ -115,8 +115,7 @@ class TmuxCarrier(Carrier):
     def close(self, session):
         panes = self._panes(session)
         if not panes:
-            return ExitEvidence(session, self.name, "absent")
-        # ponytail: only the pane processes are watched (N-1); a tool child in its own process group may outlive them
+            return self._settled(session, ExitEvidence(session, self.name, "absent"))
         pids = [pid for _, _, pid in panes]
         r = self._tmux("kill-session", "-t", f"={session}", sock=self._sock(session), check=False)
         if r.returncode and not _absent(r.stderr):
@@ -124,7 +123,7 @@ class TmuxCarrier(Carrier):
         deadline = time.monotonic() + self.exit_timeout_s
         while time.monotonic() < deadline:
             if not any(_running(pid) for pid in pids):
-                return ExitEvidence(session, self.name, "pid_exited")
+                return self._settled(session, ExitEvidence(session, self.name, "pid_exited"))
             time.sleep(0.2)
         return None  # still running: not confirmed, so no lock break (§10.4)
 

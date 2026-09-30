@@ -8,7 +8,8 @@ Commands never see the seat's live worktree (§20 I50): each run checks the head
 afterwards. The checkout holds tracked files only: commands prepare their own dependencies. Each command
 runs as `sh -c` through job.start (timeout kills the whole group). A command is a string or {run, repo}:
 single-repo batches run in that repo's checkout, multi-repo batches in the directory holding the checkouts, and a
-command with `repo` in that repo's checkout.
+command with `repo` in that repo's checkout. Each result entry records that repo (none for the batch directory), so
+the gate binds a result to (repo, command), not the command text alone.
 """
 import json
 import shutil
@@ -17,17 +18,25 @@ import time
 from pathlib import Path
 
 from foremind import job, schemas
+from foremind.defaults import TABLE
 from foremind.fsutil import atomic_write, sha256_bytes
 from foremind.paths import state_dir
 from foremind.review import FlowError, batch_repos, checkout, drop_checkouts, events, heads, heads_hash, load_batch
 
 
 def commands(h, cfg, kind) -> list:
-    return h["accept_commands"] if kind == "accept" else cfg.get("gate.checks", [])
+    return h["accept_commands"] if kind == "accept" else cfg.get("gate.checks", TABLE["gate.checks"])
 
 
 def command_text(c):
     return c if isinstance(c, str) else c.get("run") if isinstance(c, dict) else None
+
+
+def command_repo(c, ids):
+    """Repo the command runs in: its `repo`, else the only repo of a single-repo batch; None = the directory holding
+    a multi-repo batch's checkouts."""
+    rid = c.get("repo") if isinstance(c, dict) else None
+    return rid if rid is not None else ids[0] if len(ids) == 1 else None
 
 
 def result_path(root, batch_id, kind, hd):
@@ -47,22 +56,22 @@ def run(root, batch_id, cfg, kind="accept") -> dict:
     if not cmds:
         raise FlowError(f"{batch_id}: no {kind} commands")
     ids = [r.id for r, _ in pairs]
-    todo = [(command_text(c), c.get("repo") if isinstance(c, dict) else None) for c in cmds]
+    todo = [(command_text(c), command_repo(c, ids)) for c in cmds]
     for c, (text, rid) in zip(cmds, todo):
         if not isinstance(text, str) or not text.strip() or (rid is not None and rid not in ids):
             raise FlowError(f"{batch_id}: bad {kind} command {c!r}")
     hd = heads(pairs)
     jobs = state_dir(root) / "jobs"
-    timeout = int(cfg.get("acceptance.timeout_min", 30)) * 60
+    timeout = int(cfg.get("acceptance.timeout_min", TABLE["acceptance.timeout_min"])) * 60
     tmp = Path(tempfile.mkdtemp(prefix=f"foremind-{batch_id}-{kind}-"))
     out = []
     try:
         checkout(pairs, hd, tmp)
         for text, rid in todo:
-            cwd = tmp / rid if rid else tmp / ids[0] if len(ids) == 1 else tmp
-            jid = job.start(jobs, ["/bin/sh", "-c", text], cwd=cwd, timeout_s=timeout)
+            jid = job.start(jobs, ["/bin/sh", "-c", text], cwd=tmp / rid if rid else tmp, timeout_s=timeout)
             code = wait(jobs, jid).get("exit_code", -1)  # a lost runner has no exit code
-            out.append({"command": text, "exit_code": code, "output_path": str(jobs / jid / "stdout.log")})
+            out.append({"command": text, **({"repo": rid} if rid else {}), "exit_code": code,
+                        "output_path": str(jobs / jid / "stdout.log")})
     finally:
         drop_checkouts(pairs, tmp)
         shutil.rmtree(tmp, ignore_errors=True)

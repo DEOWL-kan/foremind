@@ -1,5 +1,9 @@
-from foremind import schemas
+from unittest import mock
+
+from foremind import header as hdr
+from foremind import lock, schemas
 from foremind.events import EventLog
+from foremind.fsutil import atomic_write
 from foremind.plan import freeze, model
 from foremind.plan.model import Doc, PlanError
 from foremind.plan.validate import validate
@@ -53,6 +57,13 @@ class FreezeTest(ProjectCase):
         self.assertEqual(plan.doc.header["revisions"][0]["approved_by"], "user")
         self.assertEqual(plan.doc.header["revisions"][0]["goal_hash"], plan.doc.header["goal_hash"])
         self.assertEqual(plan.goal.header["sha256"], plan.doc.header["goal_hash"])
+
+    def test_amend_before_approval_does_not_bind(self):
+        self.save(make_plan("p", [header("p.1", ["main:a.py"])]))
+        freeze.amend(self.root, "p", reason="改目标", goal="REQ-1: 新目标\n", user_approved=True)
+        self.assertFalse(model.is_bound(self.root, model.load(self.root, "p")))  # the supervisor must not promote it
+        freeze.approve(self.root, "p")
+        self.assertTrue(model.is_bound(self.root, model.load(self.root, "p")))
 
     def test_amend_widening_task_authorisation(self):
         self.cfg_home.mkdir()
@@ -195,6 +206,74 @@ class FreezeTest(ProjectCase):
         self.assertEqual(plan.batches["p.1"].header["depends_on"], ["p.2"])
         self.assertEqual(plan.batches["p.2"].header["depends_on"], [])
 
+    def test_user_approved_amend_of_a_started_batch(self):
+        self.save(make_plan("p", [header("p.1", ["main:a.py"]), header("p.2", ["main:b.py"])]))
+        freeze.approve(self.root, "p")
+        plan = model.load(self.root, "p")
+        plan.batches["p.1"].header["state"] = "running"
+        plan.batches["p.1"].body = "## 状态\n席位写的\n"
+        model.write(self.root, plan)
+        wider = Doc(header("p.1", ["main:a.py", "main:d.py"], accept_commands=["make test"],
+                           tools=[{"name": "rg", "step": "找"}]), "## 状态\n")
+        with self.assertRaisesRegex(PlanError, "needs the user's approval"):
+            freeze.amend(self.root, "p", reason="r", batches=[wider])
+        for bad, msg in ((header("p.1", ["main:d.py"]), "only grow"), (header("p.1", ["main:a.py"], mode="watch"),
+                                                                        r"not \['mode'\]")):
+            with self.assertRaisesRegex(PlanError, msg):
+                freeze.amend(self.root, "p", reason="r", batches=[Doc(bad, "## 状态\n")], user_approved=True)
+        with self.assertRaisesRegex(PlanError, "body above"):
+            freeze.amend(self.root, "p", reason="r", batches=[Doc(header("p.1", ["main:a.py"]), "新说明\n")],
+                         user_approved=True)
+        freeze.amend(self.root, "p", reason="用户同意 p.1 多写 d.py", batches=[wider], user_approved=True)
+        d = model.load(self.root, "p").batches["p.1"]
+        self.assertEqual((d.header["owns_paths"], d.header["state"]), (["main:a.py", "main:d.py"], "running"))
+        self.assertEqual(d.body, "## 状态\n席位写的\n")
+
+    def test_expand_scope(self):
+        self.save(make_plan("p", [header("p.1", ["main:a.py"]), header("p.2", ["main:b.py"], ["p.1"]),
+                                  header("p.3", ["main:c.py"])]))
+        freeze.approve(self.root, "p")
+        with self.assertRaisesRegex(PlanError, "not started"):
+            freeze.expand_scope(self.root, "p.1", ["main:x.py"], decision="Q-1", approved_by="user")
+        plan = model.load(self.root, "p")
+        for b in ("p.1", "p.2", "p.3"):
+            plan.batches[b].header["state"] = "running"
+        plan.batches["p.3"].header |= {"state": "blocked", "state_prior": "running", "blocked_reason": "quota"}
+        model.write(self.root, plan)
+        with self.assertRaisesRegex(PlanError, "started batch p.3"):  # a side branch of a started state still holds
+            freeze.expand_scope(self.root, "p.1", ["main:c.py"], decision="Q-1", approved_by="user")
+        with self.assertRaisesRegex(PlanError, "already owns"):
+            freeze.expand_scope(self.root, "p.1", ["main:a.py"], decision="Q-1", approved_by="user")
+        # p.2 depends on p.1: they are serial, the overlap is S6's to judge (and it lets a dependency pass)
+        freeze.expand_scope(self.root, "p.1", ["main:b.py"], decision="Q-2", approved_by="controller")
+        plan = model.load(self.root, "p")
+        self.assertEqual(plan.batches["p.1"].header["owns_paths"], ["main:a.py", "main:b.py"])
+        self.assertEqual(plan.doc.header["revisions"][-1]["decision"], "Q-2")
+        self.assertTrue(model.is_bound(self.root, plan))
+        goal = self.root / ".foremind" / "plans" / "p" / "goal.md"
+        text = goal.read_text()
+        model.write_goal(self.root, "p", goal_doc("REQ-1: 做两件事\n"))  # re-frozen by hand: a #8 answer never binds it (#9)
+        with self.assertRaisesRegex(PlanError, "goal.md is not the goal"):
+            freeze.expand_scope(self.root, "p.1", ["main:x.py"], decision="Q-3", approved_by="user")
+        goal.write_text(text)
+        path = model.batch_path(self.root, "p.3")
+        path.write_text(path.read_text().replace("main:c.py", "main:cc.py"))  # hand edit: unbound
+        for by in ("controller", "user"):  # a #8 answer does not approve edits nobody showed the user
+            with self.assertRaisesRegex(PlanError, "outside plan amend"):
+                freeze.expand_scope(self.root, "p.1", ["main:x.py"], decision="Q-3", approved_by=by)
+        self.assertEqual(model.load(self.root, "p").batches["p.1"].header["owns_paths"], ["main:a.py", "main:b.py"])
+
+    def test_finished_batch_is_not_amended_even_with_approval(self):
+        self.save(make_plan("p", [header("p.1", ["main:a.py"]), header("p.2", ["main:b.py"])]))
+        freeze.approve(self.root, "p")
+        for st in ("merged", "cataloged", "cancelled"):
+            plan = model.load(self.root, "p")
+            plan.batches["p.1"].header["state"] = st
+            model.write(self.root, plan)
+            with self.assertRaisesRegex(PlanError, f"p.1 is {st}: .*not amended"):
+                freeze.amend(self.root, "p", reason="r", batches=[Doc(header("p.1", ["main:a.py", "main:d.py"]),
+                                                                      "## 状态\n")], user_approved=True)
+
     def test_controller_amend_only_tightens(self):
         self.save(make_plan("p", [header("p.1", ["main:a.py"], mode="watch", hard_block=[3]),
                                   header("p.2", ["main:b.py"])]))
@@ -234,3 +313,157 @@ class FreezeTest(ProjectCase):
             freeze.amend(self.root, "p", reason="改在跑的批", batches=[Doc(header("p.1", ["main:z.py"]), "")])
         with self.assertRaisesRegex(PlanError, "reason"):
             freeze.amend(self.root, "p", reason=" ")
+
+
+class AmendIntentTest(ProjectCase):
+    def setUp(self):
+        super().setUp()
+        self.log = EventLog(self.root / ".foremind" / "events.jsonl")
+        self.save(make_plan("p", [header("p.1", ["main:a.py"]), header("p.2", ["main:b.py"])]))
+        freeze.approve(self.root, "p")
+
+    def events(self, type):
+        return [e for e in self.log.iter() if e["type"] == type]
+
+    def crash_amend(self, **kw):
+        """An amend that stops after its first batch file (the intent is written, plan.md and plan_amended are not)."""
+        real = model.write
+
+        def write(root, plan):
+            (bid, d), = list(plan.batches.items())[:1]
+            atomic_write(model.batch_path(root, bid), hdr.render(d.header, d.body))
+            raise KeyboardInterrupt
+
+        with mock.patch.object(model, "write", write), self.assertRaises(KeyboardInterrupt):
+            freeze.amend(self.root, "p", **kw)
+        self.assertIs(model.write, real)
+        self.assertEqual(len(self.log.open_intents()), 1)
+
+    def test_intent_then_result(self):
+        freeze.amend(self.root, "p", reason="p.2 多写 c.py", batches=[Doc(header("p.2", ["main:b.py", "main:c.py"]), "")])
+        (it,), (res,) = self.events("plan_amend"), self.events("plan_amended")
+        self.assertEqual((it["phase"], res["phase"], res["dedupe_id"]), ("intent", "result", it["dedupe_id"]))
+        self.assertEqual(self.log.open_intents(), [])
+        files = {f["path"]: f for f in it["files"]}
+        self.assertEqual(sorted(files), ["batches/p.1.md", "batches/p.2.md", "plans/p/plan.md"])
+        self.assertNotIn("text", files["batches/p.1.md"])  # unchanged: its hash only
+        p2 = self.root / ".foremind" / "batches" / "p.2.md"
+        self.assertEqual(files["batches/p.2.md"]["text"], p2.read_text())
+        self.assertEqual(files["batches/p.2.md"]["sha256"], model.text_hash(p2.read_text()))
+        self.assertEqual(it["result"]["plan_hash"], res["plan_hash"])
+
+    def test_next_amend_finishes_an_interrupted_one(self):
+        self.crash_amend(reason="p.1 多写 c.py", batches=[Doc(header("p.1", ["main:a.py", "main:c.py"]), "## 状态\n")],
+                         drop=["p.2"])
+        self.assertFalse(model.is_bound(self.root, model.load(self.root, "p")))  # p.1 written, plan.md not
+        report = freeze.amend(self.root, "p", reason="再改 p.1", batches=[Doc(header("p.1", ["main:a.py", "main:c.py", "main:d.py"]), "")])
+        self.assertIn("已按意图记录的哈希补完", report["warnings"][0])
+        plan = model.load(self.root, "p")
+        self.assertEqual([r["reason"] for r in plan.doc.header["revisions"]], ["p.1 多写 c.py", "再改 p.1"])
+        self.assertEqual(plan.batches["p.2"].header["state"], "cancelled")
+        self.assertTrue(model.is_bound(self.root, plan))
+        self.assertTrue(self.events("plan_amended")[0]["recovered"])
+        self.assertEqual(self.log.open_intents(), [])
+
+    def test_changed_since_is_left_alone_and_reported(self):
+        self.crash_amend(reason="r", batches=[Doc(header("p.2", ["main:b.py", "main:c.py"]), "")])
+        path = model.batch_path(self.root, "p.2")  # not written yet; changed by someone else since the crash
+        path.write_text(path.read_text().replace("main:b.py", "main:bb.py"))
+        plan_md = (self.root / ".foremind" / "plans" / "p" / "plan.md").read_text()
+        with self.assertRaisesRegex(PlanError, r"补不完：batches/p\.2\.md 在中断后又被改过(.|\n)*outside plan amend"):
+            freeze.amend(self.root, "p", reason="x")
+        (failed,) = self.events("plan_amend_failed")
+        self.assertEqual(failed["left"], ["batches/p.2.md"])
+        self.assertIn("main:bb.py", path.read_text())  # not overwritten, and nothing else written either
+        self.assertEqual((self.root / ".foremind" / "plans" / "p" / "plan.md").read_text(), plan_md)
+        self.assertEqual(self.log.open_intents(), [])  # reported once
+        report = freeze.amend(self.root, "p", reason="用户核对后重批", user_approved=True)
+        self.assertEqual(self.events("plan_amend_failed"), [failed])
+        self.assertNotIn("写到一半", "".join(report["warnings"]))
+        self.assertTrue(model.is_bound(self.root, model.load(self.root, "p")))
+
+    def set_runtime(self, bid, state):
+        """What the supervisor and a seat write after the crash: state, and the `## 状态` section."""
+        path = model.batch_path(self.root, bid)
+        d = model.read(path)
+        d.header["state"] = state
+        atomic_write(path, hdr.render(d.header, d.body + "## 状态\n进行中\n"))
+
+    def test_stopped_before_any_file_the_plan_stays_bound(self):  # REQ-18
+        with mock.patch.object(model, "write", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            freeze.amend(self.root, "p", reason="r", batches=[Doc(header("p.2", ["main:b.py", "main:c.py"]), "")])
+        self.set_runtime("p.2", "ready")  # nothing of the amend written; the supervisor moved p.2 on since
+        report = freeze.amend(self.root, "p", reason="再改", batches=[Doc(header("p.1", ["main:a.py", "main:d.py"]), "")])
+        self.assertEqual(report["warnings"][0], "上次修订 1 写到一半中断，补不完：batches/p.2.md 在中断后又被改过；"
+                                                "修订 1 一个文件也没写，没有生效，计划仍绑定；需要就重新 amend")
+        self.assertEqual(self.events("plan_amend_failed")[0]["left"], ["batches/p.2.md"])
+        plan = model.load(self.root, "p")
+        self.assertEqual((plan.batches["p.1"].header["owns_paths"], plan.batches["p.2"].header["owns_paths"]),
+                         (["main:a.py", "main:d.py"], ["main:b.py"]))
+        self.assertTrue(model.is_bound(self.root, plan))
+
+    def test_written_then_changed_at_runtime_still_finishes(self):
+        self.crash_amend(reason="r", batches=[Doc(header("p.1", ["main:a.py", "main:c.py"]), ""),
+                                              Doc(header("p.2", ["main:b.py", "main:d.py"]), "")])
+        self.set_runtime("p.1", "running")  # p.1 was written before the crash
+        report = freeze.amend(self.root, "p", reason="再改", batches=[Doc(header("p.2", ["main:b.py", "main:e.py"]), "")])
+        self.assertIn("已按意图记录的哈希补完", report["warnings"][0])
+        plan = model.load(self.root, "p")
+        self.assertEqual(plan.batches["p.1"].header["state"], "running")
+        self.assertIn("main:c.py", plan.batches["p.1"].header["owns_paths"])
+        self.assertTrue(model.is_bound(self.root, plan))
+
+    def test_a_dropped_batch_that_started_since_is_not_written(self):
+        self.crash_amend(reason="r", batches=[Doc(header("p.1", ["main:a.py", "main:c.py"]), "")], drop=["p.2"])
+        self.set_runtime("p.2", "ready")  # p.2 not yet cancelled when it crashed; the supervisor moved it on since
+        with self.assertRaisesRegex(PlanError, r"补不完：batches/p\.2\.md"):
+            freeze.amend(self.root, "p", reason="x")
+        self.assertEqual(self.events("plan_amend_failed")[0]["left"], ["batches/p.2.md"])
+        self.assertEqual(model.load(self.root, "p").batches["p.2"].header["state"], "ready")
+        self.assertEqual(self.events("plan_amended"), [])
+
+    def test_a_file_the_amend_does_not_change_may_drift(self):
+        self.crash_amend(reason="r", batches=[Doc(header("p.2", ["main:b.py", "main:c.py"]), "")])
+        self.set_runtime("p.1", "ready")  # p.1: hash only in the intent
+        report = freeze.amend(self.root, "p", reason="再改", batches=[Doc(header("p.2", ["main:b.py", "main:d.py"]), "")])
+        self.assertIn("已按意图记录的哈希补完", report["warnings"][0])
+        self.assertEqual(self.events("plan_amend_failed"), [])
+
+    def test_user_approved_amend_lists_the_widening(self):
+        self.cfg_home.mkdir()
+        (self.cfg_home / "config.toml").write_text('[delivery]\nlevel = {ceiling = "merge_dev", value = "done"}\n')
+        wide = Doc(header("p.1", ["main:a.py"], config={"delivery": {"level": "merge_dev"}}), "")
+        report = freeze.amend(self.root, "p", reason="用户同意", batches=[wide], user_approved=True)
+        self.assertIn("批准将放宽 p.1 的 delivery.level", report["warnings"])
+        plan = model.load(self.root, "p")
+        self.assertTrue(model.task_config_approved(self.root, plan, "p.1"))
+        # a controller amend approves nothing: no listing
+        self.assertEqual(freeze.amend(self.root, "p", reason="r", batches=[
+            Doc(header("p.2", ["main:b.py", "main:c.py"]), "")])["warnings"], [])
+
+
+class ExpandScopeTest(ProjectCase):
+    def setUp(self):
+        super().setUp()
+        self.save(make_plan("p", [header("p.1", ["main:a.py"]), header("p.2", ["main:b.py"])]))
+        freeze.approve(self.root, "p")
+        plan = model.load(self.root, "p")
+        plan.batches["p.1"].header["state"] = "running"
+        plan.batches["p.2"].header["state"] = "ready"
+        model.write(self.root, plan)
+
+    def test_seat_being_opened_counts_as_started(self):
+        lock.acquire(self.root, "p.2", "fm-x-p_2-1")  # seat._claim took the lock; the state is still ready
+        with self.assertRaisesRegex(PlanError, "started batch p.2"):
+            freeze.expand_scope(self.root, "p.1", ["main:b.py"], decision="Q-1", approved_by="user")
+        lock.release(self.root, "p.2", "fm-x-p_2-1")
+        freeze.expand_scope(self.root, "p.1", ["main:b.py"], decision="Q-1", approved_by="user")
+        self.assertEqual(model.load(self.root, "p").batches["p.2"].header["depends_on"], ["p.1"])
+
+    def test_retry_of_the_same_decision_is_done(self):
+        freeze.expand_scope(self.root, "p.1", ["main:x.py"], decision="Q-1", approved_by="user")
+        n = len(model.load(self.root, "p").doc.header["revisions"])
+        self.assertTrue(freeze.expand_scope(self.root, "p.1", ["main:x.py"], decision="Q-1", approved_by="user")["ok"])
+        self.assertEqual(len(model.load(self.root, "p").doc.header["revisions"]), n)
+        with self.assertRaisesRegex(PlanError, "already owns"):  # another decision asking for owned paths
+            freeze.expand_scope(self.root, "p.1", ["main:x.py"], decision="Q-2", approved_by="user")

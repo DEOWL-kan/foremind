@@ -48,6 +48,23 @@ class ClaudeLaunchTest(unittest.TestCase):
             self.assertEqual(cmd["type"], "command")
             self.assertTrue(cmd["command"].endswith(f"-m foremind hook {event}"), cmd["command"])
         self.assertEqual(hooks["PreToolUse"][0]["matcher"], "*")
+        self.assertEqual(hooks["Notification"][0]["matcher"], "")  # m2b.8: every type; the hook picks the waiting ones
+
+    def test_settings_allowlist(self):  # m2a.1 item 1: read-only and test commands, never push, install or rm
+        allow = json.loads(Path(self.make().argv[2]).read_text())["permissions"]["allow"]
+        for rule in ("Read", "Grep", "Glob", "Bash(git status:*)", "Bash(git diff:*)", "Bash(python3 -m unittest:*)",
+                     "Bash(foremind log:*)", "Bash(foremind decide:*)"):
+            self.assertIn(rule, allow)
+        for bad in ("push", "install", "rm", "pip", "npm", "brew", "find", "rg"):  # find -delete, rg --pre (r1)
+            self.assertFalse([r for r in allow if bad in r.replace("(", " ").replace(":", " ").split()], bad)
+        self.assertFalse([r for r in allow if r.startswith("Bash(git branch")])  # branch -D (r1)
+        self.assertIn("Bash(git commit:*)", allow)
+        for c in ("log", "handoff", "review", "decide", "status"):  # REQ-12: also as the program spells them
+            self.assertIn(f"Bash({claude.foremind_command(c)}:*)", allow)
+        self.assertIn("StopFailure", json.loads(Path(self.make().argv[2]).read_text())["hooks"])  # REQ-11
+        # the planner commits nothing (m2b.9 r1, Q-21): the rest of the list is the seat's
+        planner = json.loads(Path(self.make(role="planner").argv[2]).read_text())["permissions"]["allow"]
+        self.assertEqual([r for r in allow if r not in planner], ["Bash(git add:*)", "Bash(git commit:*)"])
 
     def test_hook_command_finds_the_package_from_any_cwd(self):
         # same command line with `version` instead of `hook <event>` (hooks themselves are M1-5)

@@ -1,9 +1,12 @@
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
+from foremind.events import EventLog
 from foremind.supervisor import quota
 from foremind.supervisor.quota import AVAILABLE, EXHAUSTED, LOW, UNKNOWN, probe_done, probe_due, step
 
@@ -84,6 +87,19 @@ class StepTest(unittest.TestCase):
         self.assertEqual(step(s, tel(reset + 30, 10, five_reset=new_window), reset + 60, {})["state"], AVAILABLE)
         self.assertEqual(step(None, tel(T0 - 60, 10), T0, {})["state"], AVAILABLE, "no state yet: a fresh reading counts")
 
+    def test_a_probe_success_ahead_of_the_7d_share_is_low(self):  # finding 27
+        start = T0 - 86400 / 2  # day 1 of the 7d window: its share is 100/7 %
+        ahead = tel(T0 - 10 * M, None, seven=20, seven_reset=start + 7 * 86400)  # 5h null: why it went unknown
+        s = step(None, ahead, T0, {})
+        self.assertEqual((s["state"], s["reason"]), (UNKNOWN, "null"))
+        low = probe_done(s, True, T0 + 10, {}, tel=ahead)
+        self.assertEqual((low["state"], low["ok_until"]), (LOW, T0 + 10 + 15 * M))
+        self.assertEqual(step(low, ahead, T0 + 60, {})["state"], LOW, "held like a successful probe's available")
+        self.assertEqual(probe_done(s, True, T0 + 10, {"quota.pace": False}, tel=ahead)["state"], AVAILABLE)
+        for other in (None, tel(T0, None), tel(T0, None, seven=10, seven_reset=start + 7 * 86400),
+                      tel(T0, None, seven=90, seven_reset=T0 - 1)):  # none, no 7d, within its share, an older window
+            self.assertEqual(probe_done(s, True, T0 + 10, {}, tel=other)["state"], AVAILABLE, other)
+
     def test_probe_backoff_doubles_and_is_capped_by_the_next_reset(self):
         s = step(step(None, tel(T0, 91), T0, {}), None, T0 + 3 * H, {})  # exhausted (5h), then its reset
         self.assertEqual((s["state"], s["next_reset"]), (UNKNOWN, T0 + 8 * H))
@@ -114,6 +130,25 @@ class StepTest(unittest.TestCase):
         s = step(s, None, seven_reset, {})
         self.assertEqual((s["state"], s["next_reset"]), (UNKNOWN, seven_reset + 7 * 86400))
 
+    def test_raising_the_pause_line_reopens_exhaustion(self):  # finding 1
+        seven_reset = T0 + 5 * 86400
+        s = step(None, tel(T0, 30, seven=91, seven_reset=seven_reset), T0, {})
+        self.assertEqual((s["state"], s["pause"]), (EXHAUSTED, 90))
+        self.assertIs(step(s, None, T0 + 60, {"quota.reserve_pct": 20}), s, "a lower line changes nothing")
+        self.assertIs(step(s, None, T0 + 60, {}), s)
+        s = step(s, None, T0 + 60, {"quota.reserve_pct": 5})
+        self.assertEqual((s["state"], s["reason"], s["since"]), (UNKNOWN, "config_changed", T0 + 60))
+        self.assertTrue(probe_due(s, T0 + 60))
+        cfg = {"quota.reserve_pct": 5}  # a fresh reading judges against the new line
+        self.assertEqual(step(s, tel(T0 + 120, 30, seven=91, seven_reset=seven_reset), T0 + 120, cfg)["state"], LOW)
+        s = step(s, tel(T0 + 120, 30, seven=96, seven_reset=seven_reset), T0 + 120, cfg)
+        self.assertEqual((s["state"], s["pause"]), (EXHAUSTED, 95))
+        old = {"state": EXHAUSTED, "since": T0, "window": "7d", "resets_at": seven_reset}  # before the pause field
+        self.assertEqual(step(old, None, T0 + 60, {})["reason"], "config_changed")
+        s = step(None, tel(T0, 96), T0, {}, "oneshot")
+        self.assertEqual(step(s, None, T0 + 60, {"quota.oneshot_pause_pct": 98}, "oneshot")["reason"],
+                         "config_changed")
+
     def test_seven_day_ahead_of_its_daily_share_is_low(self):
         start = T0 - 86400 - 60  # second day of the 7d window: 2/7 ≈ 28.6% allowed
         s = step(None, tel(T0, 10, seven=35, seven_reset=start + 7 * 86400), T0, {})
@@ -121,6 +156,10 @@ class StepTest(unittest.TestCase):
         s = step(s, tel(T0 + 1, 10, seven=25, seven_reset=start + 7 * 86400), T0 + 1, {})
         self.assertEqual(s["state"], AVAILABLE)
         self.assertAlmostEqual(quota.pace(8 * 86400, 86400 + 10), 100 / 7)
+        s = step(None, tel(T0, 10, seven=35, seven_reset=start + 7 * 86400), T0, {"quota.pace": False})
+        self.assertEqual(s["state"], AVAILABLE)  # user turned pacing off: only the 5h low line and the pause lines
+        s = step(None, tel(T0, 10, seven=91, seven_reset=start + 7 * 86400), T0, {"quota.pace": False})
+        self.assertEqual(s["state"], EXHAUSTED)
 
 
 class ReadTelemetryTest(unittest.TestCase):
@@ -140,6 +179,53 @@ class ReadTelemetryTest(unittest.TestCase):
         self.assertEqual(quota.read_telemetry(root)["five_hour"], None)
         self.assertNotIn("seven_day", quota.read_telemetry(root), "none in the snapshot: left out, not null")
         self.assertIsNone(quota.read_telemetry(root / "nowhere"))
+
+
+class StateFileTest(unittest.TestCase):
+    """m2b.10: the state is the account's, at the user level; a project's old .foremind/quota.json is folded in."""
+
+    def setUp(self):
+        tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(mock.patch.dict(os.environ, {"FOREMIND_CONFIG_HOME": str(tmp / "cfg")}))
+        self.root = tmp / "shop"
+        (self.root / ".foremind").mkdir(parents=True)
+        self.old = self.root / ".foremind" / "quota.json"
+
+    def test_path_load_save(self):
+        self.assertEqual(quota.state_path(), Path(os.environ["FOREMIND_CONFIG_HOME"]) / "quota.json")
+        self.assertEqual(quota.load(), {})
+        quota.save({"groups": {"claude/long": {"state": LOW}}})
+        self.assertEqual(quota.load(), {"groups": {"claude/long": {"state": LOW}}})
+        quota.state_path().write_text("[1]")
+        self.assertEqual(quota.load(), {}, "not an object: no state")
+
+    def test_migrate_takes_the_stricter_state_per_group(self):
+        self.assertFalse(quota.migrate(self.root, {}), "no old file: nothing to do")
+        q = {"groups": {"claude/long": {"state": AVAILABLE}, "claude/oneshot": {"state": EXHAUSTED, "window": "7d"}},
+             "paused": ["fm-other-a"], "exhausted_ended": 5}
+        self.old.write_text(json.dumps({
+            "groups": {"claude/long": {"state": UNKNOWN, "reason": "reset"}, "claude/oneshot": {"state": LOW},
+                       "codex/long": {"state": "bogus"}},
+            "paused": ["fm-shop-b", "fm-other-a"], "exhausted_ended": 9, "merged_checked": {"p.1": 1}}))
+        self.assertTrue(quota.migrate(self.root, q))
+        self.assertEqual(quota.load(), q)
+        self.assertEqual(q["groups"], {"claude/long": {"state": UNKNOWN, "reason": "reset"},
+                                       "claude/oneshot": {"state": EXHAUSTED, "window": "7d"}})
+        self.assertEqual((q["paused"], q["exhausted_ended"]), (["fm-other-a", "fm-shop-b"], 9))
+        self.assertFalse(self.old.exists(), "the old file is gone (merged_checked with it)")
+        ev = [e for e in EventLog(self.root / ".foremind" / "events.jsonl").iter() if e["type"] == "quota_migrated"]
+        self.assertEqual([e["taken"] for e in ev], [["claude/long"]])
+        self.assertFalse(quota.migrate(self.root, q), "once")
+
+    def test_migrate_into_nothing_takes_the_old_state_and_survives_a_bad_old_file(self):
+        self.old.write_text(json.dumps({"groups": {"claude/long": {"state": AVAILABLE}}}))
+        q = {}
+        quota.migrate(self.root, q)
+        self.assertEqual((q["groups"], q["paused"]), ({"claude/long": {"state": AVAILABLE}}, []))
+        self.old.write_text("{not json")
+        self.assertTrue(quota.migrate(self.root, q))
+        self.assertEqual(q["groups"], {"claude/long": {"state": AVAILABLE}})
+        self.assertFalse(self.old.exists())
 
 
 if __name__ == "__main__":

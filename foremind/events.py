@@ -2,16 +2,32 @@
 
 Refer to other events by `id`, never by `hash`: rotate() re-chains the entries it keeps, so their hashes change.
 Dedupe on (dedupe_id, phase) only sees the current file; entries already rotated to the archive are not consulted.
+
+An event claiming the user (one of CLAIMS is "user", a USER_TYPES type or USER_VIA: what the user's own commands
+write) gets `seat_ancestor` (REQ-11 ④, m2c.6): the session whose settings file is on an ancestor's command line
+(seat_ancestor), "unknown" when ps cannot tell; no field otherwise. audit.l0 and supervisor/phases/bounds.py act on it.
 """
 import json
+import os
 import re
+import subprocess
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from foremind import pathmatch
 from foremind.fsutil import append_line, atomic_write, file_lock, sha256_bytes
 
 _RESERVED = {"id", "ts", "prev", "hash"}
+CLAIMS = ("approved_by", "by", "author", "requested_by")
+# written only by what the user runs (guard's foremind whitelist leaves it out) with none of CLAIMS: resume / pause,
+# confirm-exit, audit --accept-config, decide --confirm, quota --reset, seat --user, init / uninstall
+# (install.settings.record), plan new, and `hook` in a session that is not Foremind's (a #22 edit it approves)
+USER_TYPES = {"resumed", "paused", "exit_confirmed", "l0_config_accepted", "pending_confirmed", "quota_reset",
+              "seat_user", "program_config_write", "planner_opened", "user_config_edit"}
+USER_VIA = ("audit --release",)  # batch_state's `via`; the program's own state changes carry none
+PS = ("/bin/ps", "/usr/bin/ps")  # the first that exists; not from PATH: a ps put first there could answer for the chain
+ANCESTORS = 32
 
 
 def _now():
@@ -30,6 +46,30 @@ def _dump(event):
 def _open_intents(events):
     closed = {e["dedupe_id"] for e in events if e["phase"] == "result"}
     return [e for e in events if e["phase"] == "intent" and e["dedupe_id"] not in closed]
+
+
+def seat_ancestor(sessions_dir) -> str | None:
+    """The session `<sessions_dir>/<session>.settings.json` names on the command line of this process or one of its
+    ancestors (a seat's claude carries it: vendors/claude.launch), walking `ps` up to ANCESTORS levels; "unknown" when
+    ps fails or the chain is longer; None when no ancestor names one (another project's sessions do not count, one
+    whose path ends in this one's included: the directory starts a word or follows `=`). Case-insensitive where the
+    volume is (pathmatch.FOLD)."""
+    dirs = "|".join(map(re.escape, {str(sessions_dir), os.path.realpath(sessions_dir)}))
+    rx = re.compile(rf"(?<![^\s=])(?:{dirs})/([A-Za-z0-9_-]+)\.settings\.json", re.I if pathmatch.FOLD else 0)
+    pid, ps = os.getpid(), next(filter(os.path.exists, PS), PS[0])
+    for _ in range(ANCESTORS):
+        try:
+            r = subprocess.run([ps, "-o", "ppid=,command=", "-p", str(pid)], capture_output=True, text=True,
+                               errors="replace", timeout=10)
+            ppid, _, cmd = r.stdout.strip().partition(" ")
+            pid = int(ppid)
+        except (OSError, subprocess.SubprocessError, ValueError):  # no ps, no answer, or the process is gone
+            return "unknown"
+        if m := rx.search(cmd):
+            return m[1]
+        if pid <= 1:
+            return None
+    return "unknown"
 
 
 class EventLog:
@@ -52,6 +92,9 @@ class EventLog:
             raise ValueError(f"phase must be 'intent' or 'result', not {phase!r}")
         if phase == "intent" and dedupe_id is None:
             raise ValueError("intent events need a dedupe_id so a result can close them")
+        if (type in USER_TYPES or fields.get("via") in USER_VIA or any(fields.get(k) == "user" for k in CLAIMS)) and \
+                (s := seat_ancestor(self.path.parent / "sessions")) is not None:  # before the lock: ps is slow
+            fields["seat_ancestor"] = s
         with self._lock():
             prev = ""
             # ponytail: full scan per append; add an index if events.jsonl outgrows a month of events

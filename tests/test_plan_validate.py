@@ -1,7 +1,8 @@
 import unittest
 
+from foremind.pathmatch import overlap as paths_overlap
 from foremind.plan import schedule
-from foremind.plan.validate import apply_edges, paths_overlap, validate
+from foremind.plan.validate import apply_edges, validate
 from test_plan_helpers import ProjectCase, header, make_plan
 
 
@@ -139,6 +140,34 @@ class ValidateTest(ProjectCase):
         plan.batches["p.1"].body = "TODO 说明\n\n## 状态\n"
         self.assertIn("p.1: forbidden word 'TODO' in prose", self.check(plan)["errors"])
 
+    def test_allow_word_marker_exempts_one_body_line(self):
+        body = "引用旧文：先做 v1 <!-- fm-allow-word -->\n正文\n"
+        self.assertTrue(self.check(make_plan("p", [header("p.1", ["main:a.py"])], body=body))["ok"])
+        self.assertIn("plan.md: forbidden word 'TODO' in prose", self.check(make_plan(
+            "p", [header("p.1", ["main:a.py"])], body=body + "TODO\n"))["errors"])
+        bad = header("p.1", ["main:a.py"], must_read=[{"path": "main:a.py", "why": "占位 <!-- fm-allow-word -->"}])
+        self.assertIn("p.1: forbidden word '占位' in prose", self.check(make_plan("p", [bad]))["errors"])
+
+    def test_unittest_module_form_needs_a_package(self):
+        (self.root / "tests").mkdir()
+        (self.root / "pkg").mkdir()
+        (self.root / "pkg" / "__init__.py").write_text("")
+        cmds = ["python3 -m unittest tests.test_x", "python3 -m unittest -v pkg.test_y tests/test_z.py",
+                "python3 -m unittest discover -s tests -p 'test_x.py'", "cd x && python3 -m unittest -k a.b"]
+        plan = make_plan("p", [header("p.1", ["main:a.py"], accept_commands=cmds)])
+        r = self.check(plan, config={"repos": [{"id": "main", "path": "."}]})
+        self.assertTrue(r["ok"], r["errors"])
+        self.assertEqual(len(r["warnings"]), 1, r["warnings"])
+        self.assertIn("tests/ has no __init__.py", r["warnings"][0])
+        self.assertIn("discover -s tests", r["warnings"][0])
+
+    def test_user_approval_warns_what_it_widens(self):
+        plan = make_plan("p", [header("p.1", ["main:a.py"], config={"delivery": {"level": "merge_dev"}}),
+                               header("p.2", ["main:b.py"], config={"delivery": {"level": "done"}})])
+        self.assertIn("批准将放宽 p.1 的 delivery.level", self.check(plan, user_approved=True)["warnings"])
+        self.assertFalse(any("批准将放宽" in w for w in self.check(plan)["warnings"]))
+        self.assertFalse(any("p.2" in w for w in self.check(plan, user_approved=True)["warnings"]))
+
     def test_reqs_count_budget_goal(self):
         plan = make_plan("p", [header("p.1", ["main:a.py"], reqs=["REQ-1", "REQ-9"])], goal="REQ-1 a\nREQ-2 b\n")
         errs = self.check(plan)["errors"]
@@ -146,10 +175,12 @@ class ValidateTest(ProjectCase):
         self.assertIn("p.1: REQ-9 not in goal.md", errs)
         many = make_plan("p", [header(f"p.{i}", [f"main:{i}.py"]) for i in range(1, 12)])
         self.assertIn("11 batches > 10: split into milestones (several plans)", self.check(many)["errors"])
-        big = make_plan("p", [header("p.1", ["main:a.py"], budget_estimate="80000")])
-        self.assertIn("budget_estimate 80000 > half", self.check(big)["errors"][0])
-        self.assertTrue(self.check(big, config={"context.abs_cap_tokens": 200_000})["ok"])  # min(160000, 200000)
-        self.assertFalse(self.check(big, config={"context.abs_cap_tokens": 200_000, "context.hard_pct": 70})["ok"])
+        big = make_plan("p", [header("p.1", ["main:a.py"], budget_estimate="80001")])
+        self.assertIn("budget_estimate 80001 > half", self.check(big)["errors"][0])  # m2d.9: min(160000, 180000) / 2
+        self.assertTrue(self.check(make_plan("p", [header("p.1", ["main:a.py"], budget_estimate="80000")]))["ok"])
+        wide = {"context.window_tokens": 250_000, "context.abs_cap_tokens": 200_000}
+        self.assertTrue(self.check(big, config=wide)["ok"])  # min(200000, 200000)
+        self.assertFalse(self.check(big, config={**wide, "context.hard_pct": 60})["ok"])  # min(150000, 200000)
         plan = make_plan("p", [header("p.1", ["main:a.py"])])
         plan.goal.body = "REQ-1 changed\n"
         self.assertIn("goal.md: changed after it was frozen", self.check(plan)["errors"][0])

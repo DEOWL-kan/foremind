@@ -22,30 +22,35 @@ path, a = os.environ["FAKE_GH_STATE"], sys.argv[1:]
 st = json.load(open(path)) if os.path.exists(path) else {}
 with open(os.environ["FAKE_GH_LOG"], "a") as f:
     f.write(json.dumps(a) + "\n")
-prs = st.setdefault("prs", {})
+prs = st.setdefault("prs", {})  # keyed "<repo>:<branch>": gh runs in the repo's worktree
+def pr(branch):
+    return os.path.basename(os.getcwd()) + ":" + branch
 def save():
     json.dump(st, open(path, "w"))
 def remote_head(branch):
     out = subprocess.run(["git", "ls-remote", "origin", "refs/heads/" + branch], capture_output=True, text=True).stdout.split()
     return out[0] if out else None
 if a[:2] == ["pr", "view"]:
-    if a[2] not in prs:
+    if pr(a[2]) not in prs:
         sys.exit("no pull requests found for branch " + a[2])
-    print(json.dumps({**prs[a[2]], "headRefOid": remote_head(a[2])}))
+    print(json.dumps({"mergeStateStatus": "CLEAN", **prs[pr(a[2])], "headRefOid": remote_head(a[2])}))
 elif a[:2] == ["pr", "create"]:
     head = a[a.index("--head") + 1]
     n = len(prs) + 1
-    prs[head] = {"number": n, "url": "https://example.test/pr/%d" % n, "state": "OPEN", "isDraft": "--draft" in a,
-                 "mergeCommit": None}
+    prs[pr(head)] = {"number": n, "url": "https://example.test/pr/%d" % n, "state": "OPEN", "isDraft": "--draft" in a,
+                     "mergeCommit": None}
     save()
-    print(prs[head]["url"])
+    print(prs[pr(head)]["url"])
 elif a[:2] == ["pr", "ready"]:
-    prs[a[2]]["isDraft"] = False
+    prs[pr(a[2])]["isDraft"] = False
     save()
 elif a[:2] == ["pr", "merge"]:
     if remote_head(a[2]) != a[a.index("--match-head-commit") + 1]:
         sys.exit("head changed")
-    prs[a[2]].update(state="MERGED", mergeCommit={"oid": "f" * 40})
+    if st.get("merge_queue"):  # the target requires a merge queue: queued (auto-merge on), still open
+        prs[pr(a[2])]["autoMergeRequest"] = {"enabledAt": "2026-01-01T00:00:00Z"}
+    else:
+        prs[pr(a[2])].update(state="MERGED", mergeCommit={"oid": "f" * 40})
     save()
 elif a[:1] == ["api"]:
     url = next(x for x in a[1:] if x.startswith("repos/"))
@@ -54,11 +59,14 @@ elif a[:1] == ["api"]:
         save()
         print("{}")
     else:
-        sha = url.split("/commits/")[1].split("/")[0]
+        from urllib.parse import parse_qs, urlsplit
+        sha, q = url.split("/commits/")[1].split("/")[0], parse_qs(urlsplit(url).query)
+        n, per = int(q.get("page", ["1"])[0]), int(q.get("per_page", ["30"])[0])
+        page = lambda items: items[(n - 1) * per:n * per]
         if "/check-runs" in url:
-            print(json.dumps({"check_runs": st.get("check_runs", {}).get(sha, [])}))
+            print(json.dumps({"check_runs": page(st.get("check_runs", {}).get(sha, []))}))
         else:
-            print(json.dumps(st.get("statuses", {}).get(sha, [])))
+            print(json.dumps(page(st.get("statuses", {}).get(sha, []))))
 '''
 
 FAKE_CLAUDE = r'''
@@ -174,6 +182,12 @@ class Project:
     def gh_log(self) -> list:
         p = self.tmp / "gh.log"
         return [json.loads(x) for x in p.read_text().splitlines()] if p.exists() else []
+
+    def pr_state(self, r="api", branch="fm/shop.1", **fields):
+        """Change what the fake host says about a repo's PR (state, mergeStateStatus, ...)."""
+        st = self.gh_state()
+        st["prs"][f"{r}:{branch}"].update(fields)
+        self.gh_state(**st)
 
     def gh_state(self, **update) -> dict:
         p = self.tmp / "gh.json"

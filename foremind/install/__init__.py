@@ -148,9 +148,11 @@ def write_project(root, *, name, carrier, notify, repos: list[dict] | None) -> l
     for r in repos or []:
         lines += ["[[repos]]", *(f"{k} = {tomlblock.value(x)}" for k, x in r.items()), ""]
     if lines:
-        tomlblock.add(project_config(root), PROJECT_BLOCK, "\n".join(lines), template=PROJECT_TEMPLATE)
+        tomlblock.add(project_config(root), PROJECT_BLOCK, "\n".join(lines), template=PROJECT_TEMPLATE,
+                      before=lambda p, t: settings.record(root, p, t))
     else:
-        tomlblock.remove(project_config(root), PROJECT_BLOCK, template=PROJECT_TEMPLATE)
+        tomlblock.remove(project_config(root), PROJECT_BLOCK, template=PROJECT_TEMPLATE,
+                         before=lambda p, t: settings.record(root, p, t))
     return notes
 
 
@@ -227,8 +229,10 @@ def uninstall(root) -> list[str]:
     for d in dirs:
         settings.uninstall(root, d)
     for p in excludes:
-        tomlblock.remove(p, EXCLUDE_BLOCK, check=False)
-    tomlblock.remove(project_config(root), PROJECT_BLOCK, template=PROJECT_TEMPLATE)
+        if tomlblock.remove(p, EXCLUDE_BLOCK, check=False) and not p.read_text(encoding="utf-8").strip():
+            p.unlink()  # the repo had no exclude file (or an empty one) before init
+    tomlblock.remove(project_config(root), PROJECT_BLOCK, template=PROJECT_TEMPLATE,
+                     before=lambda p, t: settings.record(root, p, t))
     set_registered(root, False)
     if not registered():
         settings.unwrap()

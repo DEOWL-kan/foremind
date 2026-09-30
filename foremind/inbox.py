@@ -5,16 +5,19 @@ Each message is `<!-- fm-msg <id> <ts> <sender> <nbytes> -->\n<text>\n`; the byt
 A deliverer (Stop hook, supervisor) holds locked(session) from pending_messages() to mark_delivered(), so two of
 them never deliver the same message; a crash after delivering but before marking re-delivers it (at least once).
 A crash mid-append leaves a torn tail: readers stop before it, and the next append (under the lock) cuts it off.
+forward() moves a session's pending messages to another inbox under their own ids (handoff --accept, §6.4).
 `root` defaults to the project found from the environment (FOREMIND_PROJECT inside Foremind sessions).
 """
+import contextlib
 import os
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from foremind.fsutil import append_line, atomic_write, file_lock
+from foremind.fsutil import LockBusy, append_line, atomic_write, file_lock
 from foremind.paths import find_project_root, state_dir
 
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
@@ -42,8 +45,21 @@ def _paths(session, root):
     return d / f"{session}.md", d / f"{session}.cursor"
 
 
-def locked(session, *, root=None):
-    return file_lock(_paths(session, root)[0].with_suffix(".lock"))
+@contextlib.contextmanager
+def locked(session, *, root=None, timeout=None):
+    """The inbox lock; with `timeout` (seconds) retried until then, then LockBusy. None waits for it."""
+    p = _paths(session, root)[0].with_suffix(".lock")
+    end = None if timeout is None else time.monotonic() + timeout
+    with contextlib.ExitStack() as stack:
+        while True:
+            try:
+                stack.enter_context(file_lock(p, blocking=end is None))
+                break
+            except LockBusy:
+                if time.monotonic() >= end:
+                    raise
+                time.sleep(0.05)
+        yield
 
 
 def _cursor(cur):
@@ -80,17 +96,22 @@ def append(session, text, *, sender, root=None) -> str:
         raise ValueError(f"bad sender {sender!r}")
     if not text.strip():
         raise ValueError("empty message")
-    path, cur = _paths(session, root)
     mid, ts = uuid.uuid4().hex, datetime.now(timezone.utc).isoformat(timespec="seconds")
     with locked(session, root=root):  # one writer at a time, so messages never interleave
-        if path.exists():
-            data = path.read_bytes()
-            whole = _scan(data, _cursor(cur), path)[1]
-            if whole < len(data):
-                os.truncate(path, whole)  # a torn tail from a crashed append (N-7): nobody can have read it
-        # explicit separator: append_line adds none when the text already ends with a newline
-        append_line(path, f"<!-- fm-msg {mid} {ts} {sender} {len(text.encode('utf-8'))} -->\n{text}\n")
+        _append(session, root, Message(mid, ts, sender, text, 0))
     return mid
+
+
+def _append(session, root, m):
+    """Append message `m` as is (id, ts, sender); call inside locked()."""
+    path, cur = _paths(session, root)
+    if path.exists():
+        data = path.read_bytes()
+        whole = _scan(data, _cursor(cur), path)[1]
+        if whole < len(data):
+            os.truncate(path, whole)  # a torn tail from a crashed append (N-7): nobody can have read it
+    # explicit separator: append_line adds none when the text already ends with a newline
+    append_line(path, f"<!-- fm-msg {m.id} {m.ts} {m.sender} {len(m.text.encode('utf-8'))} -->\n{m.text}\n")
 
 
 def pending_messages(session, *, root=None) -> list[Message]:
@@ -115,3 +136,21 @@ def mark_delivered(session, upto, *, root=None) -> None:
     if upto not in {m.end for m in _scan(data, done, path)[0]}:
         raise ValueError(f"cursor {upto} is not the end of a pending message in {path}")
     atomic_write(cur, str(upto))
+
+
+def forward(src, dst, *, root=None) -> list[str]:
+    """Move `src`'s pending messages to `dst`'s inbox with their id, ts and sender, then mark them delivered in
+    `src`; returns the ids appended. An id `dst` already has is skipped, so a re-run after a crash appends nothing
+    twice. Both inboxes are locked, in name order, so two forwards never deadlock."""
+    with contextlib.ExitStack() as stack:
+        for s in sorted({src, dst}):
+            stack.enter_context(locked(s, root=root))
+        msgs = pending_messages(src, root=root)
+        path = _paths(dst, root)[0]
+        have = {m.id for m in _scan(path.read_bytes(), 0, path)[0]} if path.exists() else set()
+        new = [m for m in msgs if m.id not in have]
+        for m in new:
+            _append(dst, root, m)
+        if msgs:
+            mark_delivered(src, msgs[-1].end, root=root)
+    return [m.id for m in new]

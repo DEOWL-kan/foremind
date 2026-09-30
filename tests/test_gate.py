@@ -151,8 +151,51 @@ class ManifestTest(unittest.TestCase):
             self.assertFalse(gate.is_manifest(path), path)
 
 
+class IncrementalReceiptTest(unittest.TestCase):  # REQ-6
+    def receipt(self, p):
+        out = {}
+        gate._receipt_checks(p.root, "shop.1", {"api": p.head()}, [], lambda n, ok, d: out.setdefault(n, (ok, d)))
+        return out["receipt"]
+
+    def rewrite(self, n, **changes):
+        path = review.receipts(self.p.root, "shop.1")[n - 1][1]
+        path.write_text(json.dumps({**json.loads(path.read_text()), **changes}))
+
+    def test_chain_back_to_a_full_review(self):
+        self.p = p = Project(self)
+        p.batch()
+        p.commit()
+        p.run_review({"verdict": "changes_requested",
+                      "issues": [{"severity": "must_fix", "location": "api:src/app.py:1", "summary": "bug"}]})
+        p.commit(text="x = 2\n")
+        r, first = p.run_review(), review.load_receipts(p.root, "shop.1")[0]
+        self.assertEqual((r["scope"], r["delta_from"]), ("incremental", first["heads"]))
+        self.assertEqual(self.receipt(p), (True, "r2: approved"))
+        self.rewrite(2, delta_from={"api": "0" * 40})
+        self.assertIn("delta_from is not the previous receipt's heads", self.receipt(p)[1])
+        self.rewrite(2, delta_from=first["heads"])
+        self.rewrite(1, scope="delta")  # a conflict increment is no full review
+        self.assertIn("no full review down its delta_from chain", self.receipt(p)[1])
+        self.rewrite(1, scope="incremental", delta_from={"api": "0" * 40})
+        self.assertIn("no full review down its delta_from chain", self.receipt(p)[1])
+
+
 def pending(qid, state, **kw):
     return {**EXAMPLES["pending"], "id": qid, "state": state, "answer": 1, **kw}
+
+
+class DependencyApprovalTest(unittest.TestCase):
+    def test_an_exemption_counts_while_its_decision_is_provisional_or_overdue(self):  # REQ-21, REQ-19
+        root = Project(self).root
+        for d in ("exemptions", "decisions"):
+            (state_dir(root) / d).mkdir(parents=True, exist_ok=True)
+        ex = {**EXAMPLES["exemption"], "batch": "shop.1", "match": {"paths": ["api:./pyproject.toml"]},
+              "expires_at": "2999-01-01T00:00:00+00:00"}
+        (state_dir(root) / "exemptions" / "Q-1.json").write_text(json.dumps(ex))
+        for state, want in (("provisional", {4}), ("overdue", {4}), ("confirmed", {4}), ("overturned", set())):
+            (state_dir(root) / "decisions" / "Q-1.json").write_text(
+                json.dumps(pending("Q-1", state, category=4, blocks=["shop.1"])))
+            self.assertEqual(gate._approved_categories(root, "shop.1", "api:pyproject.toml"), want, state)
 
 
 class ReleaseCheckTest(unittest.TestCase):

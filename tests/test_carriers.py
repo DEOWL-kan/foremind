@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from foremind import carriers, config
+from foremind import carriers, config, sessions
 from foremind.carriers.manual import ManualCarrier
 from foremind.events import EventLog
 from foremind.fsutil import sha256_bytes
@@ -79,6 +79,40 @@ if verb == "kill-session" and mode == "alive":
 '''
 
 
+NOBODY = "1 0 0.0 100 Mon Sep 28 10:00:00 2026 /sbin/launchd\n"  # a ps snapshot with no session in it
+
+
+def lstart(at=None) -> str:
+    """`at` (default now) as ps prints lstart under LC_ALL=C."""
+    return time.strftime("%a %b %d %H:%M:%S %Y", time.localtime(at))
+
+
+class Seat:
+    """A real process standing in for a session's claude, launched after its seat_launch record: the fake ps lists it
+    with the session's --settings while it runs (real SIGTERM, fake ps). `ignore`: it ignores SIGTERM."""
+
+    def __init__(self, test, root, session, ignore=False, batch="p.1"):
+        EventLog(Path(root) / ".foremind" / "events.jsonl").append(
+            "seat_launch", phase="intent", dedupe_id=f"seat_launch:{session}", batch=batch, session=session,
+            carrier="fake")
+        code = ("import signal, sys, time\n" + ("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n" if ignore else "")
+                + "print('ready', flush=True)\ntime.sleep(60)\n")
+        self.p = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+        self.lstart = lstart()
+        test.addCleanup(self.p.stdout.close)
+        test.addCleanup(self.p.wait)
+        test.addCleanup(self.p.kill)
+        self.p.stdout.readline()  # its handler is in place
+        self.cmd = f"claude --settings {root}/.foremind/sessions/{session}.settings.json --model m"
+
+    def ps(self):
+        return NOBODY + (f"{self.p.pid} 1 0.5 2048 {self.lstart} {self.cmd}\n" if self.p.poll() is None else "")
+
+
+def _no_ps():
+    raise sessions.SessionsError("denied")
+
+
 class OrcaCarrierTest(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
@@ -91,6 +125,7 @@ class OrcaCarrierTest(unittest.TestCase):
         self.enterContext(mock.patch.dict(os.environ, {"PATH": f"{bin_}{os.pathsep}{os.environ['PATH']}",
                                                        "FAKE_ORCA_STATE": str(self.state),
                                                        "FAKE_EVENTS": str(self.events)}))
+        self.enterContext(mock.patch.object(carriers.Carrier, "ps", staticmethod(lambda: NOBODY)))
         self.c = carriers.get("orca", self.tmp)
         self.launch = Launch(["claude", "--settings", "/s.json"], {"FOREMIND_SESSION": "fm-p-p_1-1"}, self.tmp / "wt")
 
@@ -102,7 +137,8 @@ class OrcaCarrierTest(unittest.TestCase):
         terms = self.st()["terms"]
         self.assertEqual(len(terms), 1)
         self.assertEqual((terms[0]["asked_title"], terms[0]["title"]), ("fm-p-p_1-1", "✳ Claude Code"))
-        self.assertEqual(terms[0]["worktree"], f"path:{self.tmp / 'wt'}")
+        self.assertEqual(terms[0]["worktree"], f"path:{self.tmp}")  # the project's Orca entry: a visible tab
+        self.assertIn(f"cd {self.tmp / 'wt'} && ", terms[0]["command"])  # the seat still runs in its worktree
         self.assertIn("FOREMIND_SESSION=fm-p-p_1-1 claude --settings /s.json", terms[0]["command"])
         rec = json.loads((self.tmp / ".foremind" / "carriers" / "orca" / "fm-p-p_1-1.json").read_text())
         self.assertEqual(rec, {"session": "fm-p-p_1-1", "handle": "term_1"})
@@ -161,6 +197,27 @@ class OrcaCarrierTest(unittest.TestCase):
         with mock.patch.object(self.c, "_listed", return_value={"term_1"}):
             self.assertIsNone(self.c.close("fm-p-p_1-1"))
 
+    def test_close_waits_for_the_process_orca_let_live(self):
+        """m2d.1.D1: Orca's answer (stale handle, or gone from list) while the claude in its pty runs on."""
+        self.c.create("fm-p-p_1-1", self.launch)
+        seat = Seat(self, self.tmp, "fm-p-p_1-1")
+        self.c.ps = seat.ps
+        self.assertEqual(self.c.close("fm-p-p_1-1"), ExitEvidence("fm-p-p_1-1", "orca", "absent"))
+        self.assertEqual(seat.p.wait(5), -15, "SIGTERM, to that pid")
+        self.c.create("fm-p-p_1-2", self.launch)
+        st = self.st()
+        st["terms"][0]["stale"] = True
+        self.state.write_text(json.dumps(st))
+        stubborn = Seat(self, self.tmp, "fm-p-p_1-2", ignore=True)
+        self.c.ps, self.c.exit_timeout_s = stubborn.ps, 0.3
+        self.assertIsNone(self.c.close("fm-p-p_1-2"), "still running: no evidence")
+        self.assertIsNone(stubborn.p.poll(), "never SIGKILL")
+        self.c.ps = _no_ps  # REQ-1: identity unchecked: nothing sent, the evidence stands, recorded once
+        self.c.create("fm-p-p_1-3", self.launch)
+        self.assertEqual(self.c.close("fm-p-p_1-3"), ExitEvidence("fm-p-p_1-3", "orca", "absent"))
+        (u,) = [e for e in EventLog(self.events).iter() if e["type"] == "session_close_unverified"]
+        self.assertEqual((u["session"], u["why"]), ("fm-p-p_1-3", "ps: denied"))
+
     def test_send_to_unknown_session_fails_and_is_recorded(self):
         with self.assertRaises(carriers.CarrierError):
             self.c.deliver("fm-nobody", "hi")
@@ -181,6 +238,7 @@ class TmuxCarrierTest(unittest.TestCase):
         self.enterContext(mock.patch.dict(os.environ, {"PATH": f"{bin_}{os.pathsep}{os.environ['PATH']}",
                                                        "FAKE_TMUX_LOG": str(self.log), "FAKE_TMUX_PID": "1",
                                                        "HOME": str(self.tmp), "FOREMIND_CONFIG_HOME": str(self.tmp)}))
+        self.enterContext(mock.patch.object(carriers.Carrier, "ps", staticmethod(lambda: NOBODY)))
         self.c = carriers.get("tmux", self.tmp)
         self.default_sock = self.tmp / ".local" / "state" / "foremind" / "tmux" / "foremind.sock"
 
@@ -241,6 +299,13 @@ class TmuxCarrierTest(unittest.TestCase):
         self.mode("stubborn")  # kill-session does not end it
         self.c.exit_timeout_s = 0.3
         self.assertIsNone(self.c.close("fm-x"))
+
+    def test_close_waits_for_a_claude_the_pane_left_behind(self):
+        self.mode("gone")  # tmux: no such session, while its claude runs on
+        seat = Seat(self, self.tmp, "fm-x")
+        self.c.ps = seat.ps
+        self.assertEqual(self.c.close("fm-x"), ExitEvidence("fm-x", "tmux", "absent"))
+        self.assertEqual(seat.p.wait(5), -15)
 
     def test_timeout_is_a_carrier_error(self):
         with mock.patch("subprocess.run", side_effect=subprocess.TimeoutExpired(["tmux"], 60)):

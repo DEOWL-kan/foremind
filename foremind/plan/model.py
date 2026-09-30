@@ -1,7 +1,7 @@
 """Plans on disk (DESIGN §1.3): `plans/<plan-id>/{goal.md, plan.md, plan.html}`, batch headers in `batches/<id>.md`.
 
 goal.md header: `frozen_at` + `sha256` (of the body). plan.md header: schema `plan`. Batch files: schema `batch_header`.
-Batch-header fields this package uses beyond that schema (the schema allows extra fields):
+Batch-header fields this package reads (contract, coupling and config_approved are in that schema too):
   contract          "true" marks a contract batch (§4.2 5a); its owns_paths are the contract files
   coupling          [{"batch", "score": 0..1, "reason"}] the planner's semantic coupling declaration (§4.2 5d)
   state, state_prior, blocked_reason   program-written (§20 I1)
@@ -21,7 +21,8 @@ from foremind.paths import state_dir
 RUNTIME_FIELDS = ("state", "state_prior", "blocked_reason")  # change while the plan runs: outside plan_hash
 PROGRAM_FIELDS = (*RUNTIME_FIELDS, "config_approved")
 UNSTARTED = (None, "planned", "ready")
-_STATUS = re.compile(r"^## 状态[ \t]*$", re.M)
+_STATUS = re.compile(r"## 状态[ \t]*")
+_FENCE = re.compile(r" {0,3}(`{3,}|~{3,})")
 TERMINAL = ("merged", "cataloged", "cancelled")  # their paths are free again: left out of every check
 
 
@@ -67,8 +68,19 @@ def config_hash(h: dict) -> str:
 
 
 def spec(body: str) -> str:
-    """A batch body without its `## 状态` section (runtime-written, DESIGN §1.3)."""
-    return _STATUS.split(body, 1)[0]
+    """A batch body without its `## 状态` section (runtime-written, DESIGN §1.3). A `## 状态` line inside a ``` / ~~~
+    fenced block is text, not the section; a fence still open at the end fences nothing (the first `## 状态` line cuts),
+    else the section review.set_state appends would count and each state write would unbind the plan."""
+    fence, at, first = None, 0, None
+    for line in body.split("\n"):
+        if m := _FENCE.match(line):  # a fence closes on the same character, at least as long
+            fence = m[1] if fence is None else None if m[1].startswith(fence) else fence
+        elif _STATUS.fullmatch(line):
+            if fence is None:
+                return body[:at]
+            first = at if first is None else first
+        at += len(line) + 1
+    return body if first is None or fence is None else body[:first]
 
 
 def plan_hash(plan) -> str:
@@ -90,8 +102,9 @@ def approved_hash(root, plan_id) -> str | None:
 
 
 def is_bound(root, plan) -> bool:
-    """The plan is the one last approved or amended through the program (not edited by hand since)."""
-    return plan_hash(plan) == approved_hash(root, plan.id)
+    """The plan is approved and is the one last approved or amended through the program (not edited by hand since).
+    An amend of a not yet approved plan also records a plan_hash; that alone never binds it."""
+    return "approved_at" in plan.doc.header and plan_hash(plan) == approved_hash(root, plan.id)
 
 
 def task_config_approved(root, plan, bid, *, bound=None) -> bool:

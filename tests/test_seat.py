@@ -9,10 +9,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from foremind import cli, handoff, header, lock, seat, worktree
+from foremind import cli, handoff, header, inbox, lock, seat, worktree
 from foremind.carriers import Carrier, CarrierError, SessionExists, SessionState
 from foremind.carriers.manual import ManualCarrier
 from foremind.events import EventLog
+from foremind.fsutil import sha256_file
 from foremind.lock import ExitEvidence
 from foremind.state import IllegalTransition
 
@@ -94,6 +95,7 @@ class SeatTest(unittest.TestCase):
             **GIT_ENV, "FOREMIND_WT_ROOT": str(self.tmp / "wt"), "FOREMIND_CONFIG_HOME": str(self.cfg_home),
             "PATH": f"{bin_}{os.pathsep}{os.environ['PATH']}", "FAKE_GH_HEAD": "", "FAKE_GH_LOG": str(self.gh_log)}))
         os.environ.pop("FOREMIND_PROJECT", None)
+        os.environ.pop("FOREMIND_JOB", None)  # e.g. these tests run by a gate job
         self.root = self.tmp / "shop"
         (self.root / ".foremind" / "batches").mkdir(parents=True)
         self.main = {}
@@ -186,6 +188,28 @@ class SeatTest(unittest.TestCase):
         self.assertEqual([(e["phase"], e.get("ok")) for e in self.events("seat_open")],
                          [("intent", None), ("result", True)])
         self.assertEqual({e["dedupe_id"] for e in self.events("seat_launch")}, {f"seat_launch:{s}"})  # N-b
+
+    def test_open_records_its_job_and_pid_and_the_settings_hash(self):  # m2b.10
+        self.write_header("p.1")
+        real, launched_with = seat.wait_heartbeat, []
+
+        def edited_meanwhile(root, session, *a):  # r1 #5: the hash is of the file the session started with
+            p = seat.settings_path(root, session)
+            launched_with.append(sha256_file(p))
+            p.write_text("{}")
+            return real(root, session, *a)
+
+        with mock.patch.dict(os.environ, {"FOREMIND_JOB": "j-7"}), \
+                mock.patch.object(seat, "wait_heartbeat", edited_meanwhile):  # FOREMIND_JOB: job.start sets it
+            self.open("p.1")
+        intents = lambda: [e for e in self.events("seat_open") if e["phase"] == "intent"]  # noqa: E731
+        self.assertEqual((intents()[0]["job"], intents()[0]["pid"]), ("j-7", os.getpid()))
+        launched = next(e for e in self.events("seat_launch") if e["phase"] == "result")
+        self.assertEqual(launched["settings_sha256"], launched_with[0])
+        self.assertNotEqual(launched_with[0], sha256_file(seat.settings_path(self.root, launched["session"])))
+        self.write_header("p.2", owns_paths=["api:lib/**"])
+        self.assertTrue(self.open("p.2")["ok"])
+        self.assertEqual((intents()[1]["job"], intents()[1]["pid"]), (None, os.getpid()), "the user's command")
 
     def test_fresh_open_only_from_ready(self):
         # SF-C: a started batch without a holder goes to a successor (verified, bound by accept), not a new seat
@@ -573,6 +597,80 @@ class SeatTest(unittest.TestCase):
         opened = self.events("seat_opened")[-1]
         self.assertEqual((opened["predecessor"], opened["record"]), (None, "none"))
         self.assertIsNone(handoff.accept(self.root, "p.1", res["session"]))
+
+    def test_successor_takes_a_newer_review_request_as_the_record(self):  # finding 33
+        self.write_header("p.1")
+        s1 = self.open("p.1")["session"]
+        handoff.write_section(self.root, "p.1", self.section(git(self.wt("p.1"), "rev-parse", "HEAD"), ("true", 0)),
+                              author=s1)
+        head = commit(self.wt("p.1"), "src/fix.py", "committed after the section, then sent for review")
+        ev = EventLog(self.root / ".foremind" / "events.jsonl")
+        ev.append("review_requested", batch="p.1", heads={"api": head}, requested_by=s1)
+        lock.break_lock(self.root, "p.1", ExitEvidence(s1, "fake", "absent"))  # released on delivery, sent back
+        res = self.open("p.1", successor=True)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(self.events("seat_opened")[-1]["record"], "review_request")
+        s2 = res["session"]
+        handoff.accept(self.root, "p.1", s2)
+        later = commit(self.wt("p.1"), "src/more.py", "a newer section names this, not the older review request")
+        handoff.write_section(self.root, "p.1", self.section(later, ("true", 0)), author=s2)
+        lock.break_lock(self.root, "p.1", ExitEvidence(s2, "fake", "absent"))
+        res = self.open("p.1", successor=True)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(self.events("seat_opened")[-1]["record"], "handoff")
+
+    def sent_back(self):
+        """p.1 sent back by review r2 while no seat holds it, the controller's list after the receipt."""
+        self.write_header("p.1")
+        s1 = self.open("p.1")["session"]
+        head = commit(self.wt("p.1"), "src/a.py", "x")
+        ev = EventLog(self.root / ".foremind" / "events.jsonl")
+        ev.append("changes_requested_by", batch="p.1", by="controller", items=["an older round, already fixed"])
+        ev.append("review_requested", batch="p.1", heads={"api": head}, requested_by=s1)
+        lock.break_lock(self.root, "p.1", ExitEvidence(s1, "fake", "absent"))  # released on delivery
+        issues = [{"severity": "must", "location": "api:src/a.py:1", "summary": "空值没处理"},
+                  {"severity": "note", "was": "must_fix", "filtered": "withdrawn", "location": "a.md", "summary": "撤回"}]
+        (self.root / ".foremind" / "batches" / "p.1.review.r2.json").write_text(
+            json.dumps({"verdict": "changes_requested", "issues": issues}))
+        # the receipt is written before the move it causes (review._settle), the controller's list after its own
+        ev.append("review_receipt", batch="p.1", round=2, path="p.1.review.r2.json", verdict="changes_requested")
+        ev.append("batch_state", batch="p.1", prior="in_review", state="changes_requested")
+        ev.append("changes_requested_by", batch="p.1", by="controller", items=["补一个用例", "改文案"])
+        self.write_header("p.1", state="changes_requested")
+
+    def test_successor_of_a_sent_back_batch_gets_the_lists_in_its_inbox(self):  # finding 34
+        self.sent_back()
+        res = self.open("p.1", successor=True)
+        self.assertTrue(res["ok"], res)
+        s2 = res["session"]
+        msgs = inbox.pending_messages(s2, root=self.root)
+        self.assertEqual([m.sender for m in msgs], ["supervisor", "controller"])
+        self.assertEqual(msgs[0].text, "Foremind：审查第 2 轮要求修改：\n- [must] api:src/a.py:1：空值没处理\n"
+                                       "- [note，原为 must_fix，withdrawn] a.md：撤回\n"
+                                       "改完提交，再执行 `foremind review`。", "m2e REQ-8: the same lines as tick._gate")
+        self.assertIn("\n- 补一个用例\n- 改文案\n改完提交", msgs[1].text)
+        self.assertNotIn("older round", "".join(m.text for m in msgs))
+        self.assertEqual(self.state("p.1"), "running")
+        self.assertIn("handoff --accept", self.carrier.sent[-1][1], "the kickoff after the lists")
+        handoff.accept(self.root, "p.1", s2)
+        lock.break_lock(self.root, "p.1", ExitEvidence(s2, "fake", "absent"))
+        s3 = self.open("p.1", successor=True)["session"]  # running now: nothing is sent again
+        self.assertEqual(inbox.pending_messages(s3, root=self.root), [])
+
+    def test_lists_outlive_a_failed_kickoff(self):  # r1 #2: running already, and no edge back
+        self.sent_back()
+        self.carrier.send_error = CarrierError("paste failed")
+        for _ in range(2):  # the second from running, as the supervisor would retry
+            with self.assertRaises(CarrierError):
+                self.open("p.1", successor=True)
+            self.assertEqual(self.state("p.1"), "running")
+        self.carrier.send_error = None
+        s = self.open("p.1", successor=True)["session"]
+        self.assertEqual([m.sender for m in inbox.pending_messages(s, root=self.root)], ["supervisor", "controller"])
+        handoff.accept(self.root, "p.1", s)
+        lock.break_lock(self.root, "p.1", ExitEvidence(s, "fake", "absent"))
+        s = self.open("p.1", successor=True)["session"]  # the one before took them
+        self.assertEqual(inbox.pending_messages(s, root=self.root), [])
 
     def test_successor_only_for_started_states(self):
         for st in ("ready", "review_ready", "paused"):

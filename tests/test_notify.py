@@ -3,13 +3,15 @@ import os
 import socket
 import tempfile
 import threading
+import time
 import unittest
 import urllib.parse
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
-from foremind import notify
+from foremind import events, notify
 from foremind.events import EventLog
 
 
@@ -112,6 +114,70 @@ class NtfyTest(unittest.TestCase):
     def test_no_proxy_from_the_environment_in_tests(self):  # M-2
         with mock.patch.dict(os.environ, {"https_proxy": "http://attacker.invalid:1"}):
             self.assertEqual(notify.get(self.root, {"notify.channel": "ntfy"}).routes(), [{}])
+
+
+class Rec:
+    name = "rec"
+
+    def __init__(self):
+        self.sent = []
+
+    def send(self, title, body, priority="P1"):
+        self.sent.append((title, body, priority))
+        return True
+
+
+class PolicyTest(unittest.TestCase):  # m2b.6, §11.2
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (self.root / ".foremind").mkdir()
+        self.rec = Rec()
+
+    def events(self, type):
+        return [e for e in EventLog(self.root / ".foremind" / "events.jsonl").iter() if e["type"] == type]
+
+    def send(self, key, priority, cfg=None, at=None):
+        at = at or time.time()
+        with mock.patch.object(notify.time, "time", return_value=at), \
+                mock.patch.object(events, "_now", lambda: datetime.fromtimestamp(at, timezone.utc).isoformat()):
+            return notify.notify(self.root, cfg or {}, key, f"t-{key}", "b", priority, adapter=self.rec)
+
+    def test_p0_two_per_twelve_hours_then_held_and_counted_in_the_next(self):
+        self.assertEqual([self.send(k, "P0") for k in ("a", "b", "c", "d")], [True, True, False, False])
+        self.assertIsNone(self.send("c", "P0"), "a held key counts as handled")
+        self.assertEqual([(e["key"], e["title"]) for e in self.events("notify_held")], [("c", "t-c"), ("d", "t-d")])
+        self.assertTrue(self.send("p1", "P1"), "P1 is not limited")
+        later = time.time() + 12 * 3600 + 60
+        self.assertTrue(self.send("e", "P0", at=later))
+        self.assertEqual(self.rec.sent[-1], ("t-e", "b\n另有 2 条告警未单独推送，见运行报告", "P0"))
+        self.assertTrue(self.send("f", "P0", at=later))
+        self.assertEqual(self.rec.sent[-1][1], "b", "counted once")
+        self.assertIs(self.send("g", "P0", at=later), False)
+
+    def test_an_unsent_p0_does_not_count(self):
+        self.rec.send = lambda *a: False
+        self.assertEqual([self.send(k, "P0") for k in "abc"], [False] * 3)
+        self.assertEqual(self.events("notify_held"), [])
+
+    def test_p1_to_the_report_when_asked(self):
+        cfg = {"notify.p1": "report"}
+        self.assertIs(self.send("a", "P1", cfg), False)
+        self.assertIsNone(self.send("a", "P1", cfg))
+        self.assertEqual([(e["key"], e["title"]) for e in self.events("notify_deferred")], [("a", "t-a")])
+        self.assertTrue(self.send("run_report:x", "P1", cfg), "the report's own summary goes out")
+        self.assertTrue(self.send("b", "P0", cfg))
+        self.assertEqual([t for t, _, _ in self.rec.sent], ["t-run_report:x", "t-b"])
+        self.assertTrue(self.send("c", "P1"), "default: push")
+        self.assertTrue(self.send("d", "P1", {"notify.p1": "push"}))
+
+    def test_deferred_tells_a_held_or_deferred_key_from_a_failed_send(self):  # REQ-16
+        self.send("a", "P1", {"notify.p1": "report"})
+        self.send("b", "P0")
+        self.send("c", "P0")
+        self.send("d", "P0")  # the third P0 in 12 hours: held
+        self.rec.send = lambda *a: False
+        self.send("e", "P1")  # unsent
+        self.assertEqual([notify.deferred(self.root, k) for k in "abcdef"], [True, False, False, True, False, False])
 
 
 if __name__ == "__main__":

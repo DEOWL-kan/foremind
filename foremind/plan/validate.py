@@ -13,9 +13,12 @@ REQ coverage and the batch count still include all but cancelled ones. Approved 
 this plan's: disjointness runs across plans (§1.3); an overlap with a draft plan is only a warning.
 """
 import re
-from fnmatch import fnmatchcase
+import shlex
 
 from foremind import config as cfg
+from foremind import defaults
+from foremind import pathmatch
+from foremind import repos as rp
 from foremind import schemas
 from foremind.plan import schedule
 from foremind.plan.model import UNSTARTED, is_bound, is_contract, spec, task_config_approved, text_hash
@@ -29,39 +32,25 @@ _WORD = r"(?<![\w/.:-]){}(?![\w/-]|\.\w)"
 _FORBIDDEN = re.compile("|".join(_WORD.format(re.escape(w)) if w.isascii() else re.escape(w) for w in FORBIDDEN),
                         re.I | re.ASCII)
 _PROSE_KEYS = ("reason", "why", "step")  # header strings that are prose; commands and paths are not checked
+ALLOW_WORD = "<!-- fm-allow-word -->"  # a body line carrying it is not checked for forbidden words; header fields always are
 REQ = re.compile(r"\bREQ-[1-9][0-9]*\b")
-_WILD = re.compile(r"[*?[]")
-_CLASS = re.compile(r"\[!?\]?[^\]]*\]")
 
 
 def effective_budget(config: dict) -> int:
-    """§6.3: min(window × hard threshold, absolute cap)."""
-    return int(min(config.get("context.window_tokens", 200_000) * config.get("context.hard_pct", 80) / 100,
-                   config.get("context.abs_cap_tokens", 150_000)))
-
-
-def paths_overlap(a: str, b: str) -> bool:
-    """Could two repo-qualified glob patterns (§20 I8, I11) name the same file? Errs towards yes."""
-    (ra, _, pa), (rb, _, pb) = a.partition(":"), b.partition(":")
-    if ra != rb:
-        return False
-    pa, pb = (p + "*" if p.endswith("/") else p for p in (pa, pb))  # a directory owns what is below it
-    if fnmatchcase(pa, pb) or fnmatchcase(pb, pa):
-        return True
-    if not _WILD.search(pa) or not _WILD.search(pb):
-        return False  # a literal path the other pattern does not match
-    # ponytail: two globs overlap unless their literal prefixes or suffixes rule it out; write an exact glob
-    # intersection if the false positives serialise too much
-    (a0, *_, a1), (b0, *_, b1) = (_WILD.split(_CLASS.sub("?", p)) for p in (pa, pb))  # [...] is one character
-    return (a0.startswith(b0) or b0.startswith(a0)) and (a1.endswith(b1) or b1.endswith(a1))
+    """§6.3: min(window × hard threshold, absolute cap); unset keys as foremind/defaults.py has them (the runtime's)."""
+    d = defaults.table()
+    return int(min(config.get("context.window_tokens", d["context.window_tokens"])
+                   * config.get("context.hard_pct", d["context.hard_pct"]) / 100,
+                   config.get("context.abs_cap_tokens", d["context.abs_cap_tokens"])))
 
 
 def owns_overlap(xs, ys) -> list[list[str]]:
-    return [[x, y] for x in xs for y in ys if paths_overlap(x, y)]
+    return [[x, y] for x in xs for y in ys if pathmatch.overlap(x, y)]
 
 
 def _prose(doc):
     body = re.sub(r"```.*?```|~~~.*?~~~", "", spec(doc.body), flags=re.S)  # the status section is runtime-written
+    body = "\n".join(line for line in body.splitlines() if ALLOW_WORD not in line)
     yield re.sub(r"`[^`\n]*`", "", body)
     stack = [(None, doc.header)]
     while stack:
@@ -81,6 +70,51 @@ def _ancestors(deps):
     for b in schedule.topo(deps):
         anc[b] = set().union(*({d} | anc[d] for d in deps[b]))
     return anc
+
+
+def _unittest_names(cmd):
+    """Dotted names `python3 -m unittest` is given in `cmd` (not discover)."""
+    try:
+        words = shlex.split(cmd)
+    except ValueError:
+        return []
+    out = []
+    for i in range(len(words) - 1):
+        if words[i:i + 2] != ["-m", "unittest"]:
+            continue
+        args = words[i + 2:]
+        if args[:1] == ["discover"]:
+            continue
+        for prev, w in zip(["unittest", *args], args):
+            if w in ("&&", "||", ";", "|"):
+                break
+            if prev != "-k" and not w.startswith("-") and "." in w and "/" not in w and not w.endswith(".py"):
+                out.append(w)
+    return out
+
+
+def _unittest_warnings(b, h, repo_paths):
+    """`python3 -m unittest a.b` does not find a/b.py when a/ is not a package (M2 pilot finding 6)."""
+    out = []
+    for cmd in h["accept_commands"]:
+        for name in _unittest_names(cmd):
+            top = name.split(".")[0]
+            if any((p / top).is_dir() and not (p / top / "__init__.py").exists()
+                   for r, p in repo_paths.items() if r in h["repos"]):
+                out.append(f"{b}: accept command {cmd!r}: {top}/ has no __init__.py, so `-m unittest {name}` may not "
+                           f"load it; write python3 -m unittest discover -s {top} -p '<file>.py'")
+    return out
+
+
+def _widened(root, h):
+    """Task config keys that load only with the user's approval (§1.5)."""
+    out = []
+    for k, x in cfg.task_layer(h).items():
+        try:
+            cfg.load(root, {k: x})
+        except cfg.ConfigError:
+            out.append(k)
+    return out
 
 
 def _coupling_ok(c, b, plan):
@@ -119,8 +153,10 @@ def _check_batches(root, plan, mine, config, user_approved, config_bound, errors
     for where, doc in [("plan.md", plan.doc), *mine.items()]:
         hits = {m.group() for text in _prose(doc) for m in _FORBIDDEN.finditer(text)}
         errors += [f"{where}: forbidden word {w!r} in prose" for w in sorted(hits)]
+    repo_paths = {r.id: r.path for r in rp.load_repos(root, config)}
     for b, d in mine.items():
         h = d.header
+        warnings += _unittest_warnings(b, h, repo_paths)
         if h["plan_id"] != plan.id:
             errors.append(f"{b}: plan_id {h['plan_id']!r} is not {plan.id!r}")
         if h.get("state", "planned") not in BATCH.states:
@@ -136,9 +172,9 @@ def _check_batches(root, plan, mine, config, user_approved, config_bound, errors
             if not _coupling_ok(c, b, plan):
                 errors.append(f"{b}: coupling[{i}] needs batch (another batch of this plan), score 0..1 and reason")
         if "config" in h:  # §1.5: a task may only tighten authorisation keys unless the user approved it
+            stamped = task_config_approved(root, plan, b, bound=config_bound)
             try:
-                cfg.load(root, cfg.task_layer(h), task_user_approved=user_approved
-                         or task_config_approved(root, plan, b, bound=config_bound))
+                cfg.load(root, cfg.task_layer(h), task_user_approved=user_approved or stamped)
             except cfg.ConfigError as e:
                 try:
                     cfg.load(root, cfg.task_layer(h), task_user_approved=True)
@@ -147,6 +183,9 @@ def _check_batches(root, plan, mine, config, user_approved, config_bound, errors
                 else:
                     msg = f"{b}: task config needs user approval (plan approve / amend --user-approved): {e}"
                     (errors if approved_plan else warnings).append(msg)
+            else:
+                if user_approved and not stamped:  # this approval is what lets it load
+                    warnings += [f"批准将放宽 {b} 的 {k}" for k in _widened(root, h)]
 
 
 def validate(root, plan, *, others=(), config=None, coupling=None, user_approved=False, width=None,
@@ -233,11 +272,13 @@ def validate(root, plan, *, others=(), config=None, coupling=None, user_approved
         a, b = c["a"], c["b"]
         if a not in mine or b not in mine or a in anc[b] or b in anc[a]:
             continue
+        unknown = [s for s in ("ref", "cochange") if c[s] is None]
+        at = f"C={c['score']:.2f}" + (f" ({', '.join(unknown)} unknown)" if unknown else "")
         if c["tier"] == "high":
-            warnings.append(f"{a} / {b}: C={c['score']:.2f}, high coupling: one seat in sequence, or merge them")
+            warnings.append(f"{a} / {b}: {at}, high coupling: one seat in sequence, or merge them")
         elif c["tier"] == "medium" and not ({m["batch"] for m in mine[a].header["merge_after"]} & {b}
                                              or {m["batch"] for m in mine[b].header["merge_after"]} & {a}):
-            warnings.append(f"{a} / {b}: C={c['score']:.2f}, parallel but needs merge_after with a reason")
+            warnings.append(f"{a} / {b}: {at}, parallel but needs merge_after with a reason")
 
     sub = {b: {**allb[b], "depends_on": sorted(deps[b])} for b in mine}
     report["waves"] = schedule.waves(sub, width)

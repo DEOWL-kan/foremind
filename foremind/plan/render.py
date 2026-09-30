@@ -22,6 +22,10 @@ def _reasons(report):
     return out
 
 
+def _sig(x):
+    return "未知" if x is None else str(x)
+
+
 def summary(plan, report) -> str:
     wave, reasons = _waves(report), _reasons(report)
     cp = report["critical_path"]
@@ -32,6 +36,8 @@ def summary(plan, report) -> str:
         h = d.header
         lines.append(" | ".join([b, str(wave.get(b, "-")), h["tiers"]["difficulty"], _MODES[h["mode"]],
                                  h.get("state", "草稿"), "；".join(reasons.get(b, [])) or "-"]))
+    lines += [f"耦合：{c['a']} / {c['b']}：引用 {_sig(c['ref'])} · 共改 {_sig(c['cochange'])} · 语义 {c['semantic']}"
+              f" → C={c['score']:.2f} {c['tier']}" + ("（同改契约）" if c["contract"] else "") for c in report["coupling"]]
     lines += [f"错误：{e}" for e in report["errors"]] + [f"提示：{w}" for w in report["warnings"]]
     lines += [f"重叠：{o['a']} / {o['b']} → 补边 {o['b']} depends_on {o['a']}" for o in report["overlaps"]]
     return "\n".join(lines) + "\n"
@@ -103,7 +109,8 @@ def html(plan, report) -> str:
     parts.append("</table>")
     if report["coupling"]:
         parts.append("<h2>耦合</h2><table><tr><th>批次对</th><th>引用</th><th>共改</th><th>语义</th><th>C</th><th>档</th></tr>")
-        parts += [f"<tr><td>{escape(c['a'])} / {escape(c['b'])}</td><td>{c['ref']}</td><td>{c['cochange']}</td>"
+        parts += [f"<tr><td>{escape(c['a'])} / {escape(c['b'])}</td><td>{_sig(c['ref'])}</td>"
+                  f"<td>{_sig(c['cochange'])}</td>"
                   f"<td>{c['semantic']}</td><td>{c['score']:.2f}</td><td>{escape(c['tier'])}</td></tr>"
                   for c in report["coupling"]]
         parts.append("</table>")
@@ -113,5 +120,7 @@ def html(plan, report) -> str:
         rows = "".join(f"<tr><th>{escape(k)}</th><td>{_field(v)}</td></tr>" for k, v in d.header.items())
         parts.append(f'<details id="b-{escape(b)}"><summary>{escape(b)}{muted} · {_field(d.header["reqs"])}</summary>'
                      f"<table>{rows}</table><pre>{escape(d.body)}</pre></details>")
+    if plan.goal is not None:
+        parts.append(f"<h2>目标</h2><pre>{escape(plan.goal.body)}</pre>")
     parts.append(f"<h2>计划说明</h2><pre>{escape(plan.doc.body)}</pre></body></html>\n")
     return "".join(parts)

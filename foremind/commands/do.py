@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 from foremind import config as cfg
 from foremind import repos as rp
-from foremind import schemas
+from foremind import schemas, seat
 from foremind.events import EventLog
 from foremind.fsutil import project_lock
 from foremind.paths import ProjectNotFound, find_project_root, state_dir
@@ -16,7 +16,7 @@ from foremind.plan import validate as v
 from foremind.plan.freeze import Rejected
 from foremind.plan.model import Doc, Plan, PlanError
 
-MODEL = "claude-opus-5-5"  # §3.2 「强」 for Claude; S-tier seat effort is medium
+MODEL, EFFORT = "claude-opus-5-5", "medium"  # §3.2 「强」 for Claude, S-tier seat; routes.seat.{model,effort} override
 
 
 def register(sub):
@@ -26,7 +26,7 @@ def register(sub):
     p.add_argument("--accept", action="append", required=True, metavar="CMD", help="acceptance command (repeatable)")
     p.add_argument("--id", dest="plan_id", help="plan id (default do-<n>)")
     p.add_argument("--mode", choices=schemas.MODES, default="auto")
-    p.add_argument("--model", default=MODEL)
+    p.add_argument("--model", help="seat model (default routes.seat.model, else claude-opus-5-5)")
     p.set_defaults(func=_run)
 
 
@@ -35,11 +35,13 @@ def _next_id(root):
     return f"do-{max(ns, default=0) + 1}"
 
 
-def create(root, requirement, *, owns, accept, plan_id=None, mode="auto", model_name=MODEL, config=None) -> Plan:
+def create(root, requirement, *, owns, accept, plan_id=None, mode="auto", model_name=None, config=None) -> Plan:
     requirement = requirement.strip()
     if not requirement or "\n" in requirement:
         raise PlanError("the requirement is one non-empty line")
     config = config if config is not None else cfg.load(root)
+    model_name = model_name or config.get("routes.seat.model", MODEL)
+    seat._check_model(config, model_name)  # exclude.models / exclude.providers: no route gets around them
     known = rp.load_repos(root, config)
     repos = sorted({rp.split_qualified(q, known)[0] for q in owns})
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -54,7 +56,8 @@ def create(root, requirement, *, owns, accept, plan_id=None, mode="auto", model_
             "id": bid, "plan_id": plan_id, "reqs": ["REQ-1"], "repos": repos, "owns_paths": list(owns), "reads": [],
             "depends_on": [], "merge_after": [], "start_commands": [], "accept_commands": list(accept),
             "tiers": {"difficulty": "S", "org": "exec_review", "review": "zero_context", "model": model_name,
-                      "effort": "medium", "reason": "S 档快速路径：用户用 foremind do 直接下达"},
+                      "effort": config.get("routes.seat.effort", EFFORT),
+                      "reason": "S 档快速路径：用户用 foremind do 直接下达"},
             "mode": mode, "hard_block": [], "budget_estimate": str(v.effective_budget(config) // 2),
             "must_read": [], "tools": [], "state": "planned",
         }
@@ -85,7 +88,7 @@ def _run(args):
     except Rejected as e:
         print(render.rejected(e.report), file=sys.stderr, end="")
         return 1
-    except (ProjectNotFound, PlanError, cfg.ConfigError, OSError, ValueError) as e:
+    except (ProjectNotFound, PlanError, cfg.ConfigError, seat.SeatError, OSError, ValueError) as e:
         print(f"foremind do: {e}", file=sys.stderr)
         return 1
     bid = next(iter(plan.batches))

@@ -1,12 +1,13 @@
 """`foremind doctor [--rescan]` (DESIGN §13.4): check every piece, with a fix command per failure; exit 0 when all
 green, else 1. `--rescan` first redoes the delivery proposal (§7.5) and asks before rewriting delivery.toml;
 `--rescan --yes` keeps what delivery.toml has (saying where the detection now differs) and takes the proposal for the
-rest.
+rest. A WARN line is told, not counted.
 
 The hook interpreter and its package path come first: a hook whose python is gone or cannot import foremind fails
 silently in Claude Code. They are probed with the installed command line itself (`version` for the subcommand), in
 the directory the hooks run in. `[project].name` against running batches (§20 I39): their locks and worktrees carry
 the slug, so a changed name is an error to fix by hand, never rewritten here. Checks only: nothing is created."""
+import json
 import os
 import re
 import shlex
@@ -14,13 +15,16 @@ import shutil
 import subprocess
 import sys
 import tomllib
+from pathlib import Path
 
-from foremind import config, install, lock, review, seat, worktree
+from foremind import config, gate, install, lock, review, seat, worktree
 from foremind import header as hdr
 from foremind import repos as repos_mod
+from foremind.defaults import TABLE
 from foremind.install import detect, settings
 from foremind.paths import ProjectNotFound, find_project_root, state_dir, user_config_dir
 from foremind.schemas import BATCH_ID
+from foremind.supervisor.tick import supervisor_state
 
 
 def register(sub):
@@ -105,7 +109,19 @@ def _check_slug(add, root, cfg):
         "把 [project].name 改回在途批次开跑时的名字（不自动改：会话名、worktree 路径都依赖它）")
 
 
-def checks(root) -> list[tuple[str, bool, str, str]]:
+def _checks_branch(root, rid) -> str | None:
+    """The branch the proposal read the repo's required checks off: detect_repo reads branch protection on the target
+    branch it records as facts.target_branch (its evidence URL names the same branch); None when it does not say."""
+    try:
+        prop = json.loads((state_dir(root) / "delivery.proposal.json").read_text(encoding="utf-8"))
+        v = prop["repos"][rid]["facts"]["target_branch"]["value"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return v if isinstance(v, str) and v != detect.UNKNOWN else None
+
+
+def checks(root) -> list[tuple[str, bool | None, str, str]]:
+    """(name, ok, detail, fix); ok None = a warning."""
     out = []
 
     def add(name, ok, detail="", fix=""):
@@ -141,7 +157,7 @@ def checks(root) -> list[tuple[str, bool, str, str]]:
         add("gh 已登录", True, "不需要：没有 GitHub 远端，推送与开 PR 也不归系统")
     add("claude 在 PATH", bool(shutil.which("claude")), shutil.which("claude") or "",
         "安装 Claude Code：https://docs.claude.com/claude-code")
-    kind = (cfg or {}).get("carrier.kind", seat.DEFAULTS["carrier.kind"])
+    kind = (cfg or {}).get("carrier.kind", TABLE["carrier.kind"])
     add(f"承载 {kind} 在 PATH", kind == "manual" or bool(shutil.which(kind)), shutil.which(kind) or "",
         f"安装 {kind}，或在 .foremind/config.toml 的 [carrier] kind 换一个")
 
@@ -161,10 +177,32 @@ def checks(root) -> list[tuple[str, bool, str, str]]:
         add("delivery.toml 合法", False, str(e), "foremind doctor --rescan")
 
     if cfg is not None:
-        bare = [r.id for r in repos if review.ci_mode(cfg, r.id) == "none"] if not cfg.get("gate.checks") else []
-        add("ci = none 的仓库有 [gate].checks", not bare, f"ci = none 而没有本地检查，门禁永远不过：{bare}" if bare else "",
+        # #23 the user's: the gate takes local checks in place of CI whatever [gate].ci says
+        local = [r.id for r in repos if review.ci_mode(cfg, r.id) == "none" or not review.push_by_system(cfg, r.id)]
+        bare = local if not cfg.get("gate.checks") else []
+        add("ci = none 或 #23 归用户的仓库有 [gate].checks", not bare,
+            f"门禁只认本地检查，而 [gate].checks 为空，永远不过：{bare}" if bare else "",
             "在 foremind.toml 或 .foremind/config.toml 写 [gate] checks = [\"<本地检查命令>\"]；"
-            "或 foremind doctor --rescan 把 ci 改成 required / local_first")
+            "或 foremind doctor --rescan：ci 改成 required / local_first，且推送与开 PR（#23）归系统")
+        waits = [r for r in repos if r.id not in local and review.ci_mode(cfg, r.id) in ("required", "local_first")]
+        # external CI the branch protection requires; foremind/gate is the gate's own status, which _ci never waits for
+        noci = [r.id for r in waits if not any((Path(r.path) / ".github" / "workflows").glob("*.y*ml"))  # as detect
+                and not set(gate.required_checks(root, r.id) or ()) - {gate.GATE_CONTEXT}]
+        add("ci = required / local_first 的仓库有 CI", not noci,
+            f"没检测到 .github/workflows/*.yml，分支保护也没有（foremind/gate 以外的）必过检查，门禁会一直等不来的 CI：{noci}"
+            if noci else "",
+            "交互运行 foremind doctor --rescan 把 ci 改成 none，并在 foremind.toml 或 .foremind/config.toml 写 "
+            "[gate] checks = [\"<本地检查命令>\"]；或给仓库加 CI 工作流")
+        other = []  # the gate waits for the required checks read off one branch while it delivers to another
+        for r in waits:
+            if gate.required_checks(root, r.id) is None:
+                continue
+            src, tgt = _checks_branch(root, r.id), review.repo_cfg(cfg, r.id, "target_branch") or r.default_branch
+            if src is None or src != tgt:
+                other.append(f"{r.id}（必过检查取自 {src or '来源分支未知'}，目标分支 {tgt or '未知'}）")
+        if other:
+            add("必过检查取自门禁的目标分支", None, f"门禁按这份必过检查等 CI，目标分支的保护规则可能不同：{other}",
+                "核对目标分支的分支保护；foremind doctor --rescan 只读默认分支的保护规则")
         stuck = [r.id for r in repos if review.repo_cfg(cfg, r.id, "level") == "merge_dev"
                  and not (review.repo_cfg(cfg, r.id, "merge_method") or review.repo_cfg(cfg, r.id, "merge_command"))]
         add("merge_dev 的仓库有合入方式", not stuck,
@@ -190,6 +228,14 @@ def checks(root) -> list[tuple[str, bool, str, str]]:
     lp = user_config_dir() / "supervisor.lock"  # not taken: a supervisor starting now must not see it held
     add("supervisor.lock 可取", not lp.exists() or os.access(lp, os.R_OK | os.W_OK), str(lp),
         f"检查 {lp} 的权限")
+    st, rec = supervisor_state(root)
+    if st == "stopped" and rec:  # REQ-12: the recorded pid is gone, or another process has it now (D23)
+        add("监督进程在运行", None, f"监督进程未运行（supervisor.json 记的 pid {rec.get('pid')} 已退出或已被别的进程复用）",
+            "foremind supervise")
+    elif st != "stopped":  # finding 23: it re-executes itself unless the new code failed to run
+        add("监督进程代码与当前包一致", st == "current", f"监督进程代码旧于当前包（pid {rec.get('pid')}）" if st == "stale" else "",
+            "新代码试跑失败时监督进程会留在旧代码：看 events.jsonl 的 supervisor_reexec_failed，修好后它会再试；"
+            "或停掉后重新运行 foremind supervise")
     if cfg is not None:
         _check_slug(add, root, cfg)
     try:
@@ -219,9 +265,9 @@ def _run(args):
             return 1
     bad = 0
     for name, ok, detail, fix in checks(root):
-        print(f"{'ok  ' if ok else 'FAIL'} {name}" + (f"：{detail}" if detail else ""))
+        print(f"{'ok  ' if ok else 'WARN' if ok is None else 'FAIL'} {name}" + (f"：{detail}" if detail else ""))
         if not ok:
-            bad += 1
-            print(f"     修复：{fix}")
+            bad += ok is not None
+            print(f"     {'建议' if ok is None else '修复'}：{fix}")
     print("全部通过" if not bad else f"{bad} 项未通过")
     return 1 if bad else 0

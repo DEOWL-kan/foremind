@@ -1,7 +1,7 @@
 """Schemas of every structured artifact (DESIGN §1.4) and a small validator.
 
 A spec is a plain dict:
-  type           str | int | bool | list | dict | object (any JSON value)
+  type           str | int | float | bool | list | dict | object (any JSON value)
   opt            field may be absent (default: required)
   min, max       str/list/map length, or int value
   enum           allowed values
@@ -31,6 +31,7 @@ BATCH_ID = rf"{_NAME}\.[1-9][0-9]*"
 QPATH = rf"{_NAME}:(?!/)(?!\.\.(?:/|$))(?!.*/\.\.(?:/|$)).+"  # repo-qualified, relative, no ".." segment
 SHA = r"[0-9a-f]{40}|[0-9a-f]{64}"  # full object name (SHA-1 / SHA-256); abbreviations rejected
 SHA256 = r"[0-9a-f]{64}"
+FINGERPRINT = r"[0-9a-f]{12,64}"  # a review issue's (review.fingerprint)
 REQ_ID = r"REQ-[1-9][0-9]*"
 Q_ID = r"Q-[1-9][0-9]*"
 PV_ID = r"PV-[1-9][0-9]*"
@@ -47,6 +48,10 @@ REVIEW_LEVELS = ("self", "zero_context", "cross_vendor", "user")  # 自查 / 零
 MODES = ("auto", "watch", "accompany", "user")  # 自动 / 盯着 / 陪同 / 我来做
 SEVERITIES = ("must_fix", "should_fix", "note")
 ISSUE_STATUSES = ("new", "repeat", "disputed")
+REVIEW_BASES = ("req", "authz", "regression")  # REQ-15: what a must_fix rests on
+# REQ-15 (-> note), REQ-16 (-> should_fix): why the program lowered a must_fix
+REVIEW_FILTERS = ("no_basis", "outside_coverage", "withdrawn", "outside_delta", "over_cap")
+CATEGORIES = range(24)  # 授权表 #0–#23 (§8.1)
 AUDIT_SEVERITIES = ("P0", "P1", "P2", "P3")
 AUDIT_TRIGGERS = ("l0_fail", "pre_delivery", "plan_amend", "controller_context", "decider",
                   "soft_signals", "interval", "manual", "canary")
@@ -83,7 +88,8 @@ _STR = _s()
 _INT = {"type": int}
 _POS = {"type": int, "min": 1}
 _BOOL = {"type": bool}
-_CATEGORY = {"type": int, "min": 0, "max": 23}  # 授权表 #0–#23 (§8.1)
+_SCORE = {"alt": [{"type": int, "min": 0, "max": 1}, {"type": float, "min": 0, "max": 1}]}
+_CATEGORY = {"type": int, "min": CATEGORIES[0], "max": CATEGORIES[-1]}
 _DATETIME = {"type": str, "fmt": "datetime"}
 _DATE = {"type": str, "fmt": "date", "re": r"[0-9]{4}-[0-9]{2}-[0-9]{2}"}  # fromisoformat alone accepts 20260401
 _HEADS = {"type": dict, "keys": REPO_ID, "values": _s(SHA), "min": 1}
@@ -111,7 +117,11 @@ def _batch_check(h):
 
 def _receipt_check(r):
     want = "changes_requested" if any(i["severity"] == "must_fix" for i in r["issues"]) else "approved"
-    return [] if r["verdict"] == want else [("verdict", f"must be {want!r} given the issues' severities")]
+    out = [] if r["verdict"] == want else [("verdict", f"must be {want!r} given the issues' severities")]
+    if (r["scope"] == "incremental") != ("delta_from" in r):  # REQ-6: the heads an incremental review goes on from
+        out.append(("delta_from", "present exactly when scope is 'incremental'"))
+    return out + [(f"issues[{k}]", "was and filtered go together") for k, i in enumerate(r["issues"])
+                  if ("was" in i) != ("filtered" in i)]
 
 
 def _gate_check(g):
@@ -195,6 +205,10 @@ SPECS = {
         # only the count is capped (§20 I12, decided): a recommendation, not an allowlist, so tool names and
         # steps stay free text; the planner's 2-5 guideline lives in its role card
         "tools": _list(_obj({"name": _STR, "step": _STR}), max=5),
+        "contract": _opt(_enum("true", "false")),  # §4.2 5a: its owns_paths are the contract files
+        # §4.2 5d the planner's declaration; "another batch of this plan" is plan.validate's (it needs the plan)
+        "coupling": _opt(_list(_obj({"batch": _s(BATCH_ID), "score": _SCORE, "reason": _STR}))),
+        "config_approved": _opt(_s(SHA256)),  # program-written by plan approve / amend --user-approved (§1.5)
     }, extra=True, check=_batch_check),
     # §6.4 seven fields
     "handoff_section": _obj({
@@ -211,13 +225,18 @@ SPECS = {
         "unverified": _list(_STR),
         "pointers": _obj({"transcript": _STR, "turns": _list(_STR), "files": _list(_STR)}),
     }),
-    # §7.1, §20 I33; the program takes *only* verdict and issues[].{severity, location, summary, disputed} from
-    # the reviewer output; every other field (batch, heads, reviewer_session, model, effort, round, scope,
-    # rebound_from, and per issue id, fingerprint, status new | repeat) is written by the program. disputed: true
-    # becomes status "disputed" and the key is deleted, then the receipt is validated (§20 I9, I25)
+    # §7.1, §20 I33; the program takes *only* verdict and issues[].{severity, location, summary, disputed, basis,
+    # req} from the reviewer output (and checks a must_fix's quote, category, form, broken without keeping them);
+    # every other field (batch, heads, reviewer_session, model, effort, round, scope,
+    # rebound_from, delta_from, and per issue id, fingerprint, status new | repeat) is written by the program.
+    # disputed: true becomes status "disputed" and the key is deleted, then the receipt is validated (§20 I9, I25).
+    # incremental (REQ-6): a re-review of what changed since delta_from, the previous receipt's heads; delta is the
+    # §7.6 conflict increment. REQ-15/16 (program-written): an issue's basis and req as the reviewer gave them; a
+    # must_fix the program lowered keeps was (its severity before) and filtered (why); resolved / unresolved = the
+    # previous receipt's must_fix and should_fix fingerprints not reported again / reported again this round
     "review_receipt": _obj({
         "batch": _s(BATCH_ID),
-        "scope": _enum("full", "delta"),
+        "scope": _enum("full", "incremental", "delta"),
         "heads": _HEADS,
         "reviewer_session": _STR,
         "model": _STR,
@@ -226,19 +245,28 @@ SPECS = {
         "verdict": _enum("approved", "changes_requested"),
         "issues": _list(_obj({
             "id": _STR,
-            "fingerprint": _s(r"[0-9a-f]{12,64}"),
+            "fingerprint": _s(FINGERPRINT),
             "severity": _enum(*SEVERITIES),
             "status": _enum(*ISSUE_STATUSES),
             "location": _STR,
             "summary": _STR,
+            "basis": _opt(_enum(*REVIEW_BASES)),
+            "req": _opt(_s(REQ_ID)),
+            "was": _opt(_enum(*SEVERITIES)),
+            "filtered": _opt(_enum(*REVIEW_FILTERS)),
         })),
         "rebound_from": _opt(_HEADS),
+        "delta_from": _opt(_HEADS),
+        "resolved": _opt(_list(_s(FINGERPRINT), unique=True)),
+        "unresolved": _opt(_list(_s(FINGERPRINT), unique=True)),
     }, check=_receipt_check),
     # §7.2
     "acceptance_result": _obj({
         "batch": _s(BATCH_ID),
         "heads": _HEADS,
-        "commands": _list(_obj({"command": _STR, "exit_code": _INT, "output_path": _STR}), min=1),
+        # repo = where it ran (§20 I8); absent = the directory holding a multi-repo batch's checkouts
+        "commands": _list(_obj({"command": _STR, "repo": _opt(_s(REPO_ID)), "exit_code": _INT, "output_path": _STR}),
+                          min=1),
     }),
     # §7.3
     "gate_result": _obj({
@@ -354,6 +382,14 @@ SPECS = {
         "evidence": _list(_STR, min=1),
         "premises": _list(_STR),
     }),
+    # REQ-9: the seat's `## 交付说明` in the batch log (foremind log checks it, foremind land prints it); every list
+    # may be empty
+    "delivery_notes": _obj({
+        "config_keys": _list(_obj({"key": _STR, "merge_class": _enum("plain", "union", "repo_convention", "authz"),
+                                   "default": _opt({"type": object}), "why": _STR})),
+        "design": _list(_obj({"where": _STR, "text": _STR})),
+        "leftovers": _list(_obj({"item": _STR, "why": _STR})),
+    }),
 }
 # §20 I29: the cataloger's whole output; each part is checked by its own spec and written entry by entry.
 # Precedents and improvement entries never go through a patch. Consumers call validate("catalog_patch" |
@@ -368,7 +404,7 @@ KINDS = tuple(SPECS)
 
 # --- validator -------------------------------------------------------------
 
-_TYPE_NAMES = {str: "string", int: "integer", bool: "boolean", list: "array", dict: "object"}
+_TYPE_NAMES = {str: "string", int: "integer", float: "number", bool: "boolean", list: "array", dict: "object"}
 
 
 def _join(path, key):
@@ -395,7 +431,7 @@ def _check(spec, v, path, errs):
         return err(f"{v!r} not one of {list(spec['enum'])}")
     before = len(errs)
     if t is not bool:
-        n, what = (v, "value") if t is int else (len(v), "length")
+        n, what = (v, "value") if t in (int, float) else (len(v), "length")
         if n < spec.get("min", n):
             err(f"{what} {n} < {spec['min']}")
         if n > spec.get("max", n):
@@ -521,8 +557,9 @@ EXAMPLES = {
     "acceptance_result": {
         "batch": "auth.2",
         "heads": _HEADS_EX,
-        "commands": [{"command": "python3 -m unittest tests.test_token", "exit_code": 0,
-                      "output_path": ".foremind/batches/auth.2.accept.out.0.txt"}],
+        "commands": [{"command": "python3 -m unittest tests.test_token", "repo": "api", "exit_code": 0,
+                      "output_path": ".foremind/batches/auth.2.accept.out.0.txt"},
+                     {"command": "ls", "exit_code": 0, "output_path": ".foremind/batches/auth.2.accept.out.1.txt"}],
     },
     "gate_result": {
         "batch": "auth.2",
@@ -608,6 +645,12 @@ EXAMPLES = {
         "description": "新增开发依赖未走待决，审查才发现",
         "evidence": ["auth.2 review r1 issue 3"],
         "premises": ["依赖清单与运行时依赖在同一 pyproject.toml"],
+    },
+    "delivery_notes": {
+        "config_keys": [{"key": "land.commands", "merge_class": "plain",
+                         "default": ["python3 -m unittest discover -s tests"], "why": "合入前在临时 worktree 跑的全量命令"}],
+        "design": [{"where": "§13.5", "text": "foremind land：独立 worktree 合并、验证后 ff 目标分支"}],
+        "leftovers": [],
     },
 }
 EXAMPLES["catalog_output"] = {

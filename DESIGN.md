@@ -32,7 +32,7 @@
 ## 1. 总体架构
 
 ```
-用户 ── CLI · Claude Code 插件命令 · 本地审阅页 · 手机通知(ntfy) · 晨报
+用户 ── CLI · Claude Code 插件命令 · 本地审阅页 · 手机通知(ntfy) · 运行报告
   │
   ├─ 角色（agent 会话，判断都在这里）
   │    规划 planner · 总控 controller · 席位 seat · 审查 reviewer · 审计 auditor · 决策 decider · 编目 cataloger
@@ -72,7 +72,7 @@
 | PreToolUse | 写心跳并记「工具开始」；对 Edit/Write 类工具：`owns_paths` 越界拦截、按角色可写矩阵（§2.3）拦截、核对批次锁持有者是本会话；授权表硬拦截（路径、命令、工具名含 `mcp__<服务>__<工具>`），命中先查放行凭据（§8.2），无凭据则阻止并生成待决。阻断一律用 JSON `permissionDecision: "deny"` 加理由，不用退出码 2（它会把整条钩子命令行回显给模型）【实测】 |
 | PostToolUse | 心跳与「工具结束」（被 PreToolUse 拦下的调用不会有 PostToolUse，「工具开始」要能被下一次 PreToolUse 或 Stop 清掉）；从会话记录的 usage 计算上下文占用：`input_tokens + cache_creation_input_tokens + cache_read_input_tokens`，按 `message.id` 去重、跳过 `isSidechain` 条目【实测】 |
 | UserPromptSubmit | 记录用户在场（§10.8） |
-| statusLine | 写额度遥测（5 小时 / 7 天用量与重置时间【实测】）；已有状态栏的用包装脚本串联，不替换 |
+| statusLine | 写额度遥测（5 小时 / 7 天用量与重置时间【实测】）；已有状态栏的用包装脚本串联，不替换。串联的用户命令在独立进程组中运行（不新建会话，仍用原终端），超时（10 秒）按组结束、不输出；输入字段类型不对（如 cwd 为数字）时不记读数，状态栏照常。非 Foremind 会话写读数时，删除同目录中其他修改时间早于 7 天（`telemetry.STALE_DAYS`）、内容 session 为 null 且 agent_session_id 与文件名相符的 `*.statusline.json`（删除前再确认修改时间）；认不出的不删，Foremind 会话的读数不删（I97） |
 
 **钩子的边界**：路径拦截只覆盖 Edit/Write 类工具；经 Bash 写文件只能事后发现——门禁按 diff 查 owns_paths，L0 按哈希查「系统与宿主配置」和程序写的文件（§9.2）。这是防误操作，不是安全边界（§14）。
 
@@ -116,7 +116,7 @@ CLI `foremind`（清单见 §13.5）；Claude Code 插件提供同名技能/命�
   adapters/*.py                  用户自写适配器
   events.jsonl                   只追加事件日志（去重 id、意图/结果、前一条哈希、按月轮转）
   telemetry/                     上下文与额度遥测快照
-  reports/                       晨报、指标、审计报告、事实快照
+  reports/                       运行报告、指标、审计报告、事实快照
   archive/                       按月归档：已完成批次、已闭合事件、旧进度
 ```
 
@@ -149,6 +149,9 @@ CLI `foremind`（清单见 §13.5）；Claude Code 插件提供同名技能/命�
 - 批次头由规划者和总控写，所以任务层的授权类键若比项目层宽，程序拒绝该修订，除非带有用户批准记录。
 - 任何回退、别名都不能绕过排除项（例如排除 Sonnet）。
 - 配置内容：路由（§3.2）、授权表、流程、预算、审计、额度档位、运行时段、承载与通知、门禁、验收执行器、交付分支。
+- 缺省值唯一来源是 `foremind/defaults.py` 的字面 dict `TABLE`：各层都未设置时，程序读到的值就是表里的值；各模块改读 `TABLE`，不留副本。表不收 `routes.*`、`context.by_role.*` 与 1M 窗口席位的 `BIG_*` 缺省（I96）。
+- 表里的 `None` 表示「不设」：代码对这些键未设置就不生效（不封顶、不跑命令）；判例前提（`catalog.holds`）对各层都未设置、表里为 `None` 的键按 `None` 比较，前提值为 null 即成立。
+- `config.py` 不 import `defaults.py`，`config.load` 不填缺省：合并结果只含显式设置，授权类上限、L0 配置核对与判例前提要分得出「未设置」。漏登记由 `tests/test_defaults.py` 的单向核对兜住：`TABLE` 每个键都须在 `config.KEY_CLASSES`（按通配）有登记。
 
 ### 1.6 状态机
 
@@ -240,7 +243,7 @@ CLI `foremind`（清单见 §13.5）；Claude Code 插件提供同名技能/命�
 | 审查者 | 一次性、零上下文、只读 | 审 PR 完整 diff 与规格，出 JSON 回执 |
 | 审计者 | 一次性、零上下文、只读 | 冻结目标 + 事实快照 + 总控结论 → 偏差清单 |
 | 决策者（董事长） | 一次性、零上下文、只读 | 授权表委托范围内替用户决策；只看事实报表与待决；超范围上交 |
-| 编目员 | 一次性、短会话、只读 | 每批合入后整理知识；每日复盘的归并与建议；改进日志 → 规则 |
+| 编目员 | 一次性、短会话、只读 | 每批合入后整理知识；运行报告时的归并与建议；改进日志 → 规则 |
 | 监督进程 | 程序 | 就绪队列、开关会话、投递、卡住检测、额度暂停恢复、唤醒一次性角色、统计 |
 
 默认模型与思考档见 §3.2。答疑子代理是席位可调用的工具：读前任 transcript 或指定原文，**只返回原文摘录 + 行号**，≤2k token。
@@ -291,7 +294,7 @@ CLI `foremind`（清单见 §13.5）；Claude Code 插件提供同名技能/命�
 
 ### 2.5 协作方式
 
-- 交换的都是结构化文件：计划、交接文档、批次记录、回执、决策记录、审计报告、晨报。
+- 交换的都是结构化文件：计划、交接文档、批次记录、回执、决策记录、审计报告、运行报告。
 - **收件箱**：每个长期会话一个 `inbox/<session>.md`，只追加；`.cursor` 记已投递到的位置，保证不重复、不遗漏。发消息 = 先写收件箱，再由监督进程提醒：
   - 参与方式为「自动」且会话空闲：直接投递（Orca `terminal send`、tmux `send-keys`、`codex queue`、herdr 对应命令）；send-keys 无法确认送达，记为「已发送未确认」，靠游标兜底；
   - 正忙，或参与方式为「盯着」「陪同」（用户可能正在输入）：只由 Stop 钩子在回合结束时注入。
@@ -372,7 +375,7 @@ S1 意图澄清 → S2 需求规格（冻结目标）→ S3 现状与影响分�
   - `approved`：上游审查通过、验收与 CI 绿即视为满足，下游在自己的 worktree 里基于上游分支开工（堆叠 PR）；上游 head 变化时监督进程让下游 rebase 并重审；上游被合入（任何合入方式）后下游 rebase 到目标分支。交付级别为「做完即可」时推荐，否则依赖链会停在第一环等用户合；
     堆叠细节：上游被 squash / rebase 合入后，下游用 `git rebase --onto <目标分支> <上游已审 head>` 移到目标分支，并由程序把下游 PR 的 base 改指目标分支；门禁把 `depends_on` 当作 `merge_after` 校验（上游没合入，下游不合）；很多仓库的 CI 只在 PR 指向开发分支时触发，堆叠期间 CI 不触发的，用本地检查代替（`init` 检测 CI 的分支过滤）。
   - `merged`：上游进入目标分支才满足（席位自己合入 develop 的工作流常用）。
-  - 做完合不进去的（交付级别不允许、或没有合并权限）停在 delivered 等用户合入；晨报列出「因等你合入而被挡的批次数」。
+  - 做完合不进去的（交付级别不允许、或没有合并权限）停在 delivered 等用户合入；运行报告列出「因等你合入而被挡的批次数」。
 
 **S6 机器校验（不调模型）**：依赖无环；每条 REQ 至少被一批覆盖；每批至少一条可执行验收命令；**DAG 中所有互不可达的批次对** owns_paths 两两不相交且不碰契约文件（契约批除外），跨计划同样检查；批次数 ≤10；每批预算估计在有效预算一半内；禁用词（占位、简化版、v1、以后再做、TODO 之类；只查说明文字，按词边界匹配，不查路径与代码，避免误伤 `api/v1/`）。报告关键路径长度、最大并行宽度、耦合矩阵、串行原因。不通过回 S5，最多 3 轮。
 
@@ -437,7 +440,7 @@ S1 意图澄清 → S2 需求规格（冻结目标）→ S3 现状与影响分�
 
 1. **有效预算** = min(窗口 × 硬阈值, 绝对上限)。软阈值 60–70%、硬阈值 80%（占窗口），绝对上限默认 15–20 万 token【经验值】；换会话按先到者。质量随长度下降，与窗口大小无关；1M 窗口只看百分比会太晚【证据：context rot】。「过半」一律指有效预算的一半。
 2. 按「角色 × 模型」配置，与路由同一套分层；Codex 另受 AGENTS.md 合并后 32 KiB 静默截断约束（协议核心放前部）【证据】。
-3. 实测调整：监督进程拼 L0/L1 时按字符估算，超预算报警并交编目员裁剪；开工后读 transcript usage；遗漏多 → 放宽 L1，开工 token 高且无遗漏 → 收紧。只调默认值，不覆盖用户显式配置。
+3. 实测调整：不自动调参；总控与席位的上下文线由运行报告「按实测复算的建议值」一节按实测给出建议（§11.3），由用户决定是否改配置（I95）。
 
 ### 6.4 交接
 
@@ -520,6 +523,8 @@ approved 之前，监督进程在该 head 上运行验收命令（验收执行�
 - `disputed`（席位在日志中书面反驳）→ 第三方模型仲裁（#15）；涉及 §9.4 所列 P0 类别（冻结目标、权限、钱、不可逆操作、数据丢失）的交用户；
 - 同模型都过、合入后出问题（漏出缺陷）→ 换厂商审查。
 
+每批审查花费上限可按美元（`review.cost_cap_usd_<难度>`）或输入等价 token（`review.cost_cap_tokens_<难度>`，正数才生效）设，两者并存、任一先到即生效，同一轮都到时按美元记；到上限且本轮要求修改时批次转 failed（reason review_cost_cap），review_not_converging 带 unit（usd | tokens）。token 合计：本批自最近一次 `foremind run` 以来的 review_receipt 与 review_failed（不含带 rebound_from 的与 ab_review），每次按 input×1 + cache_write×1.25 + cache_read×0.1 + output×5 折算（review.PRICE，全程序只此一处），四项有 null 的那次计入 uncounted。单次上限仍只有美元（review.max_budget_usd）。口径待用户确认（I101）。
+
 ### 7.5 交付约定：按每个仓库的实际情况（用户 2026-09-25）
 
 推送、开 PR、合入方式、谁来合、更新分支的方式，**每个仓库按它的实际情况来**，不套用某一个项目的规则。系统不预设这些值：检测到的写进提案，检测不到的问用户；用户跳过不答的项取最严的一档（交付级别「做完即可」、#23 归用户）。
@@ -547,7 +552,7 @@ approved 之前，监督进程在该 head 上运行验收命令（验收执行�
 | 合入开发分支 | 门禁通过后按该仓库的约定合入目标分支；席位会话已结束时，监督进程可代为执行同一道门禁合入 |
 | 更高（staging、发布、部署） | 永远需要用户单独授权，不在自动范围内 |
 
-用户层 ceiling 默认「合入开发分支」；value 由上面的提案确定（检测到用户没有合入权限、或规则要求人工合入时，提案为「做完即可」）。**没有合并权限**时「合入开发分支」不可选，已配置的自动退回「做完即可」，交付停在可交付状态（delivered），不算失败，晨报写明原因。
+用户层 ceiling 默认「合入开发分支」；value 由上面的提案确定（检测到用户没有合入权限、或规则要求人工合入时，提案为「做完即可」）。**没有合并权限**时「合入开发分支」不可选，已配置的自动退回「做完即可」，交付停在可交付状态（delivered），不算失败，运行报告写明原因。
 
 **合入执行**：有 `merge_command` 时，门禁检查全部通过后经 `foremind _job` 调用它代替内置合入：执行前核对远端 head 等于已审 head，执行后用 §1.6 merged 的判据核对目标分支确实包含它，任一不符按 P0 处理；否则用约定的合入方式经 `gh` 按 head 匹配合入。`merge_command` 属于 #22，只有用户能改。
 
@@ -557,7 +562,7 @@ approved 之前，监督进程在该 head 上运行验收命令（验收执行�
 
 - **何时检查**：系统合入时，合入前必查；用户自己合时按该仓库约定的 `keep_updated`：`on_conflict`（PR 出现冲突，或分支保护要求最新时才更新）/ `never`（交给用户）。（不提供「目标分支一前进就更新」，它会让每次前进都把所有待合 PR 的 CI 重跑一遍。）每合入一批，其余待合的批次重新检查一次。
 - **怎么更新**：按该仓库约定的 `update_method`（rebase，或把目标分支合进来）。程序先在状态锁内取得该批次锁（席位会话空闲或已结束时才进行），在 worktree 里本地执行，更新内容可核对；是否允许用 GitHub 页面的「更新分支」按钮同样按仓库约定。
-- **没有冲突**：程序直接完成更新，重跑 CI（或本地检查）与验收。**回执重绑**只在同时满足时进行：更新前的 head 正是回执绑定的 head；更新由程序执行；本批的累计改动逐字节不变——比较 `<旧 base>...<已审 head>` 与 `<新目标>...<新 head>` 的 `git patch-id --verbatim`（不忽略空白，因为缩进在 Python、YAML 里有语义【实测：本机 git 2.55 支持】）。满足则把原回执重新绑定到新 head，回执记 `rebound_from`；否则按有冲突处理。
+- **没有冲突**：程序直接完成更新，重跑 CI（或本地检查）与验收。**回执重绑**只在同时满足时进行：更新前的 head 正是回执绑定的 head；更新由程序执行；本批的累计改动逐字节不变——比较 `<旧 base>...<已审 head>` 与 `<新目标>...<新 head>` 的 `git patch-id --verbatim`（不忽略空白，因为缩进在 Python、YAML 里有语义【实测：本机 git 2.55 支持】）。满足则把原回执重新绑定到新 head，回执记 `rebound_from`，副本去掉 `resolved`、`unresolved`（它们对账的是原回执的上一份，I100）；否则按有冲突处理。
 - **有冲突**：交给席位解决（原会话还在就用原会话，否则按交接开新会话）。只允许改冲突涉及的文件；冲突落在 `owns_paths` 之外的，转总控或待决（#5 / #8）。解决后审查者只审「解决冲突的增量」（rebase 用 `git range-diff`；把目标分支合进来的用 `git show --remerge-diff`），回执轮次 +1，但冲突审查轮次不计入 §7.4 的 3 轮上限；`[gate].rereview_after_update = delta | full` 可改为全量重审。
 - **合入顺序**：先满足 `merge_after`，其余先到先合。跨仓库、跨端的顺序见 §1.8。
 - 批次状态：更新期间为 `updating`，完成并重新验证后回到 `approved`（§1.6）。
@@ -574,27 +579,27 @@ approved 之前，监督进程在该 head 上运行验收命令（验收执行�
 
 ### 8.1 授权表（默认「平衡」预设）
 
-字段：归谁（规则 / 席位 / 总控 / 决策者 / 用户）· 可否暂定先做 · 通知级别（无 / 晨报 / 推送）· 硬拦截（按动作、路径、工具匹配，程序强制）。**标 🔒 的行固定归用户**，任何预设与配置都不能委托出去（SPEC R10：不可撤回——钱、删除、发布、迁移、对外契约——必须等用户；R1：目标修改由用户批准）。
+字段：归谁（规则 / 席位 / 总控 / 决策者 / 用户）· 可否暂定先做 · 通知级别（无 / 运行报告 / 推送）· 硬拦截（按动作、路径、工具匹配，程序强制）。**标 🔒 的行固定归用户**，任何预设与配置都不能委托出去（SPEC R10：不可撤回——钱、删除、发布、迁移、对外契约——必须等用户；R1：目标修改由用户批准）。
 
 | # | 决策类型 | 默认归谁 | 可暂定 | 通知 | 硬拦截 |
 |---|---|---|---|---|---|
 | 0 | 意图确认（S/M 档；只在有澄清问题或复述与原话有出入时产生） | 用户 | 否 | 推送 | — |
 | 1 | 实现细节（命名、内部结构、函数设计） | 席位 | — | 无 | — |
 | 2 | 已有依赖范围内的技术方案 | 席位（写决定记录） | — | 无 | — |
-| 3 | 新增开发依赖 | 决策者 | 可 | 晨报 | 依赖清单文件与包管理器命令（`npm install`、`pip install`、`uv add` 等模式）；门禁核对开发依赖段的改动有 #3 已决事项、判例或凭据 |
+| 3 | 新增开发依赖 | 决策者 | 可 | 运行报告 | 依赖清单文件与包管理器命令（`npm install`、`pip install`、`uv add` 等模式）；门禁核对开发依赖段的改动有 #3 已决事项、判例或凭据 |
 | 4 | 新增运行时依赖或第三方服务 | 用户 | 否 | 推送 | 依赖清单文件与包管理器命令；门禁按段落复核 |
-| 5 | 内部接口 / 契约变更 | 总控（走契约批） | 否（并行期间） | 晨报 | 改契约文件需契约批身份 |
+| 5 | 内部接口 / 契约变更 | 总控（走契约批） | 否（并行期间） | 运行报告 | 改契约文件需契约批身份 |
 | 6 🔒 | 对外接口 / 公开契约 | 用户 | 否 | 推送 | 拦截 |
 | 7 🔒 | 数据库结构 / 迁移 | 用户（决策者可先出方案） | 否 | 推送 | 迁移目录拦截 |
-| 8 | 范围调整：批内（扩大 owns_paths、拆分或合并批次） | 总控 | 可 | 晨报 | — |
+| 8 | 范围调整：批内（扩大 owns_paths、拆分或合并批次） | 总控 | 可 | 运行报告 | — |
 | 9 🔒 | 范围调整：影响冻结目标或验收 | 用户 | 否 | 推送 | 目标哈希校验 |
-| 10 | 需求歧义：有判例，或可撤回且影响小 | 决策者 | 可 | 晨报 | — |
+| 10 | 需求歧义：有判例，或可撤回且影响小 | 决策者 | 可 | 运行报告 | — |
 | 11 | 需求歧义：其他 | 用户 | 否 | 推送 | — |
 | 12 | 产品行为、交互、文案、视觉 | 用户 | 仅限小的文案 | 推送 | — |
 | 13 | 优先级与顺序：不影响里程碑 | 总控 | 可 | 无 | — |
 | 14 | 优先级与顺序：影响里程碑或日期 | 用户 | 否 | 推送 | — |
-| 15 | 审查分歧的仲裁 | 决策者（第三个模型） | — | 晨报 | 涉及 §9.4 P0 类别的上交用户 |
-| 16 | 预算内的成本与额度取舍 | 决策者 | 可 | 晨报 | — |
+| 15 | 审查分歧的仲裁 | 决策者（第三个模型） | — | 运行报告 | 涉及 §9.4 P0 类别的上交用户 |
+| 16 | 预算内的成本与额度取舍 | 决策者 | 可 | 运行报告 | — |
 | 17 🔒 | 超预算、付费调用 | 用户 | 否 | 推送 | 拦截 |
 | 18 | 钱与计费逻辑、安全、权限、认证 | 用户 | 否 | 推送 | 按路径与关键词拦截，审查强度硬下限 |
 | 19 🔒 | 删除数据或外部资源 | 用户 | 否 | 推送 | 拦截 |
@@ -627,12 +632,13 @@ approved 之前，监督进程在该 head 上运行验收命令（验收执行�
 - 下钻：可要求看某批详情，必须写理由；下钻记录进入审计。
 - 输出统一格式：`{question, category, options, conclusion, confidence: high|medium|low, facts, reversible}`。程序校验 `category` 在委托集合内，否则作废并上交用户；`low`，或 `medium` 且不可撤回的，自动上交用户。
 - 被推翻：记录并计入该类推翻率；超限后的收紧顺序统一见 §8.4（先改为不可暂定，再上交用户即收回委托）；恢复只能由用户操作。
+- 一次性总控（§2.6）的输出合 controller_decision、item 与 decision 都对而仍上交用户时，上交原因末尾附「；总控的理由：<reasons>」；输出本身不合要求的照旧上交、不附理由（I99 ③）。
 
 ### 8.4 暂定决定 PV-n
 
 - 条件：该类型允许暂定 + 可撤回 + 影响小，三者都满足才先做。
 - 隔离：单独提交（提交信息 `provisional: PV-n`）或放在开关后；决策记录写明撤回方法。仓库使用 squash 合并时，暂定改动必须用开关或独立 PR 隔离（squash 后单独提交会丢）。
-- 期限：默认 48 小时，或依赖它的里程碑之前，取较早者；到期前进晨报，到期后升级为推送。
+- 期限：默认 48 小时，或依赖它的里程碑之前，取较早者；到期前进运行报告，到期后升级为推送。
 - **不自动转正**：到期未确认保持暂定（overdue）；`release-check` 阻止含未确认暂定决定的内容发布。
 - 被推翻：相应席位按撤回方法回退，记事件。
 - **推翻率**：按类型统计最近 20 次（样本 ≥5 才判定），超过 20%：先改为「不可暂定」；已不可暂定的，再归更上一级（决策者 → 用户）【经验值】。**放宽只能由用户操作**。
@@ -688,6 +694,7 @@ approved 之前，监督进程在该 head 上运行验收命令（验收执行�
 | 系统与宿主配置哈希变化带批准 | 未批准 → 硬失败 | 全部自动动作暂停，P0 通知 |
 | 冻结目标哈希变化带批准 | 未批准 → 硬失败 | 相关批次挂起，P0 通知 |
 | 计划修订带理由与批准 | 缺 → 硬失败 | 修订不生效 |
+| 声称用户的事件不由席位进程写下（seat_ancestor，I82） | 事件带会话名的 seat_ancestor → 硬失败（按事件 id） | 本轮任何动作之前先暂停全部自动动作，P0 通知；resume 后按既有 accepted 规则接受 |
 | 心跳与无进展时长 | 超阈值 → 软信号 | 见 §10.3 |
 | 同一问题反复失败、热点文件 | 超阈值 → 软信号 | 计入审计触发 |
 | 额度与预算 | 越线 → 软信号 | 见 §10.5 |
@@ -708,7 +715,7 @@ approved 之前，监督进程在该 head 上运行验收命令（验收执行�
 |---|---|---|
 | P3 轻微 | 记录不全、小的进度偏差 | 进总控待办；下个 tick 由 L0 对账是否处理 |
 | P2 中等 | 无理由驳回审查意见、计划外小工作 | 总控书面回应并附证据；驳回的由第二个审计者或用户裁决 |
-| P1 严重 | 连续两次未闭环；总控描述与事实冲突 | 轮换总控；进晨报 |
+| P1 严重 | 连续两次未闭环；总控描述与事实冲突 | 轮换总控；进运行报告 |
 | P0 | 触及冻结目标、权限、钱、不可逆操作、数据丢失 | 挂起相关批次，立即通知用户 |
 
 **轮换总控（任一）**：连续 2 次 P1 及以上未闭环；描述与事实冲突；上下文超过硬阈值或绝对上限。新总控从三个锚点重推现状，并对账旧总控的描述。
@@ -730,7 +737,7 @@ approved 之前，监督进程在该 head 上运行验收命令（验收执行�
 - **做**：开关会话、投递消息、启动一次性角色、机械检查与通知、门禁代合（交付级别允许时）；**不做**：调用模型判断、部署、发布、付费。实际启用仍按用户指令。
 - `foremind pause`：暂停所有自动动作；`resume` 恢复；项目根放 `STOP` 文件：监督进程对该项目立即停止一切自动动作（不开、不投递、不唤醒），已在运行的会话不受影响。
 - `foremind run <批次…>`：立即开始，越过运行时段与「盯着 / 陪同」的在场条件；**不能**越过依赖、待决、额度耗尽、锁与不相交检查。
-- 通知检测**发布是否成功**（HTTP 返回），失败就换路（代理不通改直连，或反过来），仍失败记为「未发出」并在晨报写明。手机是否真收到无法确认。
+- 通知检测**发布是否成功**（HTTP 返回），失败就换路（代理不通改直连，或反过来），仍失败记为「未发出」并在运行报告写明。手机是否真收到无法确认。
 
 ### 10.2 每个 tick
 
@@ -741,12 +748,13 @@ approved 之前，监督进程在该 head 上运行验收命令（验收执行�
 5. 执行动作（先写意图，做完写结果）：开席 / 续派；投递；交接与关闭旧会话；启动一次性角色（review_ready → 审查者；交付前 → 审计者；合入 → 编目员；可委托待决 → 决策者）；卡住处理；额度暂停与恢复；判例前提监视。
 6. 通知；统计。
 
-**全阻塞**：所有未完成批次都在等用户（待决、等用户合入、「盯着 / 陪同」等在场、`failed`、无法自动接手的 `stuck`、等审计放行）时，进入全阻塞状态：**不启动任何模型**（间隔抽审、编目员每日复盘、决策者每日读报表都暂停），只发一次汇总（按「阻塞原因集合」的指纹去重，反复进出全阻塞不重复发）；用户回答或新事件解除。额度暂停是另一种状态（§10.5）。
+**全阻塞**：所有未完成批次都在等用户（待决、等用户合入、「盯着 / 陪同」等在场、`failed`、无法自动接手的 `stuck`、等审计放行）时，进入全阻塞状态：**不启动任何模型**（间隔抽审、编目员归并、决策者读报表都暂停），生成一份运行报告并推送摘要（§11.3；按「阻塞原因集合」的指纹去重，反复进出全阻塞不重复发）；用户回答或新事件解除。额度暂停是另一种状态（§10.5）。
 
 ### 10.3 会话状态与卡住
 
 - 信号：钩子心跳（`heartbeats/<session>.json`，每个会话只写自己的）；承载层状态（Orca 空闲/退出、herdr 工作中/阻塞/空闲、tmux 面板活动时间 + 输出截取粗判）；git 活动。
-- 卡住【经验值，可配置】：进行中批次 20 分钟无心跳也无改动 → 提醒；再 20 分钟 → 询问状态并要求把现场写进日志；仍无回应 → 标 `stuck`，通知总控（无总控通知用户），按 §10.4 破锁后开继任会话。
+- 卡住【经验值，可配置】：进行中批次 20 分钟无心跳也无改动 → 提醒；再 20 分钟 → 询问状态并要求把现场写进日志；仍无回应 → 标 `stuck`，通知总控（无总控通知用户），按 §10.4 破锁后开继任会话。通知按继任结果如实写：开出照旧；因名额已满或整机负载高本轮没开时写「旧会话已确认退出；继任在等名额（used/cap）」或「…继任在等整机负载降下来」（I102）。
+- 行为模式提醒按 repeat_error → alternate → text_only 次序判，先判到的那种指纹已提醒过就接着判下一种；每种按自己的指纹只提醒一次（I102）。
 - **长时间工具调用**：锁里有「工具开始」无「工具结束」时视为 `busy_tool`，超时改为 2 小时【经验值】，期间只提醒不接手。
 - 等用户决定、等 CI、等额度都不算卡住。
 
@@ -754,7 +762,7 @@ approved 之前，监督进程在该 head 上运行验收命令（验收执行�
 
 - **全局锁**：见 §1.1。
 - **批次锁**：只记录持有会话，只由程序在状态锁内改写；不设租约，卡住按心跳时间判定（§10.3）。PreToolUse 在 worktree 内写入前核对持有者是本会话（按 `FOREMIND_SESSION`）。总控与规划者没有批次锁，心跳同样写 `heartbeats/`。
-- **破锁**：只有监督进程能破锁，且必须先经承载层关闭旧会话并确认它已退出（manual 承载下须用户确认）；确认不了就不开继任，只通知。
+- **破锁**：只有监督进程能破锁，且必须先经承载层关闭旧会话并确认它已退出（manual 承载下须用户确认）；确认不了就不开继任，只通知。持锁会话已有退出证据而锁没破（break_lock 失败）时，开继任前同样查整机负载，高则本轮不开、记 seat_deferred，名额不另计；上下文交接的继任仍不受名额与负载限制（I102）。
 - **转移**：交接（`handoff --accept`）与续派由程序用原子替换改写持有者。
 - 监督进程重启后先对照承载层实际存活的会话与记录再行动；不认识的会话不接管，只报告。
 - 每个动作幂等：重复 tick 不重复开会话、投递或通知。
@@ -776,6 +784,7 @@ approved 之前，监督进程在该 head 上运行验收命令（验收执行�
 - 7d 窗口耗尽时等 7d 重置，不在 5h 重置时反复试调用。
 - **档位**：稳妥（默认，如上）；用满（降速线与暂停线接近 100%，预留可设 0，并提示门禁可能等不到审查）；自定义。按用户与任务选择（§1.5 授权类：预留调低算放宽，需在上限内）。
 - 恢复时按优先级**错开**给暂停的会话发「继续」；7d 额度按日均摊目标曲线，超前就降并发。
+- **审查前后的额度读数**：review_started（及 meta.json）记 quota_start，review_receipt、review_failed 记 quota_end，`--ab` 的 ab_review 与 ab.json 同样两项都记；形状 {five_hour_pct, seven_day_pct, ts}，取本机账户最新状态栏读数，旧于 quota.stale_min 或窗口已过重置时间的 pct 记 null，ts 为读数本身的时间（无读数为 null）。只记录不判断，供 m2f 实测「按占额度比例设上限」是否可行（I101）。
 - **中断处理**：审查中断 → 作废重跑；外部副作用 → 先核实结果；base 前进 → rebase 后重审；会话过满 → 换新会话。
 
 ### 10.6 多厂商
@@ -798,34 +807,42 @@ approved 之前，监督进程在该 head 上运行验收命令（验收执行�
 
 ### 10.8 用户在场判定
 
-在场 = 最近 30 分钟【经验值】内有 foremind CLI 操作、本机 `decide` 回答、或**非 Foremind 管理的** Claude Code 会话的 UserPromptSubmit（Foremind 自己的会话不算；程序投递同样会触发 UserPromptSubmit 且输入里没有来源字段【实测】，所以承载层每次投递前先记一条「程序投递」事件（时间 + 文本哈希），与之匹配的 UserPromptSubmit 不算在场）。手机回答只算「能联系上」，用于通知升级，不算「盯着」需要的在场。用户可用 `foremind presence away|here` 显式声明，显式声明优先。无人值守小时数从最后一次在场信号算起。
+在场 = 最近 30 分钟【经验值】内有 foremind CLI 操作、本机 `decide` 回答、或**非 Foremind 管理的** Claude Code 会话的 UserPromptSubmit（Foremind 自己的会话不算；程序投递同样会触发 UserPromptSubmit 且输入里没有来源字段【实测】，所以承载层每次投递前先记一条「程序投递」事件（时间 + 文本哈希），与之匹配的 UserPromptSubmit 不算在场）。手机回答只算「能联系上」，用于通知升级，不算「盯着」需要的在场。用户可用 `foremind presence away|here` 显式声明，显式声明优先。无人值守小时数从最后一次在场信号算起。席位会话（FOREMIND_ROLE 为 seat）收到的提示与程序投递对不上（同一匹配：text_sha256，时间窗 DELIVERY_WINDOW）时记 seat_prompt_external{session, batch, sha256}，只计数，钩子判定与输出不变（I104）。
 
 ---
 
-## 11. 事件、晨报、改进回路与度量
+## 11. 事件、运行报告、改进回路与度量
 
 ### 11.1 事件即时处理
 
 新待决、审查不收敛、自报 ≠ 事实、卡住、额度状态变化、漏出缺陷、审计偏差、通知未发出、全阻塞 → 写 `events.jsonl`，按类处理与通知；用户事件钩子 `.foremind/hooks/<事件名>` 被调用。
 
+漏出缺陷：总控或用户发现已合入（merged 或 cataloged）的批次有缺陷时执行 `foremind defect <批次> --source {review,controller,user,run,test} --note <说明>`，记 defect_found{batch, source, note, by}；FOREMIND_ROLE 为 controller 或 FOREMIND_CONTROLLER 非空时 by 记 controller，否则 user；Foremind 会话里拒绝；未合入的批次改用 `foremind review --request-changes`（其 by 同样按此记，I104）。
+
 ### 11.2 通知与防告警疲劳
 
 - 每条通知都必须能立即采取行动（Google SRE）。
-- 告警：P0 立即推送，每 12 小时最多 2 条，多出的合并成一条；P1 进晨报；P2/P3 只进报表。
+- 告警：P0 立即推送，每 12 小时最多 2 条，多出的合并成一条；P1 进运行报告；P2/P3 只进报表。
 - 待决：按授权表通知级别；同组合并，未答不重复推送，只按期限升级。
 - 去重：同一事件 id 只通知一次。
 
-### 11.3 每日复盘
+### 11.3 运行报告
 
-每日（或用户设定时刻）：`foremind report` 由脚本生成晨报事实部分（只看变化，含「因等你合入而被挡的批次数」、未发出的通知、到期暂定决定、需复核判例）；编目员在其上写规则归并与升级建议（全阻塞时跳过模型部分）；按通知设置推送摘要。
+不按日定时，跟着一段自动运行走（用户 2026-09-27 定，I64）。监督进程在一段无人值守运行**告一段落**时生成一份：自上一份报告以来有批次状态变化，且此刻没有在跑的席位、也没有可开的批次（全部完成，或都在等用户、等合入、等额度）。用户也可随时 `foremind report`。内容由脚本生成，只看自上一份报告以来的变化（含「因等你合入而被挡的批次数」、未发出与被延后的通知、到期暂定决定、需复核判例）；编目员在其上写规则归并与升级建议（全阻塞时跳过模型部分）；按通知设置推送一条摘要。用户回到本机时（在场判定，§10.8）若有未看的报告先提示它。
+
+报告末尾另有「按实测复算的建议值」一节（foremind/signals.py，纯函数；从全部事件复算，含 archive/ 按月归档，不受 since 限制）：总控软硬线、席位软线与交接点、审查强度（S/M/L × 安全/非安全）、审查单次与每批美元上限、审查每批 token 上限（S/M/L；建议值 = 已 approved 批次到 approved 为止的输入等价 token 合计第 90 百分位 × 1.2，样本门槛同每批美元上限，I101）、审查轮次上限、卡住提醒间隔、API 续跑次数。每项写当前值、样本数、统计、建议值与规则，样本不足写「样本不足（n/门槛）」；质量类信号只给收紧建议，放宽写「可考虑放宽」并列依据。只建议，不改配置、不生成待决、不挡批次，推送摘要不含建议。规则细节见 I95。审查强度的召回 = 按位置配对的 must_fix（matched）÷ 基准 must_fix，由报告从 ab.json 与基准回执重算（m2e 之前的对照同样重算），读不到时退回事件的 matched，都没有写「无法复算 n 次」（I98）。
+
+「审查」一节之后另有「开发精度与效率」一节（foremind/metrics.py：collect 是唯一读文件处，compute 纯函数，lines 出 Markdown）：本段有状态变化的批次各写精度、效率两行，其所属计划各写一段累计（按该计划全部批次与全部事件，含按月归档）；计划加载失败写「计划 <id> 累计：unknown（原因）」；节首写明记录起点；推送摘要不含本节。`foremind report --plan <计划>`（可重复）用同一算法只打印该计划全部批次的两行与累计，不写报告文件、不记 report_generated；计划目录不存在或加载失败退出码 1。指标见 §11.5 与 I104。
 
 ### 11.4 改进回路
 
-出错 / 返工 / 被用户纠正 / 漏检 / 工具没用上或用错 → 改进日志（有 schema，标来源）→ 每日复盘归并为协议规则（写入 `rules.md`，带来源、前提、会失效）→ 同类再犯自动生成「升级为程序检查」的建议 → 用户批准后实现。本项目自己也写改进日志。
+出错 / 返工 / 被用户纠正 / 漏检 / 工具没用上或用错 → 改进日志（有 schema，标来源）→ 运行报告时归并为协议规则（写入 `rules.md`，带来源、前提、会失效）→ 同类再犯自动生成「升级为程序检查」的建议 → 用户批准后实现。本项目自己也写改进日志。
 
 ### 11.5 度量（`foremind report` 全部输出，取不到写 unknown）
 
 首轮通过率、审查轮数、must_fix、漏出缺陷、归一吞吐、wall-clock 与串行对照、用户投入（打扰次数、回答耗时）、成本、协议违反次数、额度中断、交接成功率；加 §6.8 上下文指标、§8.8 决策指标、§4.3 规划指标（重排次数、跨批冲突率、并行 vs 串行首轮通过率）。
+
+已实现（m2e.10，REQ-14，I104）：精度每批——首轮通过、到 approved 的轮数与回执总数、各轮 must_fix（审查者给出的，其中程序降级与撤回）、审查中退回与 approved 后退回（按总控、用户分）、门禁失败、漏出缺陷、协议违反（hook_denied 与 bounds_violation）；效率每批——里程碑间隔（开席→提审→approved→delivered→merged，后一里程碑早于前一的段按没到写「—」）、各段停留（写手、等审查、等开席、等合入，另列不为 0 的 blocked、stuck、paused、failed、updating）、等用户、写手 token、审查美元与 token、席位 / 交接 / 破锁、卡住与 API 续跑、总控介入；计划累计另有首轮通过率、平均轮数、降级与撤回占比、L0 硬失败、跨度、吞吐与归一吞吐、并行对照、各项中位数、写手 / 审查 / 强度对照的 token 与美元（写手美元无事件来源，写 unknown）、交接成功率、用户投入（待决、答复耗时、打扰）、controller_slip 与 controller_handoff。口径：token 为输入等价 token（review.PRICE）；读不到写 unknown，缺字段写「未计 n 次」，都不当 0。记录起点：外来提示与退回来源自 m2e.10 合入起；漏出缺陷只含 `foremind defect` 记下的；m2d.4 之前的审查没有美元。未做（m2f）：额度中断次数、§6.8 / §8.8 / §4.3 指标、写手美元、总控与规划者花费。
 
 ---
 
@@ -887,6 +904,7 @@ approved 之前，监督进程在该 head 上运行验收命令（验收执行�
 | 全局 | 插件与钩子装在用户级；再选「所有项目自动启用」或「按项目启用」 | 首次在某项目使用时按用户默认自动初始化 |
 
 - 可随时增加或移除项目、在项目级与全局间切换；监督进程只管理启用的项目；`status --all` 汇总。
+- 每次写入前的备份（用户配置目录 `backups/<文件名>.<路径 hash8>.<时间戳>.bak`）按同一文件名与路径 hash 前缀只留最新 10 份（按文件名中的定宽时间戳排序，`tomlblock.BACKUPS_KEPT`），格式不符或其他文件的备份不动；清理失败只提示一行，不挡写入。卸载移除 `.git/info/exclude` 里的块后，文件只剩空白时删掉该文件（原来没有这个文件的仓库不留空文件；带块的原文已先备份）（I97）。
 - Claude Code 插件：`plugin install/enable --scope user|project|local` 存在，项目级 `enabledPlugins: false` 能在该项目停用用户级插件【实测】；「项目级启用」与真实 `--scope project` 安装【待实测】，不行时退回把钩子直接写进 `settings.local.json`。Codex 项目级钩子【待实测】；不支持时钩子装全局、在未启用项目里直接跳过，并向用户说明。
 
 ### 13.3 上手（目标：从零到第一个合入的小任务 ≤15 分钟）
@@ -914,10 +932,12 @@ approved 之前，监督进程在该 head 上运行验收命令（验收执行�
 | `plan "<需求>"` / `plan show` / `plan approve` / `plan amend` | 规划者会话；审阅；批准；修订 |
 | `run <批次…>` / `pause` / `resume` | 立即开始、暂停、恢复 |
 | `seat` / `handoff [--accept]` / `ask` | 开席、交接与接手、答疑 |
+| `land <批次> [--notes]` | 总控或用户合入 delivered 单仓库批次（临时 worktree 合并、跑全量、ff 目标；§20 I78）；认主检出用 `os.path.samefile`，读不出时退回解析后路径比较（I100） |
+| `controller handoff\|check\|slip` | 常驻总控交接、接手核对、记上下文读数；取总控：`FOREMIND_CONTROLLER` 非空按它，否则跳过已交接的、取最近更新的（I99 ②） |
 | `review` / `gate` / `release-check` | 提交就绪并请求审查（按 #23 推送与开 PR）、门禁、发布前检查 |
 | `decide [--new]` | 查看并回答待决；席位提交待决 |
-| `audit [--canary]` / `retro` | 手动审计、每日复盘 |
-| `report` / `status [--all]` / `presence away\|here` | 指标与晨报、状态汇总、在场声明 |
+| `audit [--canary]` / `retro` | 手动审计、复盘 |
+| `report` / `status [--all]` / `presence away\|here` | 指标与运行报告、状态汇总（含每个未完成批次在等谁、为什么、你要做什么，I80；挡在待决上写 `foremind decide show Q-n`，计划批准后被改动写 plan_unbound 与「改回或 plan amend」，I99 ①）、在场声明 |
 | `tools scan` | 能力清单 |
 | `tick` / `supervise` | 单次 tick、前台监督循环 |
 
@@ -1090,7 +1110,58 @@ v1.1 按评审修订时（详见 `review/r-design-v1-disposition.md`）：
 | I49 | 交付前审计与对外状态（M1-6 r1 MF3、C5） | 门禁先算出本次目标状态再写 commit status；目标不是 delivered / merged（含停在 awaiting_audit）时写 `pending`，由审计放行方补写 `success`。「该档是否启用交付前审计」由一个共用函数判定，门禁与 L0 共用 |
 | I50 | 验收与审查读什么（M1-6 r2） | 验收命令与审查者都在已审 heads 的干净分离检出里运行或读取（`git -c core.hooksPath=/dev/null worktree add --detach`，用完删除），不读席位的活 worktree；检出不含未跟踪文件，依赖由验收命令自己准备。审计放行方推进到 delivered 后补写 `success`（重跑门禁也可补写） |
 | I51 | 用户自己的会话改 #22 文件（**用户 2026-09-25 定：折中**） | 已启用项目里的非 Foremind 会话（用户自己开的）用 Edit/Write 类工具改 #22 文件时**放行**，由 PostToolUse 记 `user_config_edit` 事件（会话、路径、修改后内容 sha256）；L0 核对这些文件的哈希时，与最近一条该事件一致即视为用户已批准，不暂停自动动作。例外：程序独占的 `delivery.toml` 仍拦截（经 `foremind` 命令修改）。Foremind 会话（席位、审查等）照旧拦截。编辑器直接修改、或经 Bash 修改的，钩子看不到，仍由 L0 要求用户确认一次 |
-| I52 | 监督进程基础版的几处取舍（M1-7 r1） | ① I2 的 merged 补记与硬失败判定覆盖**所有已开工状态**（running 起），未请求过审查的批次按 I48 只认托管方 PR 状态；② M2-5 晨报落地前，P1 通知也立即推送；通知标题与正文不含项目名（只含编号、选项与简短说明）；③ manual 承载或承载层无法确认退出时，用户用 `foremind confirm-exit <批次>` 确认旧会话已退出，程序据此生成 `user_confirmed` 退出证据后才可破锁；④ `notify.ntfy`（server）与 `notify.proxy` 只允许用户层设置（项目配置不得把 topic 发往别处） |
+| I52 | 监督进程基础版的几处取舍（M1-7 r1） | ① I2 的 merged 补记与硬失败判定覆盖**所有已开工状态**（running 起），未请求过审查的批次按 I48 只认托管方 PR 状态；② M2-5 运行报告落地前，P1 通知也立即推送；通知标题与正文不含项目名（只含编号、选项与简短说明）；③ manual 承载或承载层无法确认退出时，用户用 `foremind confirm-exit <批次>` 确认旧会话已退出，程序据此生成 `user_confirmed` 退出证据后才可破锁；④ `notify.ntfy`（server）与 `notify.proxy` 只允许用户层设置（项目配置不得把 topic 发往别处） |
 | I53 | 安装器的几处边界（M1-8 r1） | ① 钩子与状态栏命令一律 `<绝对解释器> -P -m foremind …`：`-P` 不把 cwd 放进 `sys.path`，席位在 foremind 仓库自身的 worktree 里也不会被正在改的代码遮蔽；doctor 用同一命令探测。② 只有来源为用户层 `~/.claude/settings.json` 的状态栏命令会被自动串联进用户层 `[statusline] command`；来源为项目或本地 settings 的，交互模式说明「将成为所有项目的状态栏」并征得同意后才串联，`--yes` 不串联（保留原状态栏、提示、doctor 报 FAIL）。③ 重跑 `init` 以已登记的值为默认（项目名、仓库、承载、通知、已确认的交付约定），事实更严时仍收紧；在已有项目内运行先 `find_project_root()`。④ uninstall 保留的 `.foremind/` 用其自带的 `.gitignore`（`*`）保持忽略。projects 注册表格式：每行一个项目根的绝对路径 |
+| I54 | 席位权限与额度重评（m2a.1） | 席位 settings 带 `permissions.allow`（`vendors/claude.py` 的 `ALLOW`：Read/Grep/Glob 与 git status/diff/log/show/rev-parse/ls-files/add/commit、ls、cat、head、tail、wc、pwd、`python3 -m unittest` 等；不含 push、安装、rm、find、rg、git branch）。**真正的边界靠 PreToolUse 守卫**：白名单里的 `python3 -m unittest` 能执行席位自写代码。额度 exhausted 记进入时的暂停线 `pause`，当前暂停线更高（或旧状态无此字段）即转 unknown（原因 `config_changed`）走试调用；`foremind quota [--reset [--group long\|oneshot]]` 只归用户（Foremind 会话整条拒绝），事件 `quota_reset`，删掉 exhausted 的 long 组时写 `exhausted_ended`。无交接文档时 L1 注入批次头要点与 goal.md 正文 |
+| I55 | 待决与放行（m2a.2） | 事件：`pending_created{question, request}`、`pending_routed{question, category, owner, to}`、`pending_answered{question, answer, by, note}`、`pending_applied{question, result}`、`pending_apply_failed{question, error}`、`pending_void{question, reason, by}`。request：`kind` hit\|scope\|manual\|catalog、`category`、`batch`、`session`、`match?`、`key?`、`approve_option?`；各 kind 由处理模块的 `apply_answer(root, record, request)` 落实。钩子不同步推送，由分离作业 `decide --notify Q-n` 推；配置读不了时不推、可重跑，监督进程补推未处理的推送键。批准也放行不了的命中（仓库外路径等）不建待决。预设：本期实现 `balanced` 与 `conservative`（= balanced 中归总控或决策者的非🔒行改归用户，只收紧）；`hands_off` 配置即报错，待决策者（m2b）与用户确认具体行（controller 2026-09-26 定，#18 归用户） |
+| I56 | 门禁核对（m2a.3） | 验收结果每条带 `repo`，门禁按（仓库、命令）比对，换执行仓库即过期；`_ci` 分页读全部 check-runs 与 statuses，必过检查名取自交付约定提案的分支保护 `required_checks`，未出现即 pending；只有合入类预检失败（role、merge_way、up_to_date、pushed）时不写 commit status failure；#23 归用户时 `[gate].checks` 不得为空（doctor 同步报） |
+| I57 | 规划者会话（m2a.4） | §13.5 的 `foremind plan "<需求>"` 改为 `plan new "<需求>" [--id] [--tier S\|M\|L]` 与 `plan submit <plan> --dir <草稿>`（与现有子命令冲突）；草稿目录 `~/.local/share/foremind/drafts/<slug>/<plan>/`；事件 `planner_opened`、`plan_submitted`；目标在首次 submit 通过 S6 时冻结，之后改目标需 #9 用户批准；`do` 缺省按 `routes.seat.*` 取模型与思考档 |
+| I58 | 用户专属命令与守卫（m2a.5） | Foremind 会话（含总控）一律拒绝：`plan approve`、`plan amend --user-approved`、`do`、`decide Q-n <选项>`（答复）、`decide --void`、`confirm-exit`、`quota --reset`、`resume`、`init`、`uninstall`、`doctor --rescan`；认长选项缩写与 `python* -m foremind`；这些位置含未展开的 shell 写法（`$`、反引号、`$'…'`、花括号、通配符）或单独的 `--` 也拒；`decide --notify` 的值须是字面 Q-n。Bash 切段认引号与 heredoc，heredoc 正文只在已知数据消费者（cat、tee、`foremind log/handoff`、`git commit -F`）时当数据；拿不准就拦（fail-closed）。#4 例外：pip install 只含 `-r <#4 清单路径>`、`-e`、`.` 时不算命中。git 带 `--output`、`-c alias.*`、`--config-env` 一律拒。守卫仍是防误操作，不是安全沙箱（§14） |
+| I59 | 已开工批次的修订与要求修改（m2a.6） | 已开工批次经带用户批准的 amend 只能改 `owns_paths`（只增）、`accept_commands`、`reads`、`must_read`、`tools`，正文 `## 状态` 以上不变；已终结批次不改。#8 获批经 `expand_scope` 追加 owns_paths（与已开工且无依赖路径的批次重叠即拒），修订记 `decision: Q-n`，计划保持绑定。`foremind review <批次> --request-changes --item …`（总控或用户）把 approved/awaiting_audit/delivered 转 changes_requested 并投递持锁会话。审查材料固定含 goal.md。**手改批次头会让计划失去绑定，监督进程随即停止为该计划开席与开继任**（试跑发现 19） |
+| I60 | 交接中的投递（m2a.7） | 心跳记 `handoff_requested_at`；已请求交接的会话不再收投递，`handoff --accept` 把前任未投递的收件箱消息转给继任（事件 `inbox_forwarded`）；会话空闲（承载层 tui-idle 或心跳最后事件为 Stop，且无 tool_open）时监督进程经承载层直接投递；`foremind log` 校验 D/F 记录格式 `<batch>.D<n> · … · #k · 证据` |
+| I61 | 更新分支与回执重绑（m2a.8） | `foremind update <批次>`：进入旁支 `updating` 写 `batch_state{prior, state, reason: update, by, heads}`，离开 reason 为 rebound\|update_failed\|update_resumed，或经 request_changes 的 update_conflict\|update_changed\|update_interrupted；`batch_updated{prior_heads, heads, bases, outcome: rebound\|rereview}`。patch-id 不变时写重绑回执 `review.r<n>.json`（n 取审查与重绑共用的序号，内容为最新 approved 回执拷贝，heads 换新，`rebound_from` 为最初审查时的 heads；源回执须过门禁同一判据），先写 `review_receipt` 事件再写文件；不收敛诊断不计重绑回执；旁支通用地写/删 `state_prior` |
+| I62 | 计划校验（m2a.9） | 正文某行含 `<!-- fm-allow-word -->` 时该行不查禁用词（批次头不豁免）；5d 中无文件可分析的引用、历史里没出现的共改记为未知，C 取已知信号的加权平均（只有语义已知时 C = 语义分）；点分形式的 `python3 -m unittest <模块>` 而目录不是包时警告 |
+| I63 | 编目落盘（m2a.10） | `foremind catalog apply <输出.json>`（用户或监督进程）逐条校验：补丁 anchor 须整行唯一匹配；**replace/delete 的 anchor 是标题行时作用于整个小节**（到同级或更高级标题前，照 cataloger 角色卡）；rules.md 的 replace/delete 与带 supersedes 的判例转用户待决（#22），待决附被取原文并存其 sha256，批准执行前比对不一致即拒；判例所依据的待决须经用户答复；事件 `catalog_applied{by, question?, results[…], files{路径: sha256}}` |
+| I64 | 晨报改为运行报告（用户 2026-09-27） | 报告不按日定时，而在一段自动运行告一段落时由监督进程生成一次（§11.3），另可随时 `foremind report`；授权表通知级别「晨报」改为「运行报告」（代码值 `report`，原 `morning`）；P1 可选 `notify.p1 = "report"` 进下一份运行报告；不设 `report.morning_at` |
+| I65 | 运行面修复（m2b.1） | ① `foremind supervise` 每次 sleep 后比对包内 `.py` 的 mtime 指纹，变化且下一个间隔不再变时先试跑新代码的 `foremind version`，成功写 `supervisor_reexec{from,to}` 并以原参数 re-exec，失败写 `supervisor_reexec_failed{from,to,error}` 继续旧代码（同一新指纹只通知一次）；`.foremind/supervisor.json{pid,started_at,code,argv}`，status/doctor 据此报「监督进程代码旧于当前包」。② 坏的 `decisions/Q-*.json`（非对象、缺字段、blocks/id 类型不对）记 tick_error 并按 fail-closed 挡批次，不中断 tick；等 merge_after/depends_on 上游合入时不跑门禁，按上游集合记一次 `gate_waiting{batch,upstream}`。③ auto 批次处于 approved/awaiting_audit/delivered 且会话空闲（无 tool_open、未请求交接、收件箱空、Stop 晚于最近投递）或承载层确认已不在时关席破锁，写 `seat_released{batch,session,state}`，不占 max_seats。④ 计划 plan_hash 与批准记录不符且有未完成批次时写 `plan_unbound{plan,plan_hash}` 并通知一次，status 显示「计划未绑定，调度已停」；delivered 且合入归用户时通知一次。⑤ 阶段挂点 `foremind/supervisor/phases/`：非 `_` 开头的模块按名顺序每轮调用 `run(t, blocked)`，可声明 `KIND` 与 `after(t, it, ok, st, jid)` 收割自己的作业；导入或运行抛出任何异常（含 SystemExit）只记 tick_error；阶段列表每进程载入一次，新阶段随 re-exec 生效；挡住批次的待决全是 deciding 时不算等用户 |
+| I66 | 守卫修补（m2b.2） | ① I58 会话 foremind 命令白名单改为按角色：所有角色不许经 Bash 调 `hook`，`log` 不许带 `--author`；席位的 `review` 只许 `review [批次]`（不带选项）、另许 `gate`；总控许 `run`、`say`、`plan amend`（不带 `--user-approved`）与 `review --request-changes`，**不许 `plan submit` 与 `catalog apply`**（controller 2026-09-27 定）；规划者许 `plan submit`；新增子命令默认拒。② 会话里调用 foremind 时改写 FOREMIND_SESSION（`VAR=`、单独一句赋值、env/sudo/exec 包装）整条拒。③ 重定向在一处去除（任意位置，含与目标分开写的两词），带引号的词不当重定向，去不掉的整条拒；进程替换 `<(`/`>(` 对所有 Foremind 会话整条拒（heredoc 数据正文除外）。④ 解释器读的 heredoc 正文当数据；凭据匹配保留 sudo、`VAR=` 等前缀原文（I55）；席位写项目外只许系统临时目录；依赖清单合一到 `foremind/manifests.py`（门禁与守卫共用，补 bun.lock 等）；命令模块导入失败时 PreToolUse 仍按守卫拒绝。⑤ supervise 自我 re-exec 前试跑改为 `foremind supervise --help`（比 REQ-1 字面的 `version` 更严，会导入 supervise 与 tick）。已知误拒（fail-closed 取舍）：`python3 $VAR/x.py`（变量可展开成 `-m pip install`，席位卡要求字面绝对路径）、自由文字参数里提到 FOREMIND_SESSION/env/sudo/exec 或 `<(`、`env FOO=1 foremind status`、`source … && python3 - <<EOF` 正文 |
+| I67 | 会话信号、接手修补与预算（m2b.8） | ① 发现 26：非阻塞 Stop 之后、下一次 UserPromptSubmit 之前的 PreToolUse 不算会话在忙（记 `tool_after_stop`，不进 open_tools）；Stop 阻塞继续时记心跳 `stop_blocked`，其后的工具照常算；运行中的批次 tool_open 超过卡住阈值且承载层空闲时清掉并记 `tool_open_cleared`（stuck.check 因此也会写心跳，heartbeat.py「只有会话自己的钩子写」不再成立）。② Notification 钩子（permission_prompt、idle_prompt 等等待类）记心跳 `waiting_input{kind, at}`（同一次等待保留首次 at）与事件 `session_waiting`，卡住检测对它只通知一次「<批次> 在终端里等你回答」、不升级；工具调用、提交或回合结束时清除。③ `foremind say <批次> "<文字>"`：写进当前应收件的会话（交接中则写给继任；锁被破时取已接手且未退出的继任），没有则报错。④ 接手：前任收件箱损坏时记 `inbox_forward_failed` 继续；卡住破锁后接手的继任收到卡住会话的未投递消息；`inbox_forwarded` 写意图与结果。⑤ 上下文预算按 `context.by_role.<角色>.<模型>.<键>` → `context.by_role.<角色>.<键>` → `context.<键>` 取（键：window_tokens、soft_pct、hard_pct、abs_cap_tokens），**各层逐键合并**（controller 登记 `context.by_role.*.*`、`context.by_role.*.*.*`；config._flatten 对既是登记值又是登记键前缀的键继续展开）；模型取状态栏 model.id，表里没有该写法时回退 seat_launch 的模型。L1 只注入 batchlog 已校验前缀里的 D/F |
+| I68 | 交付与审查余项（m2b.7） | ① doctor 不把只有 foremind/gate 的必过检查算「有 CI」，必过检查所在分支不是交付目标分支时警告；gate 分页有上限，超了报错并释放 gate.lock。② required 模式 CI（及 merge queue）pending 超过 `gate.ci_pending_max_min` 记 `ci_pending_long` 并通知一次，不判失败（in_review 批次门禁不重跑，只提醒）。③ 合入组预检读各成员 mergeStateStatus，白名单 CLEAN/HAS_HOOKS/UNSTABLE，UNKNOWN/BLOCKED 重问 3 次，任一不可合则一个都不合；merge queue 下 `gh pr merge` 只入队时记 `merge_queued`，之后核对补记 merged；多仓库只部分合入时 update 继续更新其余；approved 的 merge_dev 批次只因落后目标分支没过门禁时，阶段 `phases/update.py` 自动 `foremind update` 一次（忙则记 `update_busy`）。④ 审查：同一组 heads（按各仓库 `<head>^{tree}` 比较，空提交或 --amend 不算新内容）已有回执时席位再请求一律拒（REQ-19 原文；controller 曾加的书面反驳例外已撤回，Q-14 未批）；席位只反驳不改代码时用 `decide --new` 请总控裁定；审查超时算基础设施故障不计 max_failures，另有常量上限连续 3 次（`review_failed.timed_out`，batch_state reason `review_timeouts`，通知一次），`foremind run` 清零；3 轮上限只数最近一次 approved 之后的轮次 |
+| I69 | 决策者与一次性总控（m2b.3） | ① 新待决的类别按当前预设（并按被挡批次与请求批次的任务层配置复核，收紧则上交）归决策者或总控且交给系统时，状态 deciding，不推送；阶段 `phases/decide.py` 在额度与一次性名额允许时起一次性会话（目录 `.foremind/oneshots/`，事件 `sv_decide`），先做归属复核再看额度。**kind 为 catalog 的待决固定交用户**。② 决策者输出须合 `decision_output`、类别与选项一致、援引判例存在且未过期未被取代；confidence high，或 medium 且可撤回 → 以 by=decider 答复并执行程序动作，写 `decider_decided{sample}`（按 `decider.audit_ratio` 缺省 0.2 确定性抽取）；否则或作业失败两次、判例文件读不了 → `pending_escalated` 上交用户。③ 一次性总控：decision 须逐字等于某选项，scope_change 不超原请求路径，带 plan_amend 的一律上交；它批准的 #8 落盘 approved_by=controller。④ hands_off 预设只把 `authz.hands_off_delegate`（仅用户层）列出的、非 🔒、原归用户的类别交给决策者；未设置时照旧报错。路由 `routes.decider.*`、`routes.controller.*` |
+| I70 | 席位可见与额度均摊开关（用户 2026-09-27） | ① Orca 承载的席位终端建在**项目根的 Orca 条目**下（`--worktree path:<项目根>`，启动命令先 cd 进席位 worktree），在 Orca 界面里作为该条目下的标签页可见（标题为会话名）；此前按席位 worktree 路径建，Orca 不认该路径而退成不可见的后台句柄。一次性角色（审查者、决策者、审计者）仍是无界面的 `claude -p` 作业，看 `foremind status` 与 `.foremind/reviews|oneshots/`。② `quota.pace`（AUTHZ，[true, false]，true 更严，缺省 true）：false 时不因 7 天用量超过按日均摊线而判 low，5 小时偏低线（quota.low_pct）与暂停线（reserve/oneshot_pause）照旧；本机用户层已设 false |
+| I71 | 运行恢复（m2b.10） | ① 额度状态移到用户层 `~/.config/foremind/quota.json`（按账户 × 角色组，跨项目共用），项目层旧文件第一次读取时迁移（`quota_migrated`，取更严的状态；只读命令用 quota.view 折入未迁移的旧文件）；`merged_checked` 拆到 `.foremind/merged_checked.json`。遥测跨已启用项目读取；共用状态按本项目与已登记项目中**最严**的 reserve_pct、oneshot_pause_pct、low_pct、recover_pct 推进（quota.account_cfg），一个项目收紧会让所有项目一起提前暂停。② seat_open 意图记作业 `job` 与 `pid`，`_after_seat` 只结算本作业的意图，recover 按 pid 存活判断且先重读事件；seat_launch 结果带 `settings_sha256`（carrier.create 之前取）；sv_<kind> 意图带 job；start_job 写意图后、写作业链接前崩溃的作业下一轮找回，Popen 成功但 pid 未写成的超过启动时限按 lost。③ gave_up 计数：gate exit 2 只在批次还有未结的 merge 意图时计入（merge_queued 视为已结），超时与 lost 计入；审查与决策等一次性作业共用进行中计数（supervisor.max_oneshot） |
+| I72 | 暂定决定与判例（m2b.4） | ① 暂定条件（REQ-10）：决策者输出与待决本身都可撤回、所在行可暂定、类别未被收紧 → 待决转 provisional，写 `decisions/PV-<n>.json`（期限 48 小时），执行程序动作，通知持锁席位把相关改动单独提交并写 `provisional: PV-n`；到期未确认转 overdue 并推送；`decide Q-n --confirm|--overturn|--void`（只归用户），overturn/void 撤销签发的凭据、通知回退、计入推翻率。② 回退通知：有持锁席位写其收件箱；没有则把批次转 changes_requested 并写进 `## 状态`，转不了也就地追加到 `## 状态`，并推送用户。③ 推翻率收紧（REQ-11，按字面）：某类别最近 20 次（至少 5 次）决策者决定被推翻超过 20% → step 1 该类别不可暂定（结论照 REQ-8 直接答复），已不可暂定的 step 2 改归用户，写 `delegation_tightened`；`decide --restore <类别>` 恢复（只归用户）；同一 key 曾被推翻的请求直接交用户。④ 判例前提监视：file_hash（支持 `<仓库id>:<路径>`）或 config_key 与事实不符 → needs_review、`precedent_needs_review`；决策者援引过期、已取代或需复核的判例（settle 时当场核对）→ 作废上交；取代已被取代的判例拒收；rules.md 替换/删除的待决缺 original_sha256 拒绝执行。step 1 的语义是否修订待用户定（#9） |
+| I73 | 规划与计划修订修补（m2b.9） | ① `plan submit` 保留已有 revisions（含 #9 的用户批准）；规划者会话 cwd 为草稿目录，权限白名单不含 git add/commit，守卫对 planner 角色拒这两个命令；耦合里一方有现存文件时引用与共改记为未知。② expand_scope 也查持锁的 ready 批次；同一答复重试且路径已全归本批时视为已完成；`plan amend --user-approved` 带 user_approved 跑 S6；amend 写多个文件前写意图事件 `plan_amend`，写完记结果，下次发现有意图无结果时按哈希补完或报告 `plan_amend_failed`（计划失绑时须 `plan amend --user-approved` 重新批准）。③ 批次正文里围栏代码块中的 `## 状态` 不作切点（plan.model.spec；未闭合的围栏不算），L1 读状态区同样按 spec 切（controller 衔接）；batch_header 登记可选字段 `contract`（"true"|"false"）、`coupling`（[{batch, score, reason}]）、`config_approved`（sha256），格式错会让整份计划加载失败 |
+| I74 | 审计（m2b.5，REQ-13 依用户 2026-09-27 #9 限定） | ① L0 每轮最先跑（也在全阻塞下，不调模型）：#22 文件（CONFIG_GLOBS，按所在位置作键，不解析符号链接）对照 `l0_baseline`，无批准（最近的 `user_config_edit`、`program_config_write`、`l0_config_accepted` 名下此哈希，或本次报告后 `resumed`）即硬失败；每个根首次对账全记基线（`l0_root`）；席位 settings 按其 seat_launch 的 settings_sha256 判；冻结目标对照最近 goal_frozen / plan_approved / plan_amended 的 goal_hash；批次日志 batchlog.verify；事件链 verify_chain（指纹带所指行内容）。② 失败即关闭：新硬失败先 `paused` 再写 `l0_hard_failure` 与 P0（不含路径）；配置读不出（config_invalid）、事件日志坏行（events_invalid）、L0 抛错（l0_error）、tick 在 L0 前崩溃（tick_crash）同样处理，查到恢复后写 `l0_cleared`。L0 与 tick 级 P0 只按**用户层**选通道（notify.channel，否则有 [notify.ntfy] 即 ntfy，否则 none），项目层是被核对文件不参与。③ L1 一次性审计者：tier 要求交付前审计的批次门禁后进 awaiting_audit，无 P0/P1 → delivered 并起门禁补写 success（失败按 gate_retry_min 重试到 seat_retries，exit 2 也计次，放弃时通知）；有则 held、按级通知，`foremind audit --release` 放行；决策者抽样按 decider.audit_ratio；每日上限 audit.daily_cap。④ `foremind audit` 列 L0 失败与 held 审计；`--accept-config`（记 `l0_config_accepted` 后 resume）与 `--release` 只归用户。⑤ `foremind init` / 卸载写 `.claude/settings.local.json` 与 `.foremind/config.toml` 之前记 `program_config_write {path, sha256, by}`，L0 视同批准（controller 合入后补）。⑥ 覆盖范围：只验收审查 r1–r9 列出的篡改形式 + 通用兜底；守卫与审计防误操作而非安全沙箱，其后新的对抗性篡改形式转 m2c 审计余项 |
+| I75 | 运行报告与通知（m2b.6） | ① 运行报告（§11.3 脚本部分）：`foremind report` 与报告阶段按上一份 `report_generated` 以来的事实写 `.foremind/reports/<本地时间>.md`（批次状态变化认 batch_state、reconciled 与 plan_amended 的 dropped；等你合入按批准读任务层；首轮通过率与平均审查轮数只算窗口内有回执的批次、按回执先后次序且排除 rebound，标题注明口径；读不了的项记 unknown），推送只含编号与计数（§8.7）。全阻塞每个新指纹生成一份并推送（取代 announce_block，已推过 full_block 的指纹不重推），全部完成且有状态变化时也生成；先推送，确认已处理再写 report_generated。② P0 限流（REQ-16）：12 小时内已推 2 条后其余 P0 记 `notify_held`，进下一次推送或运行报告；L0 的 P0 不例外（controller r2 依 REQ-13/16 原文裁定）——暂停中有未带出的被限流 P0 时，paused 分支仍生成一次运行报告推摘要（`run_report:paused:<集合指纹>`，同一集合一次，不开席不跑门禁不动批次）。③ `notify.p1 = "report"` 时 P1 进下一份报告（报告摘要本身照常推）；其他值按 push。④ 批次转 failed 通知一次并提示 `foremind run <批次>`；`run` 先校验全部批次号，failed → ready 写 `batch_retried {by}`（I64 晨报改运行报告在此落地）|
+| I76 | 增量重审与审查强度（m2c.3，REQ-6/7） | ① §7.1、I25：回执 scope 增 `incremental`，程序字段 `delta_from`（上一份回执的 heads）在且仅在 incremental 时出现（schema 联检）；增量轮材料为 `<repo>.delta.diff`、`<repo>.files.txt`、log-since.md（从上一份回执那次审查开始时的日志位置起）、goal/批次头/交接、previous-receipt.json，不给完整 diff 与 log.md。② 判定：上一份回执取最新回执文件，其 bases 取 heads 相同的最近一条 review_requested 或 batch_updated（重绑回执的 merge-base 记在 batch_updated，故重绑后的一轮可走增量，重绑本身要求 patch-id 相同）；REQ-6 三条之外另要求上一份回执沿 delta_from 链能到 full，否则全量；本轮可增量而本批仍有未收割的审查（in_review 期间重请求）时增量轮等旧审查收割后再起、以它的回执为 delta_from，全量轮不等。③ §7.4：3 轮上限计 full 与 incremental，冲突增量 delta 与重绑回执不计；门禁要求 incremental 的 approved 回执 delta_from 等于前一份回执文件的 heads，且沿链能到一份 full（不要求 approved）；重绑副本按它复制的原回执核对。④ §3.2：审查者 effort 取 `routes.reviewer.effort_security`（批次 reqs 覆盖 goal.md 行首 `REQ-n: [防误操作]`/`[防对抗]`，冒号可全角；goal.md 读不出按安全批）→ `effort_s/_m/_l`（按 tiers.difficulty）→ `routes.reviewer.effort` → xhigh；值不在 EFFORTS 时审查不启动（tick 记 review_start_failed）；只在有批次头时校验，额度试调用只取 model 不受影响。route 不查 §3.1 #18 最强强度下限：用户把 effort_s/_m/_l 调低后，命中 #18 但未标安全标签的批次会用较低强度，取值时须留意（遗留）。meta.json 另记 difficulty、security，增量轮另有 delta_from。 |
+| I77 | 守卫变量误报与席位 foremind 命令走主检出（m2c.1，REQ-1/2；补 I58、I66） | ① 「只经 shell 写法命中」＝没有任何形式按字面匹配该硬拦截规则、只经 shell 写法补全才匹配（#23 为严格判定不中而宽松判定中）：按可写矩阵直接拒绝，不查凭据、不写 pending_needed、不生成 Q-n，理由要求写成字面；同一调用里其他拒绝理由与之并列输出；bash -c 与被 shell 读的 heredoc 共用外层 raw，去重键另带「是否字面命中」，字面命中照旧登记待决、shell 命中同时进矩阵。`git \>x push` 这类引号去掉后与 shell 写法不可区分者按此拒绝。② Foremind 会话（所有角色）执行 `python* … -m foremind …`：每条命令只看它自己的赋值词（定位解释器时跳过赋值词），取解释器之前最后一个 `PYTHONPATH=`，须为绝对路径且 realpath 等于 vendors.claude._PKG_PARENT，且 -m 之前带 `-P`，否则不可豁免地拒绝，理由给出可照抄的整行前缀（与钩子命令同形，主检出路径含空格时同样放行）；按前缀执行或直接执行 `foremind …` 只按角色白名单判定。`env PYTHONPATH=… python3 -P -m foremind` 仍被 FOREMIND_SESSION 改写规则拒绝（_REENV 归 m2c.9）。③ 未覆盖（遗留）：timeout/nice/xargs/uv run 包装下的 python -m foremind 不经此判定；两个 PYTHONPATH 之间夹目标名形如 python* 的重定向（`PYTHONPATH=<主检出> 2>/tmp/python PYTHONPATH=. python3 -P -m foremind …`）会被放行——属刻意绕过，由 m2c.6 越界兜底；vendors.claude.ALLOW 的 foremind 规则不匹配新前缀，席位若为 acceptEdits 每条 foremind 调用会弹确认（本项目 seat.permission_mode = auto）。 |
+| I78 | 合入命令与交付说明（m2c.4，REQ-8/9） | ① §13.5 增 `land <批次> [--notes]`：总控或用户手动合入 delivered 单仓库批次，Foremind 会话里一律拒绝（含 --notes）；门禁 heads 须等于当前 heads 且 pass；在 wt_root/_land-* 临时 detached worktree（hooks 关）以目标分支当前提交为起点 `--no-ff` 合并，跑 accept_commands 与 `land.commands`（PLAIN，缺省 `["python3 -m unittest discover -s tests"]`；输出 state_dir/land/<批次>-<时间戳>/），全过且主检出干净、目标未动才 ff（主检出在目标上 `merge --ff-only`；目标检出在别的 worktree 则拒绝；否则 update-ref 带旧值）；任何失败不动主检出与目标。② 不写批次状态：merged 由 L0 reconcile 补记，前提是 gate.batch_merged 经 review.target_ref 比对——有远端的仓库比远端目标 ref，land 只动本地分支，要等推送后才记 merged；无远端时按本地分支立即可记。③ §1.4 schema `delivery_notes`：config_keys[{key, merge_class: plain\|union\|repo_convention\|authz, default?, why}]、design[{where, text}]、leftovers[{item, why}]，三项必填可为空；`foremind log` 遇 `## 交付说明` 校验其后第一个 json 块，不合格不追加；land 成功或 `--notes` 打印最后一段汇总。④ 本项目 `land.commands` 设 3.14 与 3.13 两条全量。 |
+| I79 | API 错误续跑、交接段早于请求、退回清单进继任（m2c.2，REQ-3/4/5） | ① §10.3 续跑：主链末条 assistant 且 isApiErrorMessage 为真即 API 错误；可重试按记录 error 字段（server_error/overloaded/unknown 可重试；rate_limit/authentication_failed/billing_error/invalid_request/max_output_tokens 不可），缺字段看 apiErrorStatus 5xx，再退到文案。次数按「一轮连续错误」计（自上一条正常回复起），key `apiretry:<会话>:<错误 id>:<n>`，上限 `stuck.api_retry_max`（3）、自 `stuck.api_retry_min`（2 分钟）翻倍退避，写收件箱失败也占一次；用完或发不出时发带「API 错误」的 session_waiting。Claude Code 遇 API 错误只跑 StopFailure、不跑 Stop，空闲靠承载层 idle。② 交接窗口内的持锁者也续跑：_deliver 只投收件箱开头连续的续跑消息且投前复查 transcript；写过交接段（handed_off）后一律不续跑。③ 全阻塞（§10.2「不启动任何模型」指后台新启动）：对 running 批次只跑续跑判定，到期续跑连同整份待投收件箱一起投，用完照发一次等待通知；其余 stuck 阶段与投递照旧跳过。被待决挡住的批次同样判续跑。④ §6.4 交接段早于首次交接请求：阻断理由写明其时间并要求重写（REQ-4）。⑤ 退回清单：changes_requested 且无持锁者时，继任开席成功、发开工指令前把最新 changes_requested 回执的清单与最近一次转入以来的 changes_requested_by 条目写进继任收件箱（回执 supervisor 名义、总控条目 controller 名义，同批只写一次；kickoff 失败带 lists_unsent 作废）。 |
+| I80 | status 的「等待：」一节（m2c.5，REQ-10） | ① `foremind status` 在批次列表后为每个未完成批次写一行 `<批次> <状态> — 在等：<谁>；原因：<…>；你要做：<命令或「无需操作」>`。② 判定复用监督进程 Tick.waits（等用户的原因映射成 decide Q-n / run / land / audit --release / confirm-exit / plan approve / doctor / seat --user）与 ready.why_not_ready（上游未合入或未批准、决策中、owns_paths 重叠；为空时开席中、额度、名额已满）；已开始的批次按状态写席位与心跳、终端等回答、交接中、API 错误续跑、审查者、门禁（与 tick 门禁同口径：有未结 review_started 意图、最新回执非 approved、本轮门禁已 exit 0/1 时不算在等门禁）、审计者、合入重试。③ 监督进程未运行或代码旧、项目根 STOP、paused、任一额度组 exhausted 时，每行尾写「不会自动推进」与恢复办法。④ 只读：跳过 Tick.__init__（quota.migrate 与阶段导入会写），notify/emit/error 置空；配置有误时只输出一行 foremind doctor。多仓库批次「你要做」写「逐个仓库手动合入」（land 只收单仓库）。 |
+| I81 | 运行余项：释放、重试计数、pid 复用、试调用、接手转发、幽灵调用、L1 索引（m2c.7，REQ-12–15；补 I65、I67、I68） | ① §10.2 释放空闲席位（补 I65③）：有退出证据（承载层确认关闭或用户 confirm-exit）或 alive=False 的会话不再看心跳 tool_open、handoff_requested 与收件箱，直接关闭取证据并破锁；alive=None（含 manual）一律不当空闲，manual 只认 confirm-exit。屏幕空闲、心跳静止满 stuck.remind_min 的 tool_open 在 approved/awaiting_audit/delivered 也清（tool_open_cleared）。② §10.2 重试计数：门禁 exit 2 只在当前 head（本批最近一条带 heads 的事件）上还有未结 merge 意图时计入 supervisor.seat_retries；delivered 门禁失败后出现 verdict=pass 的 gate_result 即算已补写，不再重跑、不发「补写门禁失败」。③ 监督进程状态（补 I65①）：supervisor.json 的 pid 存活但 `ps -o lstart=` 晚于 started_at 2 秒以上按未运行（re-exec 保留 pid 只重写 started_at，早于不算不符；缺 started_at 或 ps 读不出照旧）；status 报「监督进程未运行」，doctor 在有 supervisor.json 而未运行时报一项 WARN（不计退出码）。④ §10.5 试调用成功时，最新读数的 7 天窗口仍在当前窗口内且用量超当日均摊（quota.pace 为 false 不看）转 low 带 ok_until（发现 27）。⑤ §6.4 接手转发：有前任时转前任加上次接手后开过、未接手的继任的未投递消息；锁已破而无前任时只取这次破锁拿走锁、且本批曾标 stuck 的会话（release_idle 之类的破锁不转）；每个来源各一对 inbox_forwarded（dedupe_id `inbox_forward:<批次>:<继任>:<来源>`），重跑时结果带此前意图 ids。⑥ I67① 补：非阻塞 Stop 之后、下一次 UserPromptSubmit 之前的 PreToolUse，tool_use_id 在 transcript 末段（倒读 1 MiB）主链 assistant 的 tool_use 里即真实续回合，照常进 open_tools，否则记 tool_after_stop（transcript 落盘晚 0.08–5.7 秒，续回合首个工具多仍记 tool_after_stop）。⑦ §11.3 因 review_timeouts 转 failed 只发报告阶段一条 P1「<批次> 连续失败已停」，update 阶段不再另发（I68④）。⑧ §7.6 CI 久等起点取该 head 最近一次非 pending 门禁结果之后的第一次 pending；ci_pending_long 仍按 head 只记一次。⑨ §6.1 L1 的 D/F 索引：batchlog.verify 通过后按最近登记 size 截断再核 sha256，不符不注入、给提示并记 hook_error。 |
+| I82 | 越界兜底与冒用用户检查（m2c.6，REQ-11 [防对抗]） | ① §9 监督进程新阶段 bounds（不调模型，全阻塞下也跑）。worktree：running、changes_requested、review_ready、in_review、approved 的批次（用户持锁也核），已提交（merge-base 到 HEAD）、未提交、未跟踪路径不在 owns_paths 内，或依赖清单、#7 迁移路径、#22 文件而无有效凭据 → `bounds_violation{batch, kind:"worktree", paths:[{path, why}], fingerprint}`，按指纹去重，投给持锁会话（用户持锁不投）并 P1；被 git 忽略的文件只核 #22。远端：push_pr 归用户的仓库按 supervisor.merged_check_min 节流，ls-remote 有本分支或 `gh pr list --state all` 非空 → `bounds_violation{kind:"remote", repos}`。核对抛错 → `bounds_error{batch, kind, error, fingerprint}`，按指纹 P1 一次，不算通过；通知不含路径。② 半途状态：停在合并中只跳过 git status 索引列非空的条目；停在变基中已提交取 merge-base 到 orig-head 与 onto...HEAD，git status 全部照核，只跳过该仓库远端核对；某仓库连续超过 3 轮停在半途，按仓库与 HEAD 记 bounds_error 一次。合并/变基半途的新变体转遗留，由此兜底（controller r4 收敛）。③ §1.3 事件字段 seat_ancestor：声称用户的事件（approved_by/by/author/requested_by 任一为 user，或类型属 events.USER_TYPES，或 batch_state 的 via 为 "audit --release"）写入前沿进程祖先（ps 取 /bin/ps、/usr/bin/ps 第一个存在的，最多 32 层）查找本项目 `.foremind/sessions/<会话>.settings.json`：找到记会话名，ps 读不出记 "unknown"（bounds 阶段每条 P1 一次），否则不加。④ §9.2 L0 硬失败 seat_ancestor：按事件 id 记 `l0_hard_failure{check:"seat_ancestor", target}`，本轮动作之前先暂停再 P0。 |
+| I83 | 待决识别、一次性总控相反决定、暂定余项、判例缺省值、修订报告（m2c.8，REQ-16–18） | ① §8.3 请求识别：`decide --new` 带路径或命令时 key 为 (类别, 批次, match) 的哈希（路径、命令先去重排序）；同 key 有未决（open、deciding、escalated、awaiting_local_confirm、answered 未应用）的就复用；provisional、overdue 的只在程序动作失败且重试未用完（supervisor.seat_retries）或放行凭据仍有效时复用，否则（凭据过期或重试用完）另开 Q-n，照常交决策者或推送；同 key 的暂定决定曾被推翻或作废时，新请求直接 open 交用户、不进 deciding。不带路径和命令的请求无 key、不合并。② §8.4 一次性总控的 decision 不是推荐选项时不执行，上交用户（escalated），理由写明选了哪项、推荐哪项并附其 reasons；硬拦截命中的待决推荐「不批准」，批准必经用户。③ §8.4 暂定动作（签发凭据、扩大范围等）失败后每轮重试一次，最多 supervisor.seat_retries 次，provisional 与 overdue 同样；用完推送一次 P1（只带 id 与查看、推翻命令）；期间仍按暂定生效。④ §8.5 判例 config_key 前提：键在任何配置层都没设时按缺省值比对；按仓库的 delivery.repo.<id>.level、ci 未设时按 delivery.level、gate.ci 回落（同 review.repo_cfg）；缺省值不确定的键不设即不成立；配置读不了一律不成立。⑤ §8.6 `foremind decide` 列表也列 provisional 与 overdue，时间栏写 PV 到期时间。⑥ §11.2 推送被延后（notify.p1 = report）或限流时，decide 与暂定撤回的提示写「已记下，进下一次推送或运行报告」。⑦ §4.2 S9 中断的修订补不完时，计划仍绑定（一个文件也没写、之后只动运行时字段）报「计划仍绑定」，否则报「不再绑定，需重新批准」；#8 扩大范围的答复结果带 expand_scope 的补完报告与校验警告。 |
+| I84 | 常驻总控的上下文把关、固定交接与结构化记录（m2c.10，REQ-22） | ① §6.3 常驻总控按程序读到的实际上下文（transcript 最近一次请求 input + cache 写 + cache 读，与状态栏 ctx 同源）把关；缺省软 200000、硬 300000 token（2026-09-28 实测，m2d 起按 controller_* 记录自适应），显式 context.by_role.controller.* 优先。② §6.4 过软线 Stop 提醒一次，之后每见新的 merged（batch_state 或 reconciled 的 to=merged，含 `foremind land` 合入后的补记）再提醒一次；到硬线 Stop 阻断，硬线请求一经记下即锁住（/compact、/clear 后读数降到线下仍阻断），直到按 templates/controller-handoff.md 写好 HANDOFF-controller.md 并执行 `foremind controller handoff`（校验 6 个小节与 foremind-check 核对块、文档须在硬线请求之后改过，程序把读数写进第一段，记 controller_handoff 后开继任并投递接手指令）（stop_hook_active 时不重复）；继任先 `foremind controller check`。在总控标记下 fresh startup 的嵌套会话（总控名已绑定）不绑定。③ §13.5 `foremind controller open`（带 FOREMIND_ROLE=controller 与 FOREMIND_CONTROLLER 标记，不带 FOREMIND_SESSION，模型/effort 取 routes.controller_live.*，缺省 claude-opus-5-5[1m]/high；routes.controller.* 属一次性总控）、`controller handoff`、`controller check`（逐项 ok/不符，有不符退出码 1，打印可贴进 PROGRESS 的接手行）、`controller slip --kind ruling_withdrawn|missed_event|wrong_fact|other --note`（上下文由程序读）。④ §1.4 事件 controller_launch{session, model, effort, predecessor}、controller_opened{…, carrier}、controller_handoff{from_session, agent_session_id, sha256, budget, context_tokens, calls, input_tokens, cache_write_tokens, cache_read_tokens, output_tokens}、controller_takeover{session, predecessor, ok, mismatches, context_tokens, …}、controller_slip{kind, note, session, agent_session_id, context_tokens}。 |
+| I85 | 路径匹配统一、守卫误拦与命令名大小写、overdue 凭据（m2c.9，REQ-19–21；补 I8、I11、I58） | ① I8 补：路径比较一律经 foremind/pathmatch.py：先规范化（去 `.` 段、合并 `//`，开头结尾 `/` 保留）；模式结尾 `/` 表示其下全部，其余按 fnmatch（`*` 跨 `/`），字面路径只匹配自身。owns_paths 判定（守卫、门禁与交付界外检查、耦合分析）与凭据 paths 匹配（exemptions.find、门禁依赖段复核、decide/exemption）用 owns；重叠判定（计划校验、运行时不相交、freeze）用 overlap：两边字面时相同或一个在另一个之下即重叠，否则互相 fnmatch 命中或字面前缀与后缀都相容即重叠（拿不准判重叠）。owns 只认结尾 `/`（`api:src` 不再放行 `api:src/a.py`）。② I11 补：导入时探测主检出所在卷是否大小写不敏感（自身路径大小写翻转后 samefile），不敏感时路径比较前 casefold；只探测一次、不按仓库。③ I58 补：命令里有 shell、eval、source 或 `.` 时，只有 cat、tee、foremind log/handoff、git commit -F - 读的 heredoc 正文按命令判，python*、node、ruby、perl 读的正文仍是数据；改写 FOREMIND_SESSION 的包装词（env、sudo、exec，不分大小写）只看顶层命令自身命令词之前的词，参数自由文字不算，bash -c、eval、shell 读的 heredoc 里仍看外层整条原文；大小写不敏感卷上命令名按小写参与所有判定，hard_block.patterns 的命令词也按小写比较、参数部分仍区分大小写。④ §8.4：overdue 的待决与 provisional 一样算已批准，门禁依赖段复核仍认其凭据，直到确认或推翻（REQ-21）。 |
+| I86 | 名额与继任、开席前看整机负载、交接开销记录（m2d.2，REQ-5–7；补 §10.2、§9） | ① §10.2 名额：只由 Tick.free_seats() 计算。used = 非用户持锁且未终态的批次 ∪ 开席中（sv_seat/sv_successor 未完）∪ 待接手的继任；cap = supervisor.max_seats（额度 low 时减半，至少 1）；waiting = 无人持锁、需要继任、计划仍 bound 且未 gave_up 的批次数。批次无持锁会话时，其继任在 used ≥ cap 时不开，记 successor_deferred；新批次可用名额为 cap − used − waiting，名额空出时继任先于新批次（发现 35）。前任仍持锁时（上下文交接，含首个继任未 accept 就卡住后补开的继任）继任接替该席，不另占名额也不查整机负载。② §10.2 整机负载：开新席或无持锁者的继任前，每轮至多读一次整机（supervisor/machine.py）：load1 ≥ supervisor.max_load_per_cpu（缺省 0.8）× CPU 核数（原因 load），或可用内存（macOS vm_stat free+inactive+speculative；Linux MemAvailable）< supervisor.min_free_mem_mb（缺省 2048）（原因 memory）时本轮不开；读不出的一项不设限。③ §9 事件：successor_deferred{batch, used, cap}，去重键 successor_deferred:<批次>:<下一次 sv_successor 序号>；seat_deferred{reason, load1, cpus, avail_mb, max_load_per_cpu, min_free_mem_mb}，去重键含项目最近一次 seat_opened 的 id，reason 变化不重记；machine_unreadable{what: load|cpus|memory, error} 同样按最近一次 seat_opened 去重。handoff_written 新增 context_tokens、calls、input_tokens、cache_write_tokens、cache_read_tokens、output_tokens、requested、dirty；handoff_accept 结果新增同六项 token 字段；读不到为 null（埋点，REQ-7）。 |
+| I87 | 1M 席位预算、回合中途提醒、断点、StopFailure 与续回合追认（m2d.3，REQ-8–12；补 §6.3、§6.4、§9、§10.3、§1.1） | ① §6.3 按窗口的缺省：席位（role=seat）状态栏 telemetry/<会话>.statusline.json 的 context_window.context_window_size ≥ 1000000 时，预算键代码缺省为 window_tokens=该值、hard_pct 30、soft_pct 20、abs_cap_tokens 无上限（1M 下软线 200000、交接点 300000）；显式配置仍按 context.by_role.seat.<模型>.<键>、context.by_role.seat.<键>、context.<键> 逐键优先；读不到或 < 1M 时同原缺省（软 130000、交接点 160000）。总控预算不变。② §6.3 回合中途提醒：PostToolUse 从 transcript 尾部读上下文，达软线或硬线时经 hookSpecificOutput.additionalContext 注入；该级第一次立即注入，同级之后每 5 次工具调用再注入，升到硬线立即注入，低于软线不注入并清空状态。只对主线程：输入带 agent_id（子代理内调用）时不注入、不计入节奏。席位（含其他 Foremind 会话，线同各自 Stop）状态存心跳 context_line{level, calls}；带总控标记且已绑定的会话按 controller.budget，状态存 controller 状态文件 context_line，已 controller_handoff 的不再提醒。③ §6.4 断点：席位 Stop 过软线未到硬线时，取本批最近一条带 worktrees 的 seat_opened 或 seat_user，逐个 worktree 跑 git status --porcelain；有条目就不提示、不置 soft_prompted，等无改动的 Stop 再提示一次；读不出（无 worktrees、git 失败或超时 10 秒）当作断点。硬线照旧，不看改动。④ §6.4 handoff_requested：席位第一次被要求交接时记，出自 Stop 或回合中途硬线提醒（PostToolUse）都算，同时置心跳 handoff_requested_at，此前写的交接段不作数。中途硬线交接之后的那次 Stop（stop_hook_active 为假）按 REQ-9 仍阻断一次，席位已有请求之后的交接段时直接停下即可。⑤ §10.3 StopFailure：API 错误结束回合时触发（不触发 Stop），席位 settings 注册该钩子；取输入 error（2.1.280 字段名），其次 error_type，都没有记 unknown；写心跳 api_error{type, at}（不改 event 与 ts 之外的回合字段），记事件 api_error。已安装项目合入后需重跑 `foremind init --yes`（HOOK_EVENTS 同时驱动 install.settings 与 doctor 核对）。SessionStart：席位心跳记 messaging_socket（环境变量 CLAUDE_CODE_MESSAGING_SOCKET，没有为 null），投递方式不变。⑥ §9 新事件：handoff_requested{session, batch, role, context_tokens, soft, hard, window, dirty}（去重 handoff_requested:<会话>:<批次>；dirty 为 porcelain 条目数，读不出为 null）；api_error{session, batch, error_type}；tool_after_stop_confirmed{session, batch, tool_use_id}：PostToolUse 的 tool_use_id 在 telemetry/<会话>.after_stop.json 的 ids 中即记（_tool_start 记 tool_after_stop 时写入，保留最近 20 个，在 <会话>.after_stop.lock 锁下读后写），不看心跳当前 event。⑦ §1.1 席位 settings 的 allow 另含与 foremind_command() 同形的整行前缀规则 Bash(PYTHONPATH=<包目录> <python> -P -m foremind <log\|handoff\|review\|decide\|status>:*)，原 Bash(foremind …:*) 规则保留。 |
+| I88 | 会话对账与关闭、总控继任关前任、status 显示进程（m2d.1，REQ-1–4；补 §5、§9、§10.4、§6.3/§6.4、§13.5） | ① §5 承载层退出证据：close() 的退出证据 = 承载层报告终端关闭，再核会话进程（Carrier._settled → sessions.settle）。会话进程只凭记录认：命令行里的 `--settings <项目>/.foremind/sessions/<会话>.settings.json`（外层 shell 同带时取最内层），总控凭 bind 记下的 pid+lstart；进程启动时间不得早于启动记录（席位 seat_launch intent、总控 controller_launch、规划者 settings 文件 mtime）。仍在：只对那一个 pid 发 SIGTERM，等 exit_timeout_s；退了给证据，仍在不给（按 close_due 重试）。身份核不上（ps 读不出、最内层不止一个、启动早于启动记录或无记录、本进程或其祖先、EPERM）：不发信号，照给证据，记 session_close_unverified 一次。manual 不变。② §10.4 监督进程 sessions 阶段（每 supervisor.merged_check_min 至多一次）：此项目 seat_launch 开的席位，进程仍在、身份核得上，而批次已 merged/cataloged/cancelled，或已被接替（它的 launch 之后本批有别的会话 handoff --accept，或它的锁已按退出证据破掉且本批有新的非用户持锁会话），记 session_leak，经承载层按 §5 关闭，记 session_closed。本项目用过的承载层列出的 fm-<slug>- 会话没有启动记录（seat_launch、controller_launch、planner_opened）时只记 session_unknown。不关：记录之外的会话与进程、有 seat_user 的批次、持锁会话与待接手继任、开席中、总控、规划者、身份核不上的、ps 失败时的一切。③ §6.3/§6.4 总控：SessionStart 绑定时记下钩子进程上方第一个 claude（argv[0] 基名）的 pid、lstart；上方祖先里有已绑定总控（pid 与 lstart 都对上）的会话一律不绑定。`foremind controller check` 全部 ok 且前任有 controller_launch、controller_opened、controller_handoff 且其继任正是本会话时，经它开出时的承载层按 §5 关闭，记 controller_closed，确认后不再重复；核对有不符输出「前任保留」；前任没有 controller_launch 时不关，输出请用户关闭它的终端。④ §13.5 status：「会话」段后加「存活的 Foremind 会话」段：个数、CPU 与内存合计，逐会话列角色、批次、pid、进程树 CPU%、内存 MB、已记关闭仍在跑的标记；ps 读不出时写「未知」。再加「总控」一行：updated_at 最新的 .foremind/controller/*.json 的会话名、context_tokens、controller.budget 的软硬线、更新时间。⑤ §9 事件：session_close_unverified{session, why}、session_leak{session, batch, why: finished\|taken_over, pid}、session_closed{session, batch, pid, confirmed}（第一次关闭的结果）、session_unknown{session}，均每会话一次；controller_closed{session（继任）, predecessor, confirmed, how, carrier, error?}；sv_close 的 why 新值 leaked；总控状态文件新键 pid、lstart。 |
+| I89 | 行为模式提醒、API 错误分类、卡住结果与遗留工具清理（m2d.6，REQ-16–18；补 §10.3） | ① 行为模式（只提醒）：running 批次被监看会话存活、不在等终端回答、未申请交接、不在全阻塞时（决策阻塞照判），读 transcript 主链最近 20 条；同一 Bash 命令连续 stuck.pattern_repeat（缺省 3，小于 2 或非整数按 3）次同样报错（repeat_error）、两个调用交替 3 轮以上（alternate）、连续 3 个回合只有文字无工具调用（text_only），向收件箱投一次提醒（指纹含会话，同一指纹一次；text_only 锚定这一串之前的最后一次工具调用；同类取窗口内最后一串），记 stuck_pattern；不改状态、不标卡住、不通知。② API 错误分类：心跳 api_error（StopFailure）晚于 transcript 最后一条正常回复时按类型分可重试与不可重试，其他类型与没有这样的 api_error 时按 transcript；续跑次数与退避不变；每串发过续跑的错误记一次 api_retry_result（之后有正常回复 ok true，次数用完 ok false）。③ 卡住结果：remind 或 ask 之后静默起点后移而未到 stuck，记 stuck_recovered{stage, after_s}；遗留的开着的工具在任一未终态批次的持锁会话上静默满 stuck.remind_min、承载层存活且空闲时清掉（tool_open_cleared）。④ ci_pending_long 去重键含等待起点；retry_senders 按意图数作版本缓存（一轮内有新 sv_say/sv_deliver 意图才重算）。 |
+| I90 | 守卫包装器与 -c、越界 #22 链接与远端核对、用户声明（m2d.7，REQ-19；补 I58 / I66、I82、§9.2） | ① I58 / I66 守卫：包装器：Foremind 会话里，timeout、nice、xargs、uv run、env -S（含它们的选项与参数）包装下的 `foremind …` 与 `python* -m foremind …`，按剥掉包装后的命令套角色白名单与主检出前缀；选项按各自 getopt 严格解析，认不出时停在包装器名上，其余词里有 foremind 或 python（不分大小写）即拒绝。xargs 从标准输入读入的内容与替换串按未展开的 shell 写法处理。uv run 下的 foremind 与命令位置上改写 PATH 的 foremind 视为不走主检出。`python* -m foremind` 与 -c 的判断按这条命令实际生效的最后一个 PYTHONPATH（重定向先去掉；env -i、sudo、uv 的 env-file 记为未知）。 env -S 的串按 env 自己的规则拆（引号外 `\_` 是分隔符，`\c` 与词首 `#` 截断，`${VAR}` 视为未展开写法，env 会报错的串交给通用兜底）。 ② I58 / I66 守卫：-c 与大小写：`python* -c` 的代码文字含 `foremind` 而没有 `PYTHONPATH=<主检出>` 加 `-P` 时拒绝，理由给出前缀；-c 的代码来自 xargs 读入的内容时同样按可能含 foremind 判。大小写不敏感卷上（pathmatch.FOLD）git 子命令与 shell 名也折叠后比较（`git PUSH`、`timeout 5 BASH s.sh`）。 ③ I82 ① 越界阶段：#22 对每个改动路径按链接目标与链接自身路径各判一次。远端：本批提交 = `rev-list HEAD --not <目标分支与已批准上游 head>`，并上 `rev-list --first-parent HEAD --not <每个仓库第一次开席记下的起点 starts> <batch_updated 的 bases> <已批准上游 head>`（推送与 fetch 移动不了这些基点；只看第一父提交，并入的目标不算）；seat_opened（非继任）与 seat_user 新增 `starts` {仓库: 开工 head}；ls-remote 全部分支中 head 属本批提交或名为本批分支的记入 on_remote（分支名列表，原为布尔）；PR 用 `gh pr list --state all --limit 200 --json number,headRefOid,headRefName`，head 提交属本批或分支名相同即记。owns 判定改用 pathmatch.owns。变基中 HEAD 一侧的起点为 `merge-base HEAD <onto> <refs…>`。 ④ §9.2 / I82 ③ 用户声明：goal_frozen 新增 by（FOREMIND_ROLE，否则 FOREMIND_SESSION，否则 "user"）；batch_log_appended 新增 author；seat_open（intent）不在监督作业里（没有 FOREMIND_JOB）时带 by: "user"。三者经 CLAIMS 接受 seat_ancestor 核对。seat_ancestor 的会话路径正则左侧须是行首、空白或 `=`，大小写不敏感卷上不分大小写。 |
+| I91 | land 合入多仓库批次（m2d.8，REQ-20；补 §13.5） | §13.5：foremind land 支持多仓库批次：临时目录 _land-<批次>-*/<仓库id>/ 各合一次；accept_commands 按 acceptance 的运行目录（带 repo 在该仓库检出，不带在临时目录），land.commands 每个仓库检出各跑一遍；全部通过后先逐仓库核对（主检出干净、目标仍在起点、目标不在别的 worktree 检出），任一不满足一个都不动；逐个移动（在目标上 merge --ff-only，否则 update-ref 比较交换），某仓库失败时已移动的退回起点（update-ref <起点> <合并提交>，主检出在目标上的核对后 reset --keep），退回不了的列出要求手动处理。land.commands 不是非空字符串列表时报错；交付说明汇总批次日志已登记前缀内的全部段落，相同条目只列一次并注明段号 |
+| I92 | 审查 argv 与成本记录、美元上限、强度对照试验（m2d.4，REQ-13–14；补 §7.1、§7.4、§3.2） | ① DESIGN §7.1 argv 与成本：审查者 argv 加 --json-schema <REVIEW_SCHEMA>，配了 review.max_budget_usd 加 --max-budget-usd；oneshot.exclude_dynamic_prompt 为真时审查者与一次性角色加 --exclude-dynamic-system-prompt-sections。收割先取 structured_output，回退花括号扫描；cost_usd、input_tokens、cache_write_tokens、cache_read_tokens、output_tokens、num_turns（读不到为 null）写进 review_receipt、review_failed 事件与 meta.json（回执本身不含）。 ② DESIGN §7.4 美元上限：单次超限（subtype error_max_budget_usd；配了上限时另认错误文字含 budget）记 review_failed reason budget、infra=False，计入 review.max_failures。每批：changes_requested 且本批自最近 run_requested 以来 review_receipt+review_failed 的 cost_usd 合计 ≥ review.cost_cap_usd_<难度> 时批次 failed（reason review_cost_cap），并记 review_not_converging{reason: cost_cap, cost_usd, cap, actions}；approved 的一轮不因花费失败。计入范围按 Q-29 用户答复（选项 1）：计 review_receipt 与 review_failed，不计 ab_review。 ③ DESIGN §3.2 对照试验：foremind review <batch> --ab <effort>（Foremind 会话里拒绝）对最近一份 full 回执的 heads、以该轮模型和指定强度补跑一次，材料照当轮重建（此前回执、截到当轮开始的日志、当时记下的 bases；worktree 已删用主检出），同步等待；结果写 reviews/<会话>/ab.json，meta.json 记 ab: true；记 ab_review{batch, heads, effort, base_round, base_effort, verdict, must_fix, overlap=must_fix 指纹交集, cost_usd}；不写 review_started、不出回执，不计轮数、不进门禁。 新配置键 review.max_budget_usd、review.cost_cap_usd_s/_m/_l、oneshot.exclude_dynamic_prompt 缺省不设，不设即不生效（合入后由 controller 登记进 config.py）。 |
+| I93 | 缺省值表、status 原因代码与名额 / 推迟开席、audit 越界列表（m2d.9，REQ-21；补 §1.5、§13.5） | ① §1.5：缺省值表：新模块 foremind/defaults.py 的 table() 是配置键缺省值的唯一一张表（config.py 仍不存缺省值），catalog 的判例前提（键在任何层都未设置时按缺省值比较）与 plan validate 的有效预算从它取；各模块仍读自己的副本（改读此表在 m2e）。context.abs_cap_tokens 统一为运行时（hooks）的 180000：plan validate 原用 150000，规划半预算由 75000 变为 80000。按仓库的键未设置时：target_branch = 该仓库 [[repos]] 的 default_branch（没有则未知，判例前提不成立），update_method = merge，merge_method 与 merge_command = 无（没有两者时系统不能合入），keep_updated = never（代码不读它，只有 merge_dev 批次会自动更新） ② §13.5：foremind status：「你要做」按 Tick.waits 原因的代码映射命令（tick.Reason，文本不变），不认识的代码退回按文本匹配；多仓库批次「等你合入」也给 foremind land <批次>；名额按 Tick.free_seats 计，写明其中待开继任的个数；最近一次 seat_opened 之后有 seat_deferred 时写「整机负载高，推迟开席」与负载或内存读数。foremind audit 另列全部 bounds_violation 与 bounds_error |
+| I94 | 审查 must_fix 依据核对与撤回、跨轮对账与第 3 轮起限本轮改动、每轮新 must_fix 上限（m2d.5，REQ-15–16；补 §7.1、§7.4、I25） | ① I25：回执补充字段：issue 增可选 basis、req、was、filtered（was 与 filtered 成对，filtered ∈ no_basis | outside_coverage | withdrawn | outside_delta | over_cap）；回执增可选 resolved、unresolved（指纹列表）。均为程序写，模型填了也按程序规则覆盖。 ② §7.1：审查者每条 must_fix 带 basis：req（REQ-n + goal.md 该 REQ 原文一段 quote，[防对抗] REQ 另带 form listed|new）、authz（授权表类别 #k）、regression（broken：被破坏行为的位置）。程序核对：no_basis、outside_coverage、withdrawn 降 note；降级条目留在回执，记 was、filtered；verdict 由程序按剩下的 must_fix 定，审查者 verdict 与自身 severities 矛盾仍为无效输出。材料加 reqs.md、withdrawn.md。总控或用户用 `foremind review <批次> --withdraw <指纹> --reason` 撤回（review_withdrawn，Foremind 会话里拒绝），从撤回之后启动的那轮审查起生效。 ③ §7.4：第 3 轮起（自最近 approved 以来的 full 与 incremental，本轮计入；delta 与重绑不计，counted() 与 diagnose 共用），上一份回执 heads 是本轮祖先时，status new 的 must_fix 所指文件（location 去仓库前缀后以改动文件路径开头、其后为串尾或 `:`）不在两组 heads 间改动文件（`git diff --no-renames --name-only -z`）里的降 should_fix（outside_delta）；取改动文件出错时不写回执、重收割。review.new_must_fix_max 配了则每轮新 must_fix 超出部分降 should_fix（over_cap）。回执记 resolved、unresolved 对账上一份回执的 must_fix 与 should_fix。降级不改 status，诊断计数不变。 新配置键 review.new_must_fix_max 缺省不设即不限（合入后由 controller 登记进 config.py）。 |
+| I95 | 运行报告「按实测复算的建议值」（m2d.10，REQ-22；补 §6.3、§11.3） | 运行报告末尾另有「按实测复算的建议值」一节（foremind/signals.py，纯函数；报告从 handoff.history 读全部事件，含 archive/ 按月归档，不受 since 限制）：每项写当前值、样本数、统计、建议值与规则，样本不足写「样本不足（n/门槛）」，字段缺失或为 null 的样本不计；只建议，不改配置、不生成待决、不挡批次，推送摘要不含建议。规则初值：价格比 输入 1、缓存写 1.25、缓存读 0.1、输出 5（只比 token 当量）。总控软线 = 成本拐点 c* = c0 + 10·H/K 取整到 1 万（c0：controller_takeover.context_tokens 中位数；H：其六项齐全样本按价格比折算的中位数；K：controller_handoff.calls 中位数 ÷ 2；门槛 10 次交接）。总控硬线：带读数的 controller_slip 满 5 条时建议 min(当前硬线, 失误上下文第 20 百分位向下取整到 1 万并限 15 万–40 万)，从不高于当前硬线，否则维持。总控软线限 15 万–40 万；两线都写与当前值的差，软线建议不低于当前硬线时注明需一并调硬线。席位当前线取最近一次席位（role 为 seat）handoff_requested 记下的 soft/hard（没有则代码缺省），请求计数、中位数与 dirty 占比也只数席位的；席位软线同一算法（handoff_accept 为接手、handoff_written 为交接，门槛 10），另报 handoff_requested 与 handoff_written 的 dirty 占比；席位交接点维持（无失误记录），报到交接点的请求次数、请求时上下文中位数、写交接中因请求而写的次数。审查强度固定出 S/M/L × 安全/非安全六组，按 review_started 的 (difficulty, security, effort) 统计批数、到 approved 的平均轮数、每批 cost_usd，并报基准为当前档的 ab_review 各臂召回 overlap / base_must_fix；非安全组取每臂满 10 次、召回 ≥ 0.9、平均轮数不升的最低一档（写「可考虑放宽」），安全组维持。单次美元上限 = 审查 cost_usd 的 p95 × 1.5（门槛 20 次）；每批美元上限按难度 = 已 approved 批次（到 approved 为止）审查花费的 p90 × 1.2（每档门槛 10 批）。轮次上限：自最近一次 approved 起计入上限的第 3 轮及以后（与 diagnose 同口径）提出的 must_fix，下一份回执 resolved 且未被撤回为被接受；比例 < 30%（门槛 20 条）时建议 review.max_rounds 减 1，最低 2；重绑回执与没有 resolved 的旧回执不计。卡住提醒间隔：remind 后即恢复（stuck_recovered 的 stage 为 remind）占比 ≥ 80% 写「可考虑放宽到 1.5 倍」，≤ 20% 建议 0.75 倍，限代码缺省的 0.5–2 倍，限值不改方向（已越过时维持），门槛 10 次。API 续跑：api_retry_result 成功记录里累计占比 ≥ 95% 的最小次数，门槛 10 串。规则由用户以后调整 |
+| I96 | 缺省值表成为唯一来源（m2e.2，REQ-3；补 §1.5、I93 ①） | §1.5：foremind/defaults.py 的 TABLE 是字面 dict，defaults.py 不 import foremind 其他模块；table() 返回副本。内容为 m2d.9 的 61 个键不变，另加 stuck.pattern_repeat: 3，以及记 None（不设）的 review.max_budget_usd、review.cost_cap_usd_s/_m/_l、review.cost_cap_tokens_s/_m/_l、review.new_must_fix_max、quota.probe_command 与记 False 的 oneshot.exclude_dynamic_prompt，共 72 键。各模块读未设置的键改读 TABLE，删掉副本（tick、seat、plan/coupling 的 DEFAULTS，quota LINES 的缺省数值，land 的 DEFAULT_COMMANDS，audit 的 DAILY_CAP，hooks 的上下文线常量，调用处的字面缺省）；review.py、report.py 的字面缺省随 REQ-2 由 m2e.4 改，tests/test_defaults.py 暂以 EXEMPT 豁免。不进表：routes.*、context.by_role.*、1M 窗口席位的 BIG_* 缺省。表里 None 表示不设；catalog.holds 对各层未设、表里为 None 的键按 None 比较。config.py 不 import defaults.py、config.load 不填缺省；tests/test_defaults.py 单向核对 TABLE 每个键在 config.KEY_CLASSES 有登记，并对源码做 ast 扫描拦新的字面缺省（按 foremind/ 相对路径豁免）。取值全部不变 |
+| I97 | 安装与状态栏的清理与容错（m2e.8，REQ-12；补 §1.1、§13.2） | ① §13.2 备份按同一文件名与路径 hash 前缀只留最新 10 份（tomlblock.BACKUPS_KEPT，按定宽时间戳排序），格式不符或其他文件的备份不动，清理失败只提示一行、不挡写入；卸载移除 .git/info/exclude 的块后只剩空白则删文件。 ② §1.1 statusLine：串联的用户命令用 process_group=0 放进独立进程组（不 setsid，仍用原终端），10 秒超时按组结束（os.killpg），不等孙进程，输出为空、退出码 0；输入字段类型不对时不记读数、状态栏照常；非 Foremind 会话写读数时删 telemetry/ 下其他 session 为 null、agent_session_id 与文件名相符、修改时间早于 7 天（telemetry.STALE_DAYS，删前复查 mtime）的 *.statusline.json |
+| I98 | 审查强度对照的召回按位置配对、审查位置里的引号路径（m2e.1，REQ-1、REQ-7；补 §3.2、§11.3、I92 ③、I94 ③） | ① §3.2 / I92 ③：强度对照（--ab）另记 matched：两边各取审查者给出的 must_fix（被程序降级的按 was 计），按位置一对一配对的对数。位置由 review.locate 解析为（仓库、路径、行）：仓库前缀须是 heads 里的仓库 id，否则整段当路径（x:a.py:1 的路径是 x:a.py）；路径为 git C 风格引号写法（以 `"` 开头，含 `\"`、`\\`、`\t`、`\n` 或三位八进制字节，八进制按 UTF-8 解码）时先还原，还原不了按原文；不带引号时路径取到第一个 `:<数字>` 之前（没有就取到第一个 `:` 为止），行取紧跟的数字（:12-20、:12 (fn)、:12, 40 都取 12），后面不是数就没有行。可配对 = 路径相同、两边仓库都有时相同、两边都有行时行距 ≤ 30（review.PAIR_LINES），任一边没有行时只比路径；按行距从小到大取，没有行的排最后，同距先按基准次序再按对照次序。ab_review 事件、ab.json 与命令输出另记 matched；overlap（指纹交集）照旧记。 ② I94 ③：第 3 轮起判断新 must_fix 是否落在本轮改动文件内（outside_delta）也用同一解析，不带引号的位置结果不变。 ③ §11.3：审查强度的召回 = matched ÷ 基准 must_fix（基准 must_fix 为 0 的那次不计），逐次比值取平均：报告按 ab_review 的 reviewer_session 读 reviews/<会话>/ab.json，连同基准回执 batches/<批次>.review.r<base_round>.json 重算 matched，分母为基准回执里 was 或 severity 为 must_fix 的条数；两份有一份读不到时取事件的 matched 与 base_must_fix，事件也没有 matched 就不计，该项写「对照（基准 当前档）无法复算 n 次」；规则文字写「召回（按位置配对的 must_fix ÷ 基准 must_fix，基准为当前档）」，AB_MIN、RECALL_MIN 与其余规则不变。报告不启动模型 |
+| I99 | status 的待决与未绑定计划提示、总控取法跳过已交接、一次性总控上交附理由（m2e.5，REQ-4–6；补 §13.5、§8.3） | ① §13.5 status「你要做」：挡在待决上的批次每个 Q-n 写 foremind decide show Q-n（没有具体 Q-n 时写 foremind decide）；计划有 approved_at 但未绑定时原因「计划批准后被改动，调度已停」（机读代码 plan_unbound），你要做「改回批准时的样子，或 foremind plan amend <计划>」；从未批准的计划原因「计划待批准」，你要做 foremind plan approve <计划>。 ② §13.5 controller handoff/check/slip 取总控：FOREMIND_CONTROLLER 非空时按它取；为空时跳过已记 controller_handoff（from_session 为该总控）的总控，在其余的里取最近更新的；全都交接过即当作没有总控（handoff 报找不到总控会话，check、slip 的会话字段记 null，check 不关前任）。check 核对有不符而前任此前已确认关闭时，输出「前任已关闭（此前的 check）」。 ③ §8.3 一次性总控的输出合 controller_decision、item 与 decision 都对而仍上交用户时（带 plan_amend、scope_change 不合要求、与推荐不同），上交原因末尾附「；总控的理由：<reasons 以「；」连接>」；输出不合 schema、item 不符或 decision 不是选项时照旧上交，不附理由 |
+| I100 | 重绑回执不带对账字段、land 认主检出（m2e.7，REQ-11；补 §7.6、§13.5） | ① §7.6 `foremind update` 重绑回执写带 rebound_from 的副本时去掉 resolved、unresolved（它们对账的是原回执的上一份），其余字段与事件不变。 ② §13.5 land 判断当前目录是否主检出用 os.path.samefile（大小写不敏感卷、符号链接都认同一目录），读不出时退回解析后路径比较 |
+| I101 | 审查每批 token 上限、审查前后额度读数、报告 token 上限建议值（m2e.4，REQ-2；补 §7.4、§10.5、§11.3） | ① §7.4 每批上限可按美元或输入等价 token（review.cost_cap_tokens_s/_m/_l，缺省不设），任一先到即生效，同轮都到按美元记；事件带 unit，tokens 时另带 tokens、cap、cost_usd、uncounted；折算价格比只在 review.PRICE 一处。 ② §10.5 review_started 记 quota_start，review_receipt/review_failed 记 quota_end（ab 同），旧读数或过重置的 pct 记 null、ts 保留读数时间；只记录不判断。 ③ §11.3 建议值加「审查每批 token 上限（S/M/L）」：P90 × 1.2，门槛同每批美元上限。token 口径与是否设上限待用户定 |
+| I102 | 继任查整机负载、卡住通知如实、行为模式不被先判到的挡住（m2e.6，REQ-8、REQ-9；补 §10.3、§10.4） | ① 发给席位的回执清单里被程序降级的条目写成「- [<severity>，原为 <was>，<filtered>] <location>：<summary>」，监督进程投递与开席共用一个函数。 ② §10.4 break_lock 失败而已有退出证据时继任前查整机负载（seat_deferred，名额不另计）。 ③ §10.3 卡住接管已确认退出而继任因名额或负载没开时通知写「旧会话已确认退出；继任在等名额（used/cap）/ 整机负载降下来」；行为模式按 repeat_error → alternate → text_only，已提醒过的指纹跳过接着判下一种 |
+| I103 | 嵌套命令自由文字里的 env、sudo、exec 不再误拒（m2e.9，REQ-13；改 I85 ③、补 §2.3） | ① 改写 FOREMIND_SESSION 的包装词（env、sudo、exec）只看命令词之前的词：顶层命令看它自己的；bash -c、eval、shell 读的 heredoc 里的命令看它自己的和外层每一层的（heredoc 正文的读者分不出，本层在它之前的每条命令，含正文更早的行，都算外层）；命令词之后的自由文字不算。 ② 命令词定位（guard._pre）：第一个名字等于规范化后命令名、且其后各词去掉重定向后与规范化后其余各词逐词相同的词（可差 xargs 末尾补的一个输入占位；含 xargs 替换串占位的词可配任意一词），同名的重定向目标或选项值不算；找不到时该命令的全部词都算命令词之前，嵌套命令此时照旧看外层整条原文。 ③ 限度：「至多多截一个与命令词同名的词、不会漏判」只在命令词是该命令自己的一个独立词时成立；命令词由 env -S 藏在字符串里、又有同名重定向目标时，通配可能配上假的同名词而漏判（构造写法，属 [防对抗]，见遗留）。顶层 `>/tmp/foremind sudo foremind …` 这类由放行改为拒绝（堵真实漏判） |
+| I104 | 开发精度与效率度量、report --plan、foremind defect、退回 by、外来提示（m2e.10，REQ-14；补 §10.8、§11.1、§11.3、§11.5） | ① §11.3 运行报告「开发精度与效率」一节与 `foremind report --plan <计划>`（只打印；计划不存在或加载失败退出码 1），实现 foremind/metrics.py（collect 唯一读文件、compute 纯函数）。 ② §11.5 每批精度 / 效率两行与计划累计的指标与口径（输入等价 token、unknown 与「未计 n 次」不当 0、里程碑倒序的段写「—」、单列状态中位数取不为 0 的批次、写手美元 unknown）。 ③ §11.1 `foremind defect` 记 defect_found{batch, source, note, by}，merged / cataloged 才收，会话内拒绝；defect 与 `review --request-changes` 在 FOREMIND_ROLE=controller 或 FOREMIND_CONTROLLER 非空时 by 记 controller。 ④ §10.8 席位收到与程序投递对不上的提示记 seat_prompt_external（只计数）。决定记录里对 REQ 未写死处的四项口径（回执份数对不上写 unknown、答复耗时只取跨度内创建的待决、非 user 的 by 记总控、交给代理按 pending_routed 的 to 属 DELEGATES）由 controller 裁定为 #1 |
 | I19 | 仓库交付约定的配置位置 | `[delivery.repo.<仓库id>]`，避免仓库 id 与 `delivery.level`、`delivery.depends_on` 等键冲突；全文 `[delivery.repo.<仓库>]` 同义改写 |
 | I20 | ceiling 的放宽 | 下层写了比上层宽的 ceiling 时报错，不静默取严 |

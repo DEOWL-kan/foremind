@@ -78,12 +78,22 @@ NEGATIVES = {
         (_set(["reviewer_session"], KeyError), "reviewer_session: required"),
         (_set(["round"], 0), "round: value 0 < 1"),
         (_set(["rebound_from"], {"api": SHORT}), "rebound_from.api"),
+        (_set(["delta_from"], {"api": "a" * 40}), "delta_from: present exactly when scope is 'incremental'"),
+        (_set(["scope"], "incremental"), "delta_from: present exactly when scope is 'incremental'"),
         (_set(["extra"], 1), "extra: unknown field"),
+        (_set(["issues", 0, "filtered"], "no_basis"), "issues[0]: was and filtered go together"),  # REQ-15
+        (_set(["issues", 0, "was"], "must_fix"), "issues[0]: was and filtered go together"),
+        (_set(["issues", 0, "basis"], "taste"), "issues[0].basis"),
+        (_set(["issues", 0, "req"], "REQ-0"), "issues[0].req"),
+        (_set(["resolved"], ["A1B2C3D4E5F6"]), "resolved[0]"),  # REQ-16
+        (_set(["unresolved"], ["a1b2c3d4e5f60718"] * 2), "unresolved: duplicate items"),
     ],
     "acceptance_result": [
         (_set(["heads", "app"], SHORT), "heads.app"),
         (_set(["commands"], []), "commands: length 0 < 1"),
         (_set(["commands", 0, "exit_code"], "0"), "commands[0].exit_code"),
+        (_set(["commands", 0, "repo"], "api:src"), "commands[0].repo"),
+        (_set(["commands", 1, "repo"], ""), "commands[1].repo"),
     ],
     "gate_result": [
         (_set(["heads", "api"], SHORT), "heads.api"),
@@ -181,6 +191,12 @@ NEGATIVES = {
         (_set(["evidence"], []), "evidence: length 0 < 1"),
         (_set(["source"], ""), "source: length 0 < 1"),
     ],
+    "delivery_notes": [
+        (_set(["leftovers"], KeyError), "leftovers: required"),
+        (_set(["config_keys", 0, "merge_class"], "global"), "config_keys[0].merge_class"),
+        (_set(["config_keys", 0, "why"], ""), "config_keys[0].why"),
+        (_set(["design"], [{"where": "§13.5"}]), "design[0].text: required"),
+    ],
 }
 
 
@@ -188,7 +204,8 @@ class SchemaTest(unittest.TestCase):
     def test_kinds_complete(self):
         required = {"plan", "batch_header", "handoff_section", "review_receipt", "acceptance_result",
                     "gate_result", "pending", "decision_output", "exemption", "provisional", "precedent",
-                    "audit_report", "catalog_patch", "catalog_output", "controller_decision", "improvement_entry"}
+                    "audit_report", "catalog_patch", "catalog_output", "controller_decision", "improvement_entry",
+                    "delivery_notes"}
         self.assertEqual(set(KINDS), required)
         self.assertEqual(set(EXAMPLES), required)
 
@@ -240,6 +257,13 @@ class SchemaTest(unittest.TestCase):
         receipt["issues"] = []
         receipt["verdict"] = "approved"
         self.assertEqual(validate("review_receipt", receipt), [])
+        receipt.update(scope="incremental", delta_from={"api": "c" * 40})  # REQ-6
+        self.assertEqual(validate("review_receipt", receipt), [])
+        # REQ-15/16: a lowered must_fix keeps was and filtered; the reconciliation with the previous receipt
+        receipt.update(resolved=["a1b2c3d4e5f60718"], unresolved=[], issues=[{
+            **EXAMPLES["review_receipt"]["issues"][0], "severity": "note", "was": "must_fix", "filtered": "no_basis",
+            "basis": "req", "req": "REQ-1"}])
+        self.assertEqual(validate("review_receipt", receipt), [])
         pending = copy.deepcopy(EXAMPLES["pending"])
         pending.update(state="awaiting_local_confirm", answer=1)
         self.assertEqual(validate("pending", pending), [])
@@ -289,11 +313,36 @@ class SchemaTest(unittest.TestCase):
         self.assertEqual(validate("decision_output", obj), [])
 
     def test_batch_header_fields_are_all_required(self):
+        opt = ("contract", "coupling", "config_approved")
         for field in SPECS["batch_header"]["fields"]:
+            if field in opt:
+                continue
             obj = copy.deepcopy(EXAMPLES["batch_header"])
             del obj[field]
             with self.subTest(field=field):
                 self.assertIn(f"{field}: required", validate("batch_header", obj))
+        self.assertEqual([f for f, s in SPECS["batch_header"]["fields"].items() if s.get("opt")], list(opt))
+
+    def test_batch_header_optional_fields(self):
+        ok = {"contract": "false", "config_approved": "a" * 64,
+              "coupling": [{"batch": "auth.1", "score": 0.5, "reason": "同改 token 格式"},
+                           {"batch": "auth.3", "score": 1, "reason": "r"}]}
+        self.assertEqual(validate("batch_header", {**EXAMPLES["batch_header"], **ok}), [])
+        for field, bad, msg in [
+            ("contract", "yes", "not one of"),
+            ("contract", True, "expected string"),
+            ("config_approved", "x" * 64, "does not match"),
+            ("coupling", "高", "expected array"),
+            ("coupling", [{"batch": "auth.1", "score": 1.5, "reason": "r"}], "value 1.5 > 1"),
+            ("coupling", [{"batch": "auth.1", "score": -1, "reason": "r"}], "value -1 < 0"),
+            ("coupling", [{"batch": "auth.1", "score": True, "reason": "r"}], "expected integer or number"),
+            ("coupling", [{"batch": "auth.1", "score": "0.5", "reason": "r"}], "expected integer or number"),
+            ("coupling", [{"batch": "auth", "score": 1, "reason": "r"}], "does not match"),
+            ("coupling", [{"batch": "auth.1", "score": 1}], "reason: required"),
+        ]:
+            with self.subTest(field=field, bad=bad):
+                errs = validate("batch_header", {**EXAMPLES["batch_header"], field: bad})
+                self.assertTrue(errs and msg in errs[0], errs)
 
 
 if __name__ == "__main__":

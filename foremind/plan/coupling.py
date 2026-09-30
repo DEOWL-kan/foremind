@@ -1,23 +1,27 @@
 """Coupling between the batches of a plan (DESIGN §4.2 5d).
 
-Signals per pair, each 0..1:
-  ref        Python `ast` import edges: share of the two batches' existing .py files that import the other batch
-  cochange   `git log --name-only`: commits touching both batches' owns_paths / commits touching either (Jaccard)
-  semantic   the planner's declaration in the batch header `coupling` (the larger of the two directions)
+Signals per pair, each 0..1, or None when there is nothing to analyse (unknown is not "no coupling"). ref and
+cochange only count a shared repo where both batches have existing (tracked) files: with one side still to be
+written, there is nothing to measure against.
+  ref        Python `ast` import edges: share of the two batches' existing .py files that import the other batch;
+             None when no such repo has a .py file of either
+  cochange   `git log --name-only`: commits touching both batches' owns_paths / commits touching either (Jaccard);
+             None when no commit in such a repo's history touches either
+  semantic   the planner's declaration in the batch header `coupling` (the larger of the two directions; 0 if none)
   contract   both change the same contract file (hard rule: that change belongs in the contract batch) -> tier high
-C = w_ref·ref + w_cochange·cochange + w_semantic·semantic; tier high if C >= high, medium if C >= medium, else low.
-Weights, thresholds and the history depth come from config `plan.coupling.*` (defaults below, DESIGN §4.2 5d).
+C = the weighted mean of the known signals (weights w_ref, w_cochange, w_semantic renormalised over them), so with
+only the declaration known C is the declared score; tier high if C >= high, medium if C >= medium, else low.
+Weights, thresholds and the history depth come from config `plan.coupling.*` (defaults: defaults.TABLE, §4.2 5d).
 Imports and history only exist inside one repo; across repos only contract and semantic count (§1.8).
 """
 import ast
 import subprocess
-from fnmatch import fnmatchcase
 from pathlib import PurePosixPath
 
+from foremind import pathmatch
+from foremind.defaults import TABLE
 from foremind.plan.model import is_contract
 from foremind.plan.validate import owns_overlap
-
-DEFAULTS = {"w_ref": 0.4, "w_cochange": 0.3, "w_semantic": 0.3, "high": 0.6, "medium": 0.3, "history": 500}
 
 
 def _git(repo, *args) -> str:
@@ -25,10 +29,6 @@ def _git(repo, *args) -> str:
         return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=True).stdout
     except (OSError, subprocess.CalledProcessError):
         return ""  # not a git repo: no history and no tracked files to read
-
-
-def _match(f, patterns):
-    return any(fnmatchcase(f, p + "*" if p.endswith("/") else p) for p in patterns)
 
 
 def _imports(repo, f) -> set[str]:
@@ -74,10 +74,15 @@ def _declared(h, other) -> float:
                 and isinstance(c.get("score"), (int, float)) and not isinstance(c.get("score"), bool)), default=0)
 
 
+def _r(x):
+    return None if x is None else round(x, 3)
+
+
 def analyze(plan, repos: dict, config: dict | None = None) -> list[dict]:
     """`repos`: {repo id: working tree Path}. Returns [{a, b, ref, cochange, semantic, contract, score, tier}] for
     each pair of the plan's active batches, a before b in plan order."""
-    k = {x: (config or {}).get(f"plan.coupling.{x}", v) for x, v in DEFAULTS.items()}
+    k = {x[len("plan.coupling."):]: (config or {}).get(x, v) for x, v in TABLE.items()
+         if x.startswith("plan.coupling.")}
     heads = {b: d.header for b, d in plan.active().items()}
     pats = {b: {} for b in heads}
     for b, h in heads.items():
@@ -93,22 +98,26 @@ def analyze(plan, repos: dict, config: dict | None = None) -> list[dict]:
         for b in ids[i + 1:]:
             nr = dr = nc = dc = 0
             for r in pats[a].keys() & pats[b].keys() & used:
-                fa = [f for f in files[r] if _match(f, pats[a][r])]
-                fb = [f for f in files[r] if _match(f, pats[b][r])]
+                fa = [f for f in files[r] if pathmatch.owns(f, pats[a][r])]
+                fb = [f for f in files[r] if pathmatch.owns(f, pats[b][r])]
+                if not fa or not fb:  # one side has nothing yet: unknown here, not a known 0
+                    continue
                 pa, pb = [f for f in fa if f.endswith(".py")], [f for f in fb if f.endswith(".py")]
                 c = cache.setdefault(r, {})
                 nr += _importers(repos[r], pa, fb, c) + _importers(repos[r], pb, fa, c)
                 dr += len(pa) + len(pb)
                 for files_changed in history[r]:
-                    ta = any(_match(f, pats[a][r]) for f in files_changed)
-                    tb = any(_match(f, pats[b][r]) for f in files_changed)
+                    ta = any(pathmatch.owns(f, pats[a][r]) for f in files_changed)
+                    tb = any(pathmatch.owns(f, pats[b][r]) for f in files_changed)
                     nc, dc = nc + (ta and tb), dc + (ta or tb)
-            ref, co = (nr / dr if dr else 0.0), (nc / dc if dc else 0.0)
+            ref, co = (nr / dr if dr else None), (nc / dc if dc else None)
             sem = max(_declared(heads[a], b), _declared(heads[b], a))
             contract = any(owns_overlap(heads[a]["owns_paths"], [cf]) and owns_overlap(heads[b]["owns_paths"], [cf])
                            for cf in contract_files)
-            score = round(k["w_ref"] * ref + k["w_cochange"] * co + k["w_semantic"] * sem, 6)
+            known = [(k[w], x) for w, x in (("w_ref", ref), ("w_cochange", co), ("w_semantic", sem)) if x is not None]
+            total = sum(w for w, _ in known)
+            score = round(sum(w * x for w, x in known) / total, 6) if total else 0.0
             tier = "high" if contract or score >= k["high"] else "medium" if score >= k["medium"] else "low"
-            out.append({"a": a, "b": b, "ref": round(ref, 3), "cochange": round(co, 3), "semantic": sem,
+            out.append({"a": a, "b": b, "ref": _r(ref), "cochange": _r(co), "semantic": sem,
                         "contract": contract, "score": score, "tier": tier})
     return out

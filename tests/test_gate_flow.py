@@ -5,6 +5,7 @@ import json
 import shutil
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from foremind import acceptance, gate, review, schemas
 from foremind.cli import main
@@ -16,8 +17,8 @@ from test_gate_fixture import TIERS, Project, sh
 MERGE = 'git -C "$FOREMIND_REPO_PATH" merge -q --no-ff -m merge "$FOREMIND_HEAD"'
 
 
-def ci_run(i, conclusion, status="completed"):
-    return {"id": i, "name": "test", "status": status, "conclusion": conclusion}
+def ci_run(i, conclusion, status="completed", name="test"):
+    return {"id": i, "name": name, "status": status, "conclusion": conclusion}
 
 
 class Base(unittest.TestCase):
@@ -98,6 +99,32 @@ class HappyPathTest(Base):
         path.write_text(json.dumps(json.loads(path.read_text())))  # same result, other bytes: no run event matches
         res = self.gate(p)
         self.assertEqual((res["verdict"], len(p.events("accept_run"))), ("pass", 2))
+
+    def test_result_without_repo_is_rerun(self):
+        p = self.project()
+        p.run_review()
+        self.gate(p)
+        path = acceptance.result_path(p.root, "shop.1", "accept", {"api": p.head()})
+        old = json.loads(path.read_text())
+        del old["commands"][0]["repo"]
+        data = json.dumps(old)
+        path.write_text(data)  # as an older version wrote it, with its run record
+        review.events(p.root).append("accept_run", batch="shop.1", heads=old["heads"], path=path.name,
+                                     sha256=sha256_bytes(data.encode()), ok=True)
+        res = self.gate(p)
+        self.assertEqual((res["verdict"], len(p.events("accept_run"))), ("pass", 3))
+        self.assertEqual(json.loads(path.read_text())["commands"][0]["repo"], "api")
+
+    def test_same_command_in_another_repo_is_not_the_same_result(self):
+        in_api = 'test "$(basename "$(pwd -P)")" = api'
+        p = self.project(("api", "app"), cfg={"gate.checks": [{"run": in_api, "repo": "api"}]})
+        p.run_review()
+        self.assertEqual(self.gate(p)["state"], "delivered")
+        p.cfg["gate.checks"] = [{"run": in_api, "repo": "app"}]  # same text, run elsewhere
+        res = self.gate(p)
+        self.assertEqual(self.failing(res), ["checks"])
+        self.assertIn("failed", self.check(res, "checks")["detail"])
+        self.assertEqual(len(p.events("checks_run")), 2)
 
 
 class PitfallTest(Base):
@@ -234,13 +261,16 @@ class ScopeTest(Base):
         sd = state_dir(p.root)
         (sd / "exemptions").mkdir()
         (sd / "decisions").mkdir()
-        (sd / "exemptions" / "Q-1.json").write_text(json.dumps(
-            {**EXAMPLES["exemption"], "batch": "shop.1", "match": {"paths": ["api:pyproject.toml"]}}))
+        ex = {**EXAMPLES["exemption"], "batch": "shop.1", "match": {"paths": ["api:pyproject.toml"]},
+              "expires_at": "2999-01-01T00:00:00+00:00"}
+        (sd / "exemptions" / "Q-1.json").write_text(json.dumps(ex))
         decision = {**EXAMPLES["pending"], "id": "Q-1", "state": "answered", "answer": 1, "blocks": ["shop.1"]}
         (sd / "decisions" / "Q-1.json").write_text(json.dumps({**decision, "category": 3}))
         self.assertEqual(self.failing(self.gate(p)), ["dependencies"])  # declared dev (#3), changed runtime
         (sd / "decisions" / "Q-1.json").write_text(json.dumps({**decision, "category": 4}))
         self.assertEqual(self.gate(p)["verdict"], "pass")
+        (sd / "exemptions" / "Q-1.json").write_text(json.dumps({**ex, "expires_at": "2026-01-08T00:00:00+00:00"}))
+        self.assertEqual(self.failing(self.gate(p)), ["dependencies"])  # expired: approves nothing any more
 
 
 class CiTest(Base):
@@ -268,6 +298,40 @@ class CiTest(Base):
         self.assertIn(f"repos/{{owner}}/{{repo}}/statuses/{head}", post)
         self.assertIn("context=foremind/gate", post)
         self.assertIn("state=success", post)
+
+    def test_every_page_and_the_required_checks(self):
+        p = self.project(origin=True, cfg={"delivery.repo.api.push_pr": "system", "gate.ci": "required"})
+        p.run_review()
+        head = p.head()
+        runs = [ci_run(i, "failure" if i == 140 else "success", name=f"c{i}") for i in range(1, 151)]
+        p.gh_state(check_runs={head: runs})
+        res = self.gate(p)
+        self.assertIn("check c140", self.check(res, "ci:api")["detail"])  # on the second page
+        self.assertIn(["api", f"repos/{{owner}}/{{repo}}/commits/{head}/check-runs?per_page=100&page=2"], p.gh_log())
+        runs[139]["conclusion"] = "success"
+        prop = state_dir(p.root) / "delivery.proposal.json"
+        facts = lambda v: json.dumps({"repos": {"api": {"facts": {"required_checks": {"value": v}}}}})  # noqa: E731
+        prop.write_text(facts(["c1", "build", "foremind/gate"]))  # foremind/gate: ours, written after the checks
+        p.gh_state(check_runs={head: runs})
+        res = self.gate(p)
+        self.assertIn("not reported yet: ['build']", self.check(res, "ci:api")["detail"])
+        self.assertEqual((res["verdict"], p.state()), ("fail", "in_review"))
+        self.assertIn("state=pending", self.posted(p)[-1])
+        prop.write_text(facts("unknown"))  # unknown: the checks that reported are all there is to go by
+        self.assertIsNone(gate.required_checks(p.root, "api"))
+        self.assertIsNone(gate.required_checks(p.root, "app"))
+        prop.write_text(facts(["c1", "build"]))
+        p.gh_state(statuses={head: [{"id": 1, "context": "build", "state": "success"}]})
+        self.assertEqual(self.gate(p)["state"], "delivered")
+
+    def test_user_push_needs_local_checks(self):
+        p = self.project(cfg={"gate.ci": "required", "gate.checks": []})  # #23 the user's (N13)
+        p.run_review()
+        res = self.gate(p)
+        self.assertEqual((self.failing(res), p.state()), (["ci:api"], "in_review"))
+        self.assertIn("[gate].checks is empty", self.check(res, "ci:api")["detail"])
+        p.cfg["gate.checks"] = ["true"]
+        self.assertEqual(self.gate(p)["state"], "delivered")
 
     def test_local_first_marks_ready_once_then_waits_for_ci(self):
         p = self.project(origin=True, cfg={"delivery.repo.api.push_pr": "system", "gate.ci": "local_first"})
@@ -302,6 +366,31 @@ class CiTest(Base):
         res = self.gate(p)
         self.assertEqual((res["verdict"], self.failing(res)), ("fail", ["receipt"]))
         self.assertIn("receipt void", self.check(res, "receipt")["detail"])
+
+
+class CiLimitTest(Base):
+    def required(self):
+        p = self.project(origin=True, cfg={"delivery.repo.api.push_pr": "system", "gate.ci": "required"})
+        p.run_review()
+        return p
+
+    def test_paging_stops_and_the_lock_goes(self):
+        p = self.required()
+        p.gh_state(check_runs={p.head(): [ci_run(i, "success", name=f"c{i}") for i in range(1, 251)]})
+        with mock.patch.object(gate, "MAX_PAGES", 2), self.assertRaisesRegex(review.FlowError, "more than 2 pages"):
+            self.gate(p)
+        with gate.batch_lock(p.root, "shop.1"):  # released: not LockBusy
+            pass
+        self.assertEqual(self.gate(p)["state"], "delivered")  # three pages are within the real cap
+
+    def test_pending_ci_is_named_in_the_gate_result(self):  # the update phase times it (ci_pending_long)
+        p = self.required()
+        p.gh_state(check_runs={p.head(): [ci_run(1, None, status="in_progress")]})
+        res = self.gate(p)
+        g = p.events("gate_result")[-1]
+        self.assertEqual((g["failing"], g["pending"]), (["ci:api"], ["ci:api"]))
+        self.assertEqual((res["verdict"], p.state(), p.events("ci_pending_long")), ("fail", "in_review", []))
+        self.assertIn("state=pending", self.posted(p)[-1])
 
 
 class MergeTest(Base):
@@ -341,6 +430,79 @@ class MergeTest(Base):
         p.run_review()
         self.assertEqual(self.gate(p)["state"], "merged")
         self.assertIn(["pr", "merge", "fm/shop.1", "--squash", "--match-head-commit", p.head()], p.gh_log())
+
+    def gh_group(self, *repos):
+        cfg = {"delivery.level": "merge_dev"}
+        for r in repos:
+            cfg.update({f"delivery.repo.{r}.push_pr": "system", f"delivery.repo.{r}.merge_method": "squash"})
+        p = self.project(repos, origin=True, cfg=cfg)
+        p.run_review()
+        return p
+
+    def test_none_merges_while_the_host_finds_one_unmergeable(self):  # N3
+        p = self.gh_group("api", "app")
+        p.pr_state("app", mergeStateStatus="BLOCKED")
+        self.enterContext(mock.patch.object(gate, "SETTLE_S", 0))
+        res = self.gate(p)
+        self.assertEqual((res["verdict"], self.failing(res), res["state"], p.state()),
+                         ("fail", ["mergeable"], "delivered", "delivered"))
+        self.assertIn("app BLOCKED", self.check(res, "mergeable")["detail"])
+        self.assertNotIn("api", self.check(res, "mergeable")["detail"])
+        self.assertEqual([a for a in p.gh_log() if a[:2] == ["pr", "merge"]], [])
+        self.assertIn("state=success", self.posted(p)[-1])  # written before the precheck, left alone by it
+        stored = json.loads(Path(res["path"]).read_text())
+        self.assertEqual((stored["verdict"], p.events("gate_result")[-1]["failing"]), ("fail", ["mergeable"]))
+        for status in ("DIRTY", "BEHIND", "DRAFT", "UNKNOWN", "SOMETHING_NEW"):
+            p.pr_state("app", mergeStateStatus=status)
+            self.assertEqual(self.failing(self.gate(p)), ["mergeable"], status)
+        p.pr_state("app", mergeStateStatus="UNSTABLE")  # mergeable; only checks outside the required set are red
+        res = self.gate(p)
+        self.assertEqual((res["verdict"], res["state"]), ("pass", "merged"))
+        self.assertEqual(len([a for a in p.gh_log() if a[:2] == ["pr", "merge"]]), 2)
+
+    def test_a_status_the_host_is_still_working_out_is_asked_again(self):  # r1 #5
+        p = self.gh_group("api")
+        p.pr_state("api", mergeStateStatus="UNKNOWN")  # right after foremind/gate was written
+        waits, real = [], gate.time.sleep
+
+        def sleep(s):
+            if s != gate.SETTLE_S:  # the job waits of the run
+                return real(s)
+            waits.append(s)
+            p.pr_state("api", mergeStateStatus="BLOCKED" if len(waits) == 1 else "CLEAN")
+
+        with mock.patch.object(gate.time, "sleep", sleep):
+            res = self.gate(p)
+        self.assertEqual((res["verdict"], res["state"], len(waits)), ("pass", "merged", 2))
+        self.assertEqual(len([a for a in p.gh_log() if "mergeStateStatus" in a]), 3)
+
+    def test_merge_queue_keeps_the_batch_delivered(self):  # N4
+        p = self.gh_group("api")
+        p.gh_state(merge_queue=True)
+        res = self.gate(p)
+        self.assertEqual((res["verdict"], res["state"], p.state()), ("pass", "delivered", "delivered"))
+        self.assertIn("merge queue", res["warnings"][-1])
+        [q] = p.events("merge_queued")
+        self.assertEqual((q["batch"], q["repo"], q["head"]), ("shop.1", "api", p.head()))
+        self.assertEqual((p.events("merge_unverified"), [e["phase"] for e in p.events("merge")]), ([], ["intent"]))
+        calls = len(p.gh_log())
+        self.assertEqual(self.gate(p)["state"], "delivered")  # still queued: neither merged again nor prechecked
+        again = p.gh_log()[calls:]
+        self.assertEqual([a for a in again if a[:2] == ["pr", "merge"] or "mergeStateStatus" in a], [])
+        self.assertFalse(gate.batch_merged(p.root, "shop.1", p.cfg))
+        p.pr_state(state="MERGED")  # the queue merged it
+        self.assertTrue(gate.batch_merged(p.root, "shop.1", p.cfg))  # what L0 reconcile goes by
+        self.assertEqual(self.gate(p)["state"], "merged")
+        self.assertEqual(len([a for a in p.gh_log() if a[:2] == ["pr", "merge"]]), 1)
+
+    def test_a_queued_pr_that_closed_is_merged_again(self):
+        p = self.gh_group("api")
+        p.gh_state(merge_queue=True)
+        self.gate(p)
+        p.pr_state(state="CLOSED")  # no longer waiting in the queue: the next run merges through gh again
+        p.gh_state(merge_queue=False)
+        res = self.gate(p)
+        self.assertEqual((res["state"], len(p.events("merge_queued"))), ("merged", 1))
 
     def test_group_is_checked_before_any_merge(self):
         p = self.project(("api", "app"), cfg={"delivery.level": "merge_dev", "delivery.repo.api.merge_command": MERGE})
@@ -388,6 +550,21 @@ class MergeTest(Base):
         self.gate(p)  # still waiting: still pending
         self.assertIn("state=pending", self.posted(p)[-1])
         self.assertTrue(gate.pre_delivery_audit(review.load_batch(p.root, "shop.1"), p.cfg))
+
+    def test_merge_prechecks_alone_leave_the_status(self):
+        p = self.project(origin=True, cfg={"delivery.repo.api.merge_command": MERGE})
+        sh(p.wt(), "git", "push", "-q", "origin", "fm/shop.1")
+        p.run_review()
+        self.assertEqual(self.gate(p)["state"], "delivered")
+        self.assertIn("state=success", self.posted(p)[-1])
+        n = len(self.posted(p))
+        p.cfg["delivery.level"] = "merge_dev"
+        res = self.gate(p, role="controller")  # N9: only the merge failed its checks, the batch did not
+        self.assertEqual((self.failing(res), res["state"]), (["role"], "delivered"))
+        self.assertEqual(len(self.posted(p)), n)  # the success stands
+        p.cfg["gate.checks"] = ["false"]
+        self.assertEqual(self.failing(self.gate(p, role="controller")), ["checks", "role"])
+        self.assertIn("state=failure", self.posted(p)[-1])
 
     def test_session_without_a_role_cannot_merge(self):
         p = self.merge_dev()

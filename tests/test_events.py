@@ -1,11 +1,16 @@
 import json
 import multiprocessing
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+from foremind import events
 from foremind.events import EventLog
+from foremind.install import settings
+from foremind.supervisor import tick as sv
 
 
 def _append_many(path, tag, n, barrier):
@@ -116,6 +121,97 @@ class EventLogTest(unittest.TestCase):
         for bad in ("2026-9", "2026-13", "2026-00", "2026-09-01", "", "sept"):
             with self.assertRaises(ValueError, msg=bad):
                 self.log.rotate(self.tmp / "archive", bad)
+
+
+class SeatAncestorTest(unittest.TestCase):
+    """m2c.6 (REQ-11 ④): an event claiming the user records the session whose settings file an ancestor names."""
+
+    def setUp(self):
+        self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.sd = self.tmp / "proj" / ".foremind"
+        self.sd.mkdir(parents=True)
+        self.log = EventLog(self.sd / "events.jsonl")
+
+    def chain(self, *cmds, fail_at=None):
+        """ps as a process table: this process, then its ancestors running `cmds`, then launchd."""
+        pids = [os.getpid(), *range(1000, 1000 + len(cmds))]
+        table = {p: (pids[i + 1] if i + 1 < len(pids) else 1, c)
+                 for i, (p, c) in enumerate(zip(pids, ["python", *cmds]))}
+
+        def ps(argv, **kw):
+            pid = int(argv[-1])
+            if pid == fail_at or pid not in table:
+                return subprocess.CompletedProcess(argv, 1, "", "")
+            return subprocess.CompletedProcess(argv, 0, f"{table[pid][0]:6d} {table[pid][1]}\n", "")
+        return mock.patch.object(events.subprocess, "run", side_effect=ps)
+
+    def seat(self, sd):
+        return f"claude --settings {sd}/sessions/fm-p-1.settings.json --permission-mode auto"
+
+    def test_a_seat_of_this_project(self):
+        with self.chain("zsh -c foremind", self.seat(self.sd), "zsh -l"):
+            e = self.log.append("pending_answered", question="Q-1", by="user")
+        self.assertEqual(e["seat_ancestor"], "fm-p-1")
+        self.assertEqual(self.log.verify_chain(), [])
+
+    def test_another_project_or_no_seat_adds_nothing(self):
+        other = self.tmp / "real" / ".foremind"
+        for cmds in ((self.seat(other),), ("zsh -l", "login")):
+            with self.chain(*cmds):
+                e = self.log.append("plan_approved", plan="p", approved_by="user")
+            self.assertNotIn("seat_ancestor", e)
+
+    def test_ps_failing_or_a_chain_too_long_is_unknown(self):
+        with self.chain("zsh", fail_at=1000):
+            self.assertEqual(self.log.append("x", author="user")["seat_ancestor"], "unknown")
+        with self.chain(*["zsh"] * events.ANCESTORS):
+            self.assertEqual(self.log.append("x", requested_by="user")["seat_ancestor"], "unknown")
+        with self.chain(*["zsh"] * (events.ANCESTORS - 2)):
+            self.assertNotIn("seat_ancestor", self.log.append("x", requested_by="user"))
+
+    def test_other_events_are_written_as_before(self):
+        with self.chain(self.seat(self.sd)) as ps:
+            e = self.log.append("review_requested", batch="p.1", requested_by="fm-p-1", by="controller")
+        ps.assert_not_called()
+        self.assertNotIn("seat_ancestor", e)
+
+    def test_the_user_only_commands_by_their_type(self):
+        """resume, pause, confirm-exit, audit --accept-config, decide --confirm, quota --reset, seat --user, init /
+        uninstall, plan new, `hook` outside Foremind's sessions: no claim field; audit --release: batch_state's via."""
+        self.assertEqual(events.USER_TYPES, {"resumed", "paused", "exit_confirmed", "l0_config_accepted",
+                                             "pending_confirmed", "quota_reset", "seat_user", "program_config_write",
+                                             "planner_opened", "user_config_edit"})
+        for ty in sorted(events.USER_TYPES):
+            with self.chain(self.seat(self.sd)) as ps:
+                self.assertEqual(self.log.append(ty)["seat_ancestor"], "fm-p-1")
+            self.assertEqual(ps.call_args.args[0][0], next(filter(os.path.exists, events.PS)))  # not PATH's first
+        with self.chain(self.seat(self.sd)) as ps:
+            self.assertTrue(sv.pause(self.sd.parent, True))
+            self.assertTrue(sv.pause(self.sd.parent, False))
+            settings.record(self.sd.parent, self.tmp / "proj" / ".claude" / "settings.json", "{}")
+            self.log.append("batch_state", batch="p.1", prior="awaiting_audit", state="delivered",
+                            via="audit --release")
+            walks = ps.call_count
+            self.log.append("batch_state", batch="p.1", prior="ready", state="running")  # the program's
+            self.log.append("merge", batch="p.1", repo="main", head="abc", via="gh")
+            self.assertEqual(ps.call_count, walks)
+        self.assertEqual([(e["type"], e.get("seat_ancestor")) for e in self.log.iter()][-6:],
+                         [("paused", "fm-p-1"), ("resumed", "fm-p-1"), ("program_config_write", "fm-p-1"),
+                          ("batch_state", "fm-p-1"), ("batch_state", None), ("merge", None)])
+
+    def test_ps_at_the_next_fixed_path_or_none(self):
+        usr = self.tmp / "usr-bin-ps"
+        usr.touch()
+        with mock.patch.object(events, "PS", (str(self.tmp / "bin-ps"), str(usr))):
+            with self.chain(self.seat(self.sd)) as ps:
+                self.assertEqual(self.log.append("paused")["seat_ancestor"], "fm-p-1")
+            self.assertEqual(ps.call_args.args[0][0], str(usr))
+        with mock.patch.object(events, "PS", (str(self.tmp / "bin-ps"), str(self.tmp / "usr-ps"))):
+            self.assertEqual(self.log.append("paused")["seat_ancestor"], "unknown")
+
+    def test_a_test_project_is_not_the_real_one(self):
+        """The real ps: tests write their events in temporary projects, so a seat running them adds nothing."""
+        self.assertNotIn("seat_ancestor", self.log.append("batch_retried", batch="p.1", by="user"))
 
 
 if __name__ == "__main__":

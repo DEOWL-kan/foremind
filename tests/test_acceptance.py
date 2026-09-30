@@ -19,6 +19,7 @@ class AcceptanceTest(unittest.TestCase):
         head = p.commit()
         red = acceptance.run(p.root, "shop.1", p.cfg)
         self.assertEqual(red["heads"], {"api": head})
+        self.assertEqual(red["commands"][0]["repo"], "api")  # where it ran, for the gate to compare
         self.assertNotEqual(red["commands"][0]["exit_code"], 0)
         cwd, checked_out = output(red, 0).splitlines()
         self.assertEqual((Path(cwd).name, checked_out), ("api", head))  # single-repo batch: that repo (§20 I8)
@@ -40,6 +41,7 @@ class AcceptanceTest(unittest.TestCase):
         self.assertEqual(output(acceptance.run(p.root, "shop.1", p.cfg), 0).split(), ["api", "app"])  # batch dir
         p.cfg["gate.checks"] = ["pwd -P", {"run": "pwd -P", "repo": "app"}]
         res = acceptance.run(p.root, "shop.1", p.cfg, kind="checks")
+        self.assertEqual([c.get("repo") for c in res["commands"]], [None, "app"])  # the batch dir has no repo
         top, app = Path(output(res, 0)), Path(output(res, 1))
         self.assertEqual((app.parent, app.name), (top, "app"))
         self.assertTrue(acceptance.result_path(p.root, "shop.1", "checks", res["heads"]).name.startswith("shop.1.checks."))

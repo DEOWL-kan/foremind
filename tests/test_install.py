@@ -1,4 +1,5 @@
 import contextlib
+import io
 import json
 import shutil
 import tomllib
@@ -14,6 +15,14 @@ USER_SETTINGS = ('{\n    "permissions": {"allow": ["Bash(ls)"]},\n'
                  '    "hooks": {"Stop": [{"matcher": "", "hooks": [{"type": "command", "command": "say done"}]}]},\n'
                  '    "statusLine": {"type": "command", "command": "my-status --short", "padding": 1}\n}')
 USER_TOML = "# mine\n[gate]\nchecks = [\"make test\"]"  # no trailing newline on purpose
+
+
+def ci_repo(env, path):
+    """A repo with a CI workflow: init's `ci = required` then passes doctor."""
+    root = env.repo(path)
+    (root / ".github" / "workflows").mkdir(parents=True)
+    (root / ".github" / "workflows" / "ci.yml").write_text("on: push\n")
+    return root
 
 
 class TomlBlockTest(unittest.TestCase):
@@ -49,6 +58,35 @@ class TomlBlockTest(unittest.TestCase):
         with self.assertRaises(tomlblock.BlockError):
             tomlblock.add(self.env.tmp / "new.toml", "x", "k = ")
         self.assertFalse((self.env.tmp / "new.toml").exists())
+
+    def test_backups_keep_the_newest_of_that_file(self):
+        self.p.write_text("a = 1\n")
+        d = self.env.config / "backups"
+        d.mkdir(parents=True)
+        prefix = f"c.toml.{tomlblock.sha256_bytes(str(self.p.resolve()).encode())[:8]}."
+        old = [d / f"{prefix}20000101-000000-{i:06d}.bak" for i in range(tomlblock.BACKUPS_KEPT + 1)]
+        foreign = [d / f"{prefix}notes.bak", d / "other.toml.12345678.20000101-000000-000000.bak", d / "mine.txt"]
+        for f in old + foreign:
+            f.write_text("x")
+        tomlblock.add(self.p, "x", "k = 1")
+        ours = sorted(f.name for f in d.iterdir() if f not in foreign)
+        self.assertEqual(len(ours), tomlblock.BACKUPS_KEPT)
+        self.assertEqual(ours[:-1], [f.name for f in old[2:]])  # the two oldest went, the new one is last
+        self.assertEqual((d / ours[-1]).read_text(), "a = 1\n")
+        self.assertTrue(all(f.exists() for f in foreign))
+
+    def test_failed_backup_cleanup_does_not_stop_the_write(self):
+        self.p.write_text("a = 1\n")
+        d = self.env.config / "backups"
+        d.mkdir(parents=True)
+        prefix = f"c.toml.{tomlblock.sha256_bytes(str(self.p.resolve()).encode())[:8]}."
+        for i in range(tomlblock.BACKUPS_KEPT):
+            (d / f"{prefix}20000101-000000-{i:06d}.bak").write_text("x")
+        with mock.patch.object(tomlblock.Path, "unlink", side_effect=PermissionError("denied")), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            tomlblock.add(self.p, "x", "k = 1")
+        self.assertIn("k = 1", self.p.read_text())
+        self.assertIn("denied", err.getvalue())
 
     def test_value(self):
         v = {"s": 'a "b"\\ \n ü \x7f \x1f', "b": True, "n": 3, "l": ["x", 1]}
@@ -99,7 +137,7 @@ class InitUninstallTest(unittest.TestCase):
         (self.env.home / ".claude" / "settings.json").write_text(json.dumps({"statusLine": sl}))
 
     def test_single_repo_keeps_and_restores_user_files(self):
-        root = self.env.repo(self.env.tmp / "shop")
+        root = ci_repo(self.env, self.env.tmp / "shop")
         (root / ".claude").mkdir()
         (root / ".claude" / "settings.local.json").write_text(USER_SETTINGS)
         (root / "foremind.toml").write_text(USER_TOML)
@@ -137,14 +175,25 @@ class InitUninstallTest(unittest.TestCase):
         self.assertTrue((root / ".foremind" / "delivery.toml").exists())  # data stays
         self.assertNotIn(".foremind", sh(root, "git", "status", "--porcelain", "--untracked-files=all"))  # still ignored
 
+    def test_uninstall_deletes_the_exclude_file_init_created(self):
+        root = ci_repo(self.env, self.env.tmp / "shop")
+        exclude = root / ".git" / "info" / "exclude"
+        exclude.unlink(missing_ok=True)  # e.g. a clone made without git's templates
+        self.init("--repo", f"main={root}")
+        self.assertIn("/.foremind/", exclude.read_text())
+        rc, out = self.env.run("uninstall", project=root)
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(exclude.exists())
+
     def test_two_repos_from_scratch(self):
         root = self.env.tmp / "proj"
-        api, app = self.env.repo(root / "api"), self.env.repo(root / "app")
+        api, app = ci_repo(self.env, root / "api"), ci_repo(self.env, root / "app")
         self.init("--repo", f"api={api}", "--repo", f"app={app}", "--root", str(root), "--name", "p")
         self.assertEqual(config.load(root)["repos"], [{"id": "api", "path": "api"}, {"id": "app", "path": "app"}])
         for d in (root, api, app):
             self.assertEqual(settings.check(d), [])
         self.assertIn("/.claude/settings.local.json", (api / ".git" / "info" / "exclude").read_text())
+        (root / "foremind.toml").write_text(USER_TOML)  # #23 unanswered = the user's: the gate needs local checks
         self.doctor(root)
         registered = (root / ".foremind" / "config.toml").read_bytes()
         with contextlib.chdir(api):
@@ -188,7 +237,7 @@ class InitUninstallTest(unittest.TestCase):
         self.assertEqual(settings.wrapped(), (None, False))
 
     def test_status_line_from_the_project_is_not_wrapped_without_consent(self):
-        root = self.env.repo(self.env.tmp / "shop")
+        root = ci_repo(self.env, self.env.tmp / "shop")
         (root / ".claude").mkdir()
         (root / ".claude" / "settings.json").write_text('{"statusLine": {"type": "command", "command": "./st.sh"}}')
         self.claude_settings("g")  # the project's is the one in effect
@@ -197,16 +246,19 @@ class InitUninstallTest(unittest.TestCase):
         self.assertEqual(settings.wrapped(), (None, False))
         self.assertFalse((self.env.config / "config.toml").exists())
         self.assertNotIn("statusLine", json.loads(settings.path(root).read_text()))
+        (root / "foremind.toml").write_text(USER_TOML)
         self.assertEqual(self.fails(root), [f"钩子已装 {settings.path(root)}"])
 
     def test_a_second_project_with_another_status_line(self):
-        a, b = self.env.repo(self.env.tmp / "a"), self.env.repo(self.env.tmp / "b")
+        a, b = ci_repo(self.env, self.env.tmp / "a"), ci_repo(self.env, self.env.tmp / "b")
         self.claude_settings("g")
         self.init("--root", str(a))
         self.claude_settings("h")
         out = self.init("--root", str(b))
         self.assertIn("无法再串联 'h'", out)
         self.assertEqual(settings.wrapped(), ("g", True))
+        for d in (a, b):
+            (d / "foremind.toml").write_text(USER_TOML)
         self.assertEqual(self.fails(a), [])
         self.assertEqual(self.fails(b), [f"钩子已装 {settings.path(b)}"])
 

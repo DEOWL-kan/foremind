@@ -24,15 +24,17 @@ claim_for_user is `seat --user` (I3); continue_seat moves a live session on to i
 import fnmatch
 import functools
 import json
+import os
 import re
 import subprocess
 import time
 from pathlib import Path
 
-from foremind import config, handoff, header, job, lock, repos as repos_mod, schemas, worktree
+from foremind import config, handoff, header, inbox, job, lock, pathmatch, repos as repos_mod, schemas, worktree
 from foremind.carriers import SessionExists
+from foremind.defaults import TABLE
 from foremind.events import EventLog
-from foremind.fsutil import atomic_write, sha256_bytes
+from foremind.fsutil import atomic_write, sha256_bytes, sha256_file
 from foremind.paths import state_dir
 from foremind.schemas import BATCH_ID, SHA
 from foremind.state import BATCH, BATCH_SIDE, can_transition, transition
@@ -40,11 +42,7 @@ from foremind.vendors import get as get_vendor
 
 STARTED = ("running", "review_ready", "in_review", "changes_requested", "approved", "awaiting_audit", "delivered")
 SUCCESSOR_FROM = handoff.SUCCESSOR_FROM  # I43
-DEFAULTS = {"seat.permission_mode": "acceptEdits", "seat.sessionstart_timeout_s": 60,
-            "seat.manual_sessionstart_timeout_s": 600, "seat.verify_timeout_s": 600, "seat.continue_enabled": False,
-            "delivery.depends_on": "merged", "carrier.kind": "tmux"}
 _PROVIDERS = {"claude": ("claude", "anthropic"), "codex": ("codex", "openai")}  # vendor -> names exclude.providers may use
-_WILD = re.compile(r"[*?\[]")
 
 
 class SeatError(Exception):
@@ -56,7 +54,7 @@ def _events(root):
 
 
 def setting(cfg, key):
-    return cfg.get(key, DEFAULTS[key])
+    return cfg.get(key, TABLE[key])
 
 
 def header_path(root, batch) -> Path:
@@ -126,27 +124,9 @@ def _next_seq(root, prefix) -> int:
 
 # --- runtime disjointness ----------------------------------------------------
 
-def _literal(p):
-    m = _WILD.search(p)
-    return p if m is None else p[:m.start()]
-
-
 def paths_overlap(a, b) -> bool:
-    """Could `<repo>:<glob>` a and b name a common file? A literal path also covers everything below it."""
-    # ponytail: case-sensitive, no ./ or // normalization (N-8); a case-only clash on macOS goes unseen
-    (ra, pa), (rb, pb) = a.split(":", 1), b.split(":", 1)
-    if ra != rb:
-        return False
-    la, lb = _literal(pa), _literal(pb)
-    if la == pa and lb == pb:
-        return pa == pb or pa.startswith(pb.rstrip("/") + "/") or pb.startswith(pa.rstrip("/") + "/")
-    if la == pa:
-        return fnmatch.fnmatchcase(pa, pb) or la.startswith(lb) or lb.startswith(la)
-    if lb == pb:
-        return fnmatch.fnmatchcase(pb, pa) or la.startswith(lb) or lb.startswith(la)
-    # ponytail: two globs are compared by literal prefix only (`src/*.py` vs `src/*.md` overlap); a false positive
-    # only serializes two batches. Exact glob intersection if that gets in the way.
-    return la.startswith(lb) or lb.startswith(la)
+    """Could `<repo>:<glob>` a and b name a common file? (pathmatch.overlap; ready.py and freeze.py call it here)"""
+    return pathmatch.overlap(a, b)
 
 
 def _is_started(h) -> bool:
@@ -249,6 +229,12 @@ def _start_ref(root, cfg, up, repo):
     return heads[repo.id]
 
 
+def _starts(wts) -> dict:
+    """{repo: head} of worktrees a batch starts in (not a successor's): a base that stays when the batch's commits
+    are pushed to the target (bounds.pushed, m2d.7 ⑥)."""
+    return {rid: head for rid, (_, head) in wts.items()}
+
+
 def prepare_worktrees(root, cfg, h, slug):
     """Returns ({repo id: (path, head)}, [{upstream, repo, sha, path}] of the read-only upstream worktrees)."""
     bid = h["id"]
@@ -274,10 +260,23 @@ def prepare_worktrees(root, cfg, h, slug):
 
 # --- mechanical verification -------------------------------------------------
 
+def _review_request(root, bid) -> dict | None:
+    """The batch's latest review_requested when it is newer than its latest handoff section: a holder that committed
+    and asked for review after its last section (then released on delivery, or gone) left that as its record."""
+    last = None
+    for e in handoff.history(root):
+        if e.get("batch") == bid and e["type"] in ("handoff_written", "review_requested") and e["phase"] == "result":
+            last = e
+    return last if last and last["type"] == "review_requested" and isinstance(last.get("heads"), dict) else None
+
+
 def expectations(root, h, wts, *, successor):
     """What the record says: ({repo: (branch, sha)}, [(command, exit code)], changed files or None).
     A fresh batch expects a clean worktree; None = a successor with no handoff section (record "none"): only the
-    branch name and PR head can be checked."""
+    branch name and PR head can be checked. A review request newer than the section is the record then: its heads,
+    committed, a clean worktree (finding 33)."""
+    if successor and (req := _review_request(root, h["id"])):
+        return {rid: (f"fm/{h['id']}", sha) for rid, sha in req["heads"].items()}, [], []
     sec = handoff.latest_section(root, h["id"]) if successor else None
     if sec is None:
         repos = {rid: (f"fm/{h['id']}", head) for rid, (_, head) in wts.items()}
@@ -388,11 +387,11 @@ def _vendor(model):
 
 def _check_model(cfg, model):
     """exclude.models and exclude.providers: no fallback or alias gets around them (§1.5, §3.2)."""
-    for pat in cfg.get("exclude.models", []):
+    for pat in cfg.get("exclude.models", TABLE["exclude.models"]):
         if fnmatch.fnmatchcase(model.lower(), pat.lower()) or pat.lower() in model.lower():
             raise SeatError(f"model {model} is excluded by exclude.models ({pat})")
     names = _PROVIDERS[_vendor(model)]
-    for p in cfg.get("exclude.providers", []):
+    for p in cfg.get("exclude.providers", TABLE["exclude.providers"]):
         if p.lower() in names:
             raise SeatError(f"model {model} ({names[1]}) is excluded by exclude.providers ({p})")
 
@@ -447,6 +446,59 @@ def _abandon(root, carrier, bid, session, *, claimed, launched):
     return evidence, released
 
 
+def _settings_sha(root, session) -> str | None:
+    """sha256 of the settings file the session was launched with (for L0 to compare later); None without one."""
+    try:
+        return sha256_file(settings_path(root, session))
+    except OSError:
+        return None
+
+
+def changes_text(n, issues) -> str:
+    """REQ-8: round `n`'s must-fix list as the seat gets it (tick._gate, _changes_lists): one line per issue, one the
+    program lowered (review.assemble: was, filtered) showing so."""
+    lines = [f"- [{i.get('severity')}" + (f"，原为 {i['was']}，{i.get('filtered')}" if i.get("was") else "")
+             + f"] {i.get('location')}：{i.get('summary')}" for i in issues]
+    return f"Foremind：审查第 {n} 轮要求修改：\n" + "\n".join(lines) + "\n改完提交，再执行 `foremind review`。"
+
+
+def _changes_lists(root, bid) -> list[tuple[str, str]]:
+    """(sender, text) of the must-fix lists a changes_requested batch's holder would have been sent (finding 34), in
+    the formats of review.request_changes and tick._gate, while no seat has taken them since the batch last entered
+    changes_requested: the latest receipt when it asks for changes (it is written before the move it causes), then
+    the changes_requested_by lists since. Taken: a move to running (save one by a successor whose kickoff failed:
+    seat_open result lists_unsent), or a successor opened with them (seat_opened lists)."""
+    evs = list(handoff.history(root))
+    entered = ran = was = -1
+    receipt = None
+    for i, e in enumerate(evs):
+        if e.get("batch") != bid:
+            continue
+        if e["type"] == "batch_state":  # review.set_state writes state, seat.set_state to
+            to = e.get("state", e.get("to"))
+            if to == "changes_requested":
+                entered = i
+            elif to == "running":
+                ran, was = i, ran
+        elif e["type"] == "review_receipt":
+            receipt = (i, e)
+        elif e["type"] == "seat_open" and e.get("lists_unsent"):
+            ran = was
+        elif e["type"] == "seat_opened" and e.get("lists"):
+            ran = i
+    if entered < 0 or ran > entered:
+        return []
+    out = []
+    if receipt and receipt[0] > ran and receipt[1].get("verdict") == "changes_requested":
+        r = json.loads((state_dir(root) / "batches" / Path(receipt[1]["path"]).name).read_text(encoding="utf-8"))
+        out.append(("supervisor", changes_text(receipt[1].get("round"), r.get("issues", []))))
+    for e in evs[entered + 1:]:
+        if e["type"] == "changes_requested_by" and e.get("batch") == bid:
+            out.append(("controller", f"Foremind：要求修改（{e.get('by')}，{e['ts']}）：\n"
+                        + "\n".join(f"- {x}" for x in e.get("items", [])) + "\n改完提交，再执行 `foremind review`。"))
+    return out
+
+
 def open_seat(root, bid, *, carrier, successor=False) -> dict:
     root = Path(root).resolve()
     h, cfg = _load(root, bid)
@@ -466,8 +518,13 @@ def open_seat(root, bid, *, carrier, successor=False) -> dict:
             raise SeatError(f"{bid} is held by the user (seat --user): no successor takes it over")
         if not successor:
             _claim(root, bid, session)
+        # m2b.10: whose it is (the supervisor's job, FOREMIND_JOB; None from the user's command) and the process
+        # that writes its result, so the supervisor settles it as soon as that process is gone; outside a job it
+        # claims the user (m2d.7 ⑦: events.append checks seat_ancestor)
+        job = os.environ.get("FOREMIND_JOB") or None
         ev.append("seat_open", phase="intent", dedupe_id=f"seat_open:{session}", batch=bid, session=session,
-                  successor=successor, predecessor=predecessor)
+                  successor=successor, predecessor=predecessor, job=job, pid=os.getpid(),
+                  **({} if job else {"by": "user"}))
     claimed = not successor
     out = {"ok": False, "batch": bid, "session": session, "worktrees": {}, "problems": []}
 
@@ -493,7 +550,8 @@ def open_seat(root, bid, *, carrier, successor=False) -> dict:
     timeout = setting(cfg, "seat.manual_sessionstart_timeout_s" if carrier.name == "manual"
                       else "seat.sessionstart_timeout_s")
     t0, launched = time.time(), True  # from here on a session may exist, even if create() fails
-    launch_id = f"seat_launch:{session}"
+    lists, moved = [], False
+    launch_id, settings_sha = f"seat_launch:{session}", _settings_sha(root, session)  # r1 #5: what it starts with
     ev.append("seat_launch", phase="intent", dedupe_id=launch_id, batch=bid, session=session, carrier=carrier.name,
               socket=getattr(carrier, "socket", None), model=h["tiers"]["model"], effort=h["tiers"].get("effort"))
     try:
@@ -504,7 +562,7 @@ def open_seat(root, bid, *, carrier, successor=False) -> dict:
             raise
         hb = wait_heartbeat(root, session, bid, t0, timeout)
         ev.append("seat_launch", dedupe_id=launch_id, batch=bid, session=session, ok=hb is not None,
-                  agent_session_id=(hb or {}).get("agent_session_id"))
+                  agent_session_id=(hb or {}).get("agent_session_id"), settings_sha256=settings_sha)
         if hb is None:
             problem = f"no heartbeat from {session} within {timeout} s"
             evidence, released = _abandon(root, carrier, bid, session, claimed=claimed, launched=True)
@@ -517,17 +575,27 @@ def open_seat(root, bid, *, carrier, successor=False) -> dict:
                 raise SeatError(f"{bid}: lock no longer held by {session}")
             if successor and now not in SUCCESSOR_FROM:
                 raise SeatError(f"{bid} became {now} while its successor was starting")
+            # once running, tick.gates sends nothing more: the lists go to the successor's inbox here, before the
+            # move (REQ-5); a failed write leaves changes_requested, a failed kickoff marks its result lists_unsent
+            # (r1 #2), and the next successor gets them
+            lists = _changes_lists(root, bid) if successor else []
+            for sender, text in lists:
+                inbox.append(session, text, sender=sender, root=root)
             if now != "running":
                 set_state(root, bid, "running", held=True)
+                moved = True
         carrier.deliver(session, kickoff_text(bid, wts, successor=successor, record=expect[2] is not None))
     except BaseException as e:
         ev.append("seat_launch", dedupe_id=launch_id, batch=bid, session=session, ok=False, error=str(e))  # deduped
         evidence, released = _abandon(root, carrier, bid, session, claimed=claimed, launched=launched)
-        result(False, error=str(e), closed=evidence is not None, released=released)
+        result(False, error=str(e), closed=evidence is not None, released=released,
+               **({"lists_unsent": True} if lists and moved else {}))
         raise
     ev.append("seat_opened", batch=bid, session=session, successor=successor, carrier=carrier.name,
               worktrees=out["worktrees"], readonly=[{k: r[k] for k in ("upstream", "repo", "sha")} for r in ro],
-              **({"predecessor": predecessor, "record": "handoff" if expect[2] is not None else "none"}
+              **({"lists": len(lists)} if lists else {}), **({} if successor else {"starts": _starts(wts)}),
+              **({"predecessor": predecessor, "record": "none" if expect[2] is None else
+                  "review_request" if _review_request(root, bid) else "handoff"}
                  if successor else {}))
     result(True)
     return {**out, "ok": True}
@@ -543,7 +611,7 @@ def claim_for_user(root, bid) -> dict:
             set_state(root, bid, "running", held=True)
     wts, ro = prepare_worktrees(root, cfg, h, project_slug(root, cfg))
     paths = {rid: str(p) for rid, (p, _) in wts.items()}
-    _events(root).append("seat_user", batch=bid, worktrees=paths,
+    _events(root).append("seat_user", batch=bid, worktrees=paths, starts=_starts(wts),
                          readonly=[{k: r[k] for k in ("upstream", "repo", "sha")} for r in ro])
     return paths
 
@@ -621,6 +689,6 @@ def continue_seat(root, session, frm, to, *, remaining_budget, carrier) -> dict:
         raise
     ev.append("seat_opened", batch=to, session=session, successor=False, carrier=carrier.name,
               worktrees=out["worktrees"], readonly=[{k: r[k] for k in ("upstream", "repo", "sha")} for r in ro],
-              continued_from=frm)
+              continued_from=frm, starts=_starts(wts))
     result(True)
     return {**out, "ok": True}

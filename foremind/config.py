@@ -26,6 +26,8 @@ KEY_CLASSES: dict[str, str] = {
     "notify.*": PLAIN,
     "runtime.*": PLAIN,
     "context.*": PLAIN,  # §6.3 effective budget: window_tokens, soft_pct, hard_pct, abs_cap_tokens (§20 I15)
+    "context.by_role.*.*": PLAIN,  # §6.3 per role: context.by_role.<role>.<key> (m2b.8), merged key by key
+    "context.by_role.*.*.*": PLAIN,  # per role and model: context.by_role.<role>.<model>.<key>
     "plan.coupling.*": PLAIN,  # §4.2 5d weights and thresholds
     "project.name": PLAIN,  # §20 I39 slug source; keep it stable once batches are running
     "seat.*": PLAIN,  # sessionstart/verify/manual timeouts, continue_enabled (§20 I44)
@@ -36,9 +38,21 @@ KEY_CLASSES: dict[str, str] = {
     "review.max_failures": PLAIN,  # consecutive reviewer failures on the same heads before `failed`
     "routes.*.*": PLAIN,  # e.g. routes.reviewer.model / effort (§3.2)
     "oneshot.timeout_min": PLAIN,
+    "oneshot.exclude_dynamic_prompt": PLAIN,  # m2d.4 A10: --exclude-dynamic-system-prompt-sections when true
+    "review.max_budget_usd": PLAIN,  # m2d.4 REQ-13: per-review dollar cap (unset = none)
+    "review.cost_cap_usd_s": PLAIN,  # m2d.4 REQ-13: per-batch review cost cap by difficulty (unset = none)
+    "review.cost_cap_usd_m": PLAIN,
+    "review.cost_cap_usd_l": PLAIN,
+    "review.cost_cap_tokens_s": PLAIN,  # m2e.4 REQ-2: per-batch review cap in input-equivalent tokens (unset = none)
+    "review.cost_cap_tokens_m": PLAIN,
+    "review.cost_cap_tokens_l": PLAIN,
+    "review.new_must_fix_max": PLAIN,  # m2d.5 REQ-16: new must-fix per round beyond this become should_fix
     "acceptance.timeout_min": PLAIN,
     "flow.*.*": PLAIN,
     "review.max_rounds": PLAIN,
+    "audit.daily_cap": PLAIN,  # m2b.5: L1 auditors started per local day (default 10)
+    "land.commands": PLAIN,  # m2c.4: full-suite commands `foremind land` runs after accept_commands
+    "decider.audit_ratio": PLAIN,  # m2b.3: share of decider decisions sampled for audit (default 0.2)
     "stuck.*": PLAIN,
     "delivery.depends_on": PLAIN,
     "exclude.models": UNION,
@@ -46,6 +60,7 @@ KEY_CLASSES: dict[str, str] = {
     "hard_block.categories": UNION,
     "forbidden.actions": UNION,
     "gate.checks": UNION,
+    "gate.ci_pending_max_min": PLAIN,  # m2b.7: CI (and a merge queue) pending this long -> one notice, not a fail
     "repos": REPO_CONVENTION,
     "gate.ci": REPO_CONVENTION,
     "delivery.repo.*.target_branch": REPO_CONVENTION,
@@ -59,8 +74,11 @@ KEY_CLASSES: dict[str, str] = {
     "gate.rereview_after_update": AUTHZ,
     "quota.reserve_pct": AUTHZ,
     "seat.permission_mode": AUTHZ,
+    "authz.preset": AUTHZ,  # §8.1 presets (m2a.2 decide/table.py)
+    "authz.hands_off_delegate": AUTHZ,  # no order: user layer only; m2b.3 hands_off categories given to the decider
     "delivery.repo.*.push_pr": AUTHZ,
     "quota.low_pct": AUTHZ,
+    "quota.pace": AUTHZ,  # user 2026-09-27: false turns off the 7d daily-share slowdown (pause lines stay)
     "quota.recover_pct": AUTHZ,
     "quota.oneshot_pause_pct": AUTHZ,
     "quota.probe_command": AUTHZ,  # no order: user layer only, a project must not inject a command
@@ -80,8 +98,10 @@ AUTHZ_ORDERS: dict[str, list | str] = {
     "quota.reserve_pct": HIGHER_STRICTER,  # a bigger reserve is stricter
     "delivery.repo.*.push_pr": ["user", "system"],
     "quota.low_pct": LOWER_STRICTER,  # slow down earlier
+    "quota.pace": [True, False],  # pacing on is stricter
     "quota.recover_pct": LOWER_STRICTER,  # recover later
     "quota.oneshot_pause_pct": LOWER_STRICTER,  # the user keeping #23 is stricter
+    "authz.preset": ["conservative", "balanced", "hands_off"],
     "seat.permission_mode": ["plan", "dontAsk", "manual", "acceptEdits", "auto", "bypassPermissions"],
 }
 
@@ -129,7 +149,9 @@ def _flatten(data, prefix=""):
         key = prefix + k
         # a registered key keeps its dict whole; {value, ceiling}-only tables are AUTHZ notation only where
         # the key is AUTHZ (or unregistered) and not the parent of registered keys (`[stuck] value = 5` is stuck.value)
-        if isinstance(v, dict) and _lookup(KEY_CLASSES, key) is None and (not _is_authz_spec(v) or _is_prefix(key)):
+        # (a key that is both a registered value and the parent of registered keys, like context.by_role under
+        # context.*, is a table: its entries merge one by one)
+        if isinstance(v, dict) and (_is_prefix(key) or _lookup(KEY_CLASSES, key) is None and not _is_authz_spec(v)):
             flat = _flatten(v, key + ".")
         else:
             flat = {key: v}

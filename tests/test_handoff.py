@@ -3,12 +3,13 @@ import copy
 import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from foremind import batchlog, cli, handoff, header, lock
+from foremind import batchlog, cli, handoff, header, heartbeat, lock
 from foremind.events import EventLog
 from foremind.lock import ExitEvidence
 from foremind.schemas import EXAMPLES
@@ -129,6 +130,33 @@ class HandoffTest(unittest.TestCase):
         self.assertEqual(lock.holder(self.root, "auth.2"), "fm-shop-auth_2-2")
         self.assertEqual(handoff.accept(self.root, "auth.2", "fm-shop-auth_2-2"), "fm-shop-auth_2-1")
         self.assertIn("前任 fm-shop-auth_2-1", (self.root / ".foremind" / "batches" / "auth.2.log.md").read_text())
+
+    def test_events_carry_the_session_costs(self):  # REQ-7
+        costs = ("context_tokens", "calls", "input_tokens", "cache_write_tokens", "cache_read_tokens", "output_tokens")
+        handoff.write_section(self.root, "auth.2", self.section, author="fm-shop-auth_2-1")
+        e = [x for x in self.events().iter() if x["type"] == "handoff_written"][-1]
+        self.assertEqual([e[k] for k in (*costs, "requested", "dirty")], [None] * 6 + [False, None], "unreadable")
+        tr = self.root / "t.jsonl"
+        tr.write_text("\n".join(json.dumps({"type": "assistant", "message": {"id": i, "usage": {
+            "input_tokens": 2, "cache_creation_input_tokens": 5, "cache_read_input_tokens": n, "output_tokens": 7}}})
+            for i, n in (("m1", 100), ("m2", 300))) + "\n")
+        heartbeat.update(self.root, "fm-shop-auth_2-1", transcript_path=str(tr), handoff_requested=True)
+        wts = {}
+        for repo, files in (("api", ["a", "b"]), ("app", [])):
+            wts[repo] = self.root / "wt" / repo
+            subprocess.run(["git", "init", "-q", str(wts[repo])], check=True)
+            for f in files:
+                (wts[repo] / f).write_text("x")
+        self.events().append("seat_opened", batch="auth.2", session="fm-shop-auth_2-1", successor=False,
+                             worktrees={r: str(p) for r, p in wts.items()})
+        handoff.write_section(self.root, "auth.2", self.section, author="fm-shop-auth_2-1")
+        e = [x for x in self.events().iter() if x["type"] == "handoff_written"][-1]
+        self.assertEqual([e[k] for k in (*costs, "requested", "dirty")], [307, 2, 4, 10, 400, 14, True, 2])
+        self.opened_as_successor("fm-shop-auth_2-2")
+        heartbeat.update(self.root, "fm-shop-auth_2-2", transcript_path=str(tr))
+        handoff.accept(self.root, "auth.2", "fm-shop-auth_2-2")
+        e = [x for x in self.events().iter() if x["type"] == "handoff_accept" and x["phase"] == "result"][-1]
+        self.assertEqual([e[k] for k in costs], [307, 2, 4, 10, 400, 14])
 
     def test_cli(self):
         f = self.root / "section.json"

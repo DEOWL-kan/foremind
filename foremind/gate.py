@@ -2,56 +2,48 @@
 
 run() re-derives every check from files, git and the host: the latest receipt (approved; full lowercase SHAs equal
 to every repo's current head; reviewer != implementer; content hash matches a program-started review), acceptance
-and [gate].checks bound to the same heads (run by the program when missing), [gate].ci per repo, owns_paths,
-merge_after / depends_on merged, dependency-manifest sections, delivery level, and for merges the caller role, a
-pushed and up-to-date branch. A remote branch that is neither the reviewed head nor an ancestor of it (someone
-pushed something else) voids the receipt. One gate run per batch at a time (batches/<id>.gate.lock, not waited for).
-The result is written to batches/<id>.gate.<heads-hash>.json first. Then the state the run will end in is worked
-out, and the commit status foremind/gate is written for every head that is on its remote as reviewed (for #23-user
-repos: once the user pushed): success only when the batch ends delivered or merged, pending while it waits for the
-pre-delivery audit (§20 I49; whoever passes the audit writes success). Then the batch moves: in_review -> approved
--> awaiting_audit | delivered -> merged (merge_dev only), merging through `merge_command` (checked before and
-after) or `gh pr merge --match-head-commit`.
+and [gate].checks bound to the same heads and the same (repo, command) list (run by the program when missing or
+stale), [gate].ci per repo (every page of the host's checks, and the branch's required checks from the delivery
+proposal), owns_paths, merge_after / depends_on merged, dependency-manifest sections, delivery level, and for merges
+the caller role, a pushed and up-to-date branch. A remote branch that is neither the reviewed head nor an ancestor of
+it (someone pushed something else; a head `foremind update` replaced is only stale) voids the receipt. One gate or
+update run per batch at a time (batches/<id>.gate.lock, not waited for). The result is written to
+batches/<id>.gate.<heads-hash>.json first. Then the state the run will end in is worked out, and the commit status
+foremind/gate is written for every head that is on its remote as reviewed (for #23-user repos: once the user
+pushed): success only when the batch ends delivered or merged, pending while it waits for the pre-delivery audit
+(§20 I49; whoever passes the audit writes success); failing merge prechecks alone write none. Then the batch moves:
+in_review -> approved -> awaiting_audit | delivered -> merged (merge_dev only), merging through `merge_command`
+(checked before and after) or `gh pr merge --match-head-commit`. Right before the group's first merge each gh repo's
+PR must be mergeable to the host (mergeStateStatus in MERGEABLE, else check `mergeable` fails and nothing merges); a
+PR the merge queue took is `merge_queued` and the batch stays delivered until a later run (or L0) sees it merged.
 """
 import contextlib
 import json
 import re
+import time
 import tomllib
-from fnmatch import fnmatchcase
+from datetime import datetime, timezone
 
-from foremind import acceptance, job, review, schemas
+from foremind import acceptance, job, pathmatch, review, schemas
+from foremind.defaults import TABLE
 from foremind.fsutil import LockBusy, atomic_write, file_lock, sha256_bytes
+from foremind.manifests import SECTIONS, is_manifest
 from foremind.paths import state_dir
-from foremind.review import FlowError, gh, git, is_ancestor, run as _run
+from foremind.review import FlowError, bases, gh, git, is_ancestor, run as _run
 
 GATE_CONTEXT = "foremind/gate"
 APPROVAL = ("receipt", "reviewer", "receipt_event", "acceptance", "checks")  # + ci:<repo>, approval phase (§1.6)
 MERGE_ROLES = ("seat", "supervisor", "user")  # controller, planner and one-shot roles never merge (§2.3)
-APPROVED_Q = ("answered", "applied", "provisional", "confirmed")
+APPROVED_Q = ("answered", "applied", "provisional", "overdue", "confirmed")  # overdue: still provisional (REQ-21)
+MERGE_PRE = {"role", "merge_way", "up_to_date", "pushed", "mergeable"}  # merge-only: never a commit status (N9)
+MAX_PAGES = 50  # of a host list (100 per page)
+# GitHub's MergeStateStatus values `gh pr merge` goes ahead on; BEHIND, BLOCKED, DIRTY, DRAFT, UNKNOWN and any value
+# added later stop the whole merge group (N3)
+MERGEABLE = ("CLEAN", "HAS_HOOKS", "UNSTABLE")
+SETTLE_TRIES, SETTLE_S = 3, 5
 
-# Dependency manifests (§8.1 #3/#4). Sections are dotted prefixes: (runtime -> #4, dev -> #3). Other changed keys
-# that look like dependencies, and every other manifest, need #4 ("cannot parse = #4", §8.2).
-# ponytail: fixed list; share one list with the hooks' hard-block patterns when that config exists
-SECTIONS = {
-    "package.json": (("dependencies", "peerDependencies", "optionalDependencies"), ("devDependencies",)),
-    "pyproject.toml": (("project.dependencies", "project.optional-dependencies"), ("dependency-groups",)),
-}
-# Patterns with a `/` match the whole repo path (fnmatch's `*` crosses `/`), the others the file name.
-MANIFESTS = (*SECTIONS, "requirements*.txt", "requirements*.in", "*requirements/*.txt", "*requirements/*.in",
-             "constraints*.txt", "Pipfile", "Pipfile.lock", "poetry.lock", "uv.lock", "pdm.lock", "setup.py",
-             "setup.cfg", "environment.yml", "environment.yaml", "package-lock.json", "npm-shrinkwrap.json",
-             "yarn.lock", "pnpm-lock.yaml", "deno.json", "deno.jsonc", "deno.lock", "go.mod", "go.sum", "Cargo.toml",
-             "Cargo.lock", "Gemfile", "Gemfile.lock", "*.gemspec", "composer.json", "composer.lock", "pubspec.yaml",
-             "pubspec.lock", "build.gradle", "build.gradle.kts", "pom.xml", "*.csproj", "*.fsproj", "*.vbproj",
-             "packages.config", "Directory.Packages.props", "Podfile", "Podfile.lock", "Package.swift",
-             "Package.resolved")
 _DEPISH = re.compile(r"depend|requires|overrides|resolutions", re.I)
 _MISSING = object()
-
-
-def is_manifest(path) -> bool:
-    name = path.rsplit("/", 1)[-1]
-    return any(fnmatchcase(path if "/" in g else name, g) for g in MANIFESTS)
 
 
 # --- git criteria --------------------------------------------------------------
@@ -76,24 +68,12 @@ def is_merged(repo_dir, target, head, base) -> bool:
 def patch_id(repo_dir, rev_range) -> str:
     """`git diff <range> | git patch-id --verbatim` ('' for an empty diff). Whitespace counts: indentation is
     meaningful in Python and YAML. §7.6 rebind (M2-2) compares `<old base>...<reviewed head>` with
-    `<new target>...<new head>`."""
-    diff = _run(["git", "diff", "--binary", "--no-color", "--no-ext-diff", "--no-textconv", rev_range], repo_dir,
-                text=False).stdout
+    `<new target>...<new head>`. The context is pinned: diff.context=0 in the repo config would let a target change
+    right next to the batch's lines through."""
+    diff = _run(["git", "diff", "--binary", "--no-color", "--no-ext-diff", "--no-textconv", "-U3",
+                 "--inter-hunk-context=0", rev_range], repo_dir, text=False).stdout
     out = _run(["git", "patch-id", "--verbatim"], repo_dir, input=diff, text=False).stdout.split()
     return out[0].decode() if out else ""
-
-
-def bases(root, batch_id, pairs, hd) -> dict:
-    """{repo: merge-base} recorded by the latest `foremind review` (§20 I48), kept only where the head recorded with
-    it is the current head `hd` or an ancestor of it: a worktree reset elsewhere (onto the target, say) has no base.
-    {} if review was never requested."""
-    e = next((e for e in reversed(review.all_events(root))
-              if e["type"] == "review_requested" and e.get("batch") == batch_id), None)
-    if not e:
-        return {}
-    rec, old = e.get("bases") or {}, e.get("heads") or {}
-    return {r.id: rec[r.id] for r, wt in pairs
-            if rec.get(r.id) and old.get(r.id) and is_ancestor(wt, old[r.id], hd[r.id])}
 
 
 def merged(repo, wt, head, cfg, base) -> bool:
@@ -163,18 +143,19 @@ def manifest_need(path, old, new) -> int:
 
 
 def _approved_categories(root, batch_id, qpath) -> set:
-    """Categories of approved decisions whose exemption for this batch covers `qpath` (§8.2)."""
+    """Categories of approved decisions whose unexpired exemption for this batch covers `qpath` (§8.2)."""
     # ponytail: an exemption is only issued on approval, so exemption + decision state = approved; precedents: M2-1
-    cats = set()
+    cats, now = set(), datetime.now(timezone.utc)
     for p in sorted((state_dir(root) / "exemptions").glob("Q-*.json")):
         try:
             ex = json.loads(p.read_text(encoding="utf-8"))
             q = json.loads((state_dir(root) / "decisions" / p.name).read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if schemas.validate("exemption", ex) or schemas.validate("pending", q) or ex["batch"] != batch_id:
+        if (schemas.validate("exemption", ex) or schemas.validate("pending", q) or ex["batch"] != batch_id
+                or datetime.fromisoformat(ex["expires_at"]) <= now):
             continue
-        if q.get("state") in APPROVED_Q and any(fnmatchcase(qpath, g) for g in ex["match"].get("paths", [])):
+        if q.get("state") in APPROVED_Q and pathmatch.owns(qpath, ex["match"].get("paths", [])):
             cats.add(q["category"])
     return cats
 
@@ -225,6 +206,15 @@ def _receipt_checks(root, batch_id, hd, diverged, add) -> bool:
     if r["scope"] == "delta" and not any(x["scope"] == "full" and x["verdict"] == "approved"
                                          for x in review.load_receipts(root, batch_id)[:-1]):
         probs.append("delta approval without an approved full review")
+    if r["scope"] == "incremental":  # REQ-6; a rebound copy (§7.6) is checked as the receipt it copies (r1 #1)
+        chain = review.load_receipts(root, batch_id)
+        i = len(chain) - 1
+        if "rebound_from" in r:
+            i = next((j for j in range(i - 1, -1, -1) if chain[j]["heads"] == r["rebound_from"]), 0)
+        if i < 1 or r["delta_from"] != chain[i - 1]["heads"]:
+            probs.append("incremental receipt whose delta_from is not the previous receipt's heads")
+        elif not review.full_behind(chain):
+            probs.append("incremental receipt with no full review down its delta_from chain")
     if diverged:  # §7.5: the remote holds something else than what was reviewed
         probs.append(f"the remote branch diverged from the reviewed head in {diverged}: receipt void; merge the "
                      "remote branch into the worktree (a new head), then request the review again")
@@ -232,14 +222,21 @@ def _receipt_checks(root, batch_id, hd, diverged, add) -> bool:
     evs = review.all_events(root)
     impl = r["reviewer_session"] in _implementers(root, batch_id, evs)
     add("reviewer", not impl, f"reviewer {r['reviewer_session']}" + (" also implemented this batch" if impl else ""))
-    sha = sha256_bytes(data)
-    starts = [e for e in evs if e["type"] == "review_started" and e.get("phase") == "intent"
-              and e.get("batch") == batch_id and e.get("reviewer_session") == r["reviewer_session"]]
-    ok = any(e["type"] == "review_receipt" and e.get("batch") == batch_id and e.get("path") == path.name
-             and e.get("sha256") == sha and e.get("reviewer_session") == r["reviewer_session"] for e in evs) \
-        and any(s.get("heads") == r.get("rebound_from", r["heads"]) for s in starts)
+    ok = receipt_backed(evs, batch_id, path.name, data, r)
     add("receipt_event", ok, "" if ok else "receipt does not match a review started by the program")
     return not probs and not impl and ok
+
+
+def receipt_backed(evs, batch_id, name, data, r) -> bool:
+    """The receipt file `name` (bytes `data`, parsed `r`) has its review_receipt event (path, sha256, reviewer), and
+    that reviewer's review was started by the program on the heads the receipt was reviewed at (`rebound_from` for
+    a rebound copy, §7.6)."""
+    sha = sha256_bytes(data)
+    return any(e["type"] == "review_receipt" and e.get("batch") == batch_id and e.get("path") == name
+               and e.get("sha256") == sha and e.get("reviewer_session") == r["reviewer_session"] for e in evs) \
+        and any(e["type"] == "review_started" and e.get("phase") == "intent" and e.get("batch") == batch_id
+                and e.get("reviewer_session") == r["reviewer_session"]
+                and e.get("heads") == r.get("rebound_from", r["heads"]) for e in evs)
 
 
 def _local_check(root, batch_id, cfg, h, hd, kind, add, *, may_run, rerun):
@@ -247,7 +244,8 @@ def _local_check(root, batch_id, cfg, h, hd, kind, add, *, may_run, rerun):
     cmds = acceptance.commands(h, cfg, kind)
     if not cmds:
         return add(name, True, "no [gate].checks configured")
-    want = [acceptance.command_text(c) for c in cmds]
+    want = [(acceptance.command_text(c), acceptance.command_repo(c, h["repos"])) for c in cmds]
+    ran = lambda res: [(c.get("command"), c.get("repo")) for c in res.get("commands", [])]  # noqa: E731
     path = acceptance.result_path(root, batch_id, kind, hd)
 
     def read():
@@ -261,8 +259,9 @@ def _local_check(root, batch_id, cfg, h, hd, kind, add, *, may_run, rerun):
         return data, res, bool(runs) and runs[-1].get("sha256") == sha256_bytes(data)
 
     data, res, recorded = read()
-    # a file without its run record (a crash between the two, or an edit) is stale too: rerunning is safe
-    stale = not recorded or not isinstance(res, dict) or [c.get("command") for c in res.get("commands", [])] != want
+    # a file without its run record (a crash between the two, or an edit) is stale too: rerunning is safe; so is one
+    # from before results recorded their repo
+    stale = not recorded or not isinstance(res, dict) or ran(res) != want
     if may_run and (rerun or stale):
         acceptance.run(root, batch_id, cfg, kind)
         data, res, recorded = read()
@@ -273,8 +272,8 @@ def _local_check(root, batch_id, cfg, h, hd, kind, add, *, may_run, rerun):
     if not errs:
         if res["heads"] != hd:
             probs.append("heads differ")
-        if [c["command"] for c in res["commands"]] != want:
-            probs.append("commands changed since the run")
+        if ran(res) != want:
+            probs.append("commands or their repos changed since the run")
         if failed := [c["command"] for c in res["commands"] if c["exit_code"] != 0]:
             probs.append(f"failed: {failed}")
     if not recorded:
@@ -282,14 +281,40 @@ def _local_check(root, batch_id, cfg, h, hd, kind, add, *, may_run, rerun):
     add(name, not probs, "; ".join(probs) or f"{len(want)} passed")
 
 
-def _ci(wt, sha) -> tuple[str, str]:
+def required_checks(root, repo_id) -> list[str] | None:
+    """Required check names on the repo's target branch, as `init` / `doctor --rescan` detected them into
+    delivery.proposal.json (install.detect); None when unknown (no proposal, unreadable, or "unknown")."""
+    try:
+        prop = json.loads((state_dir(root) / "delivery.proposal.json").read_text(encoding="utf-8"))
+        v = prop["repos"][repo_id]["facts"]["required_checks"]["value"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return v if isinstance(v, list) and all(isinstance(x, str) for x in v) else None
+
+
+def _pages(wt, url, key=None) -> list:
+    """Every item of a paged host list: `?per_page=100&page=n` until a page comes back short; past MAX_PAGES full
+    pages FlowError ends the gate run (and releases its lock) instead of paging on."""
+    out = []
+    for n in range(1, MAX_PAGES + 1):
+        page = json.loads(gh(wt, "api", f"{url}?per_page=100&page={n}") or ("{}" if key else "[]"))
+        items = (page.get(key, []) if isinstance(page, dict) else None) if key else page
+        if not isinstance(items, list):
+            raise ValueError(f"{url} page {n}: not a list")
+        out += items
+        if len(items) < 100:
+            return out
+    raise FlowError(f"{url}: more than {MAX_PAGES} pages of 100")
+
+
+def _ci(wt, sha, required=None) -> tuple[str, str]:
     """('success' | 'pending' | 'failure', detail) of the host's checks on this exact SHA; per check name only the
-    latest run counts (a re-run turning red to green on the same SHA passes). Our own foremind/gate is ignored."""
-    # ponytail: first 100 check runs and statuses; paginate if a repo ever has more
+    latest run counts (a re-run turning red to green on the same SHA passes). Our own foremind/gate is ignored.
+    A `required` check name (branch protection) that has not reported on the SHA yet is pending."""
     base = f"repos/{{owner}}/{{repo}}/commits/{sha}"
     try:
-        runs = json.loads(gh(wt, "api", f"{base}/check-runs?per_page=100") or "{}").get("check_runs", [])
-        stats = json.loads(gh(wt, "api", f"{base}/statuses?per_page=100") or "[]")
+        runs = _pages(wt, f"{base}/check-runs", "check_runs")
+        stats = _pages(wt, f"{base}/statuses")
     except ValueError as e:
         return "failure", f"unreadable CI answer: {e}"
     latest = {}
@@ -302,16 +327,19 @@ def _ci(wt, sha) -> tuple[str, str]:
             st = s.get("state") if s.get("state") in ("success", "pending") else "failure"
             latest.setdefault(f"status {s.get('context')}", []).append((s.get("id", 0), st))
     now = {k: max(v)[1] for k, v in latest.items()}
-    if not now:
-        return "pending", "no CI results yet"
     if bad := sorted(k for k, v in now.items() if v == "failure"):
         return "failure", f"failed: {bad}"
+    seen = {c.get("name") for c in runs} | {s.get("context") for s in stats}
+    if missing := sorted(set(required or ()) - seen - {GATE_CONTEXT}):  # foremind/gate is written after this
+        return "pending", f"required checks not reported yet: {missing}"
+    if not now:
+        return "pending", "no CI results yet"
     if wait := sorted(k for k, v in now.items() if v == "pending"):
         return "pending", f"waiting: {wait}"
     return "success", f"{len(now)} green"
 
 
-def _ci_check(cfg, repo, wt, sha, phase, has_checks) -> tuple:
+def _ci_check(root, cfg, repo, wt, sha, phase, has_checks) -> tuple:
     """(name, ok, detail, pending) for one repo's [gate].ci (DESIGN §7.3)."""
     mode, name = review.ci_mode(cfg, repo.id), f"ci:{repo.id}"
     if mode not in ("local_first", "required", "none"):
@@ -319,14 +347,16 @@ def _ci_check(cfg, repo, wt, sha, phase, has_checks) -> tuple:
     if mode == "none":
         detail = "none: local checks only" if has_checks else "[gate].ci none needs [gate].checks"
         return name, has_checks, detail, False
-    if not review.push_by_system(cfg, repo.id):
-        return name, True, "#23 is the user's: local checks stand in for CI", False
+    if not review.push_by_system(cfg, repo.id):  # N13: nothing to stand in without [gate].checks
+        detail = "#23 is the user's: local checks stand in for CI" if has_checks else \
+            "#23 is the user's: local checks stand in for CI, and [gate].checks is empty"
+        return name, has_checks, detail, False
     if mode == "local_first" and phase == "approval":
         return name, True, "local_first: local checks during review rounds", False
     br = review.branch(wt)
     if mode == "local_first" and (pr := review.pr_view(wt, br)) and pr.get("isDraft"):
         gh(wt, "pr", "ready", br)  # the one CI run, now that the last round passed
-    st, detail = _ci(wt, sha)
+    st, detail = _ci(wt, sha, required_checks(root, repo.id))
     return name, st == "success", f"{mode}: {detail}", st == "pending"
 
 
@@ -397,33 +427,78 @@ def _merge_one(root, batch_id, repo, wt, head, cfg, base):
         env = {"FOREMIND_BATCH": batch_id, "FOREMIND_REPO": repo.id, "FOREMIND_REPO_PATH": str(repo.path),
                "FOREMIND_HEAD": head, "FOREMIND_BRANCH": br, "FOREMIND_TARGET": review.target_branch(repo, cfg)}
         jid = job.start(jobs, ["/bin/sh", "-c", value], cwd=wt, env=env,
-                        timeout_s=int(cfg.get("oneshot.timeout_min", 30)) * 60)
+                        timeout_s=int(cfg.get("oneshot.timeout_min", TABLE["oneshot.timeout_min"])) * 60)
         if (code := acceptance.wait(jobs, jid).get("exit_code")) != 0:
             raise FlowError(f"{repo.id}: merge_command exited {code} (output in {jobs / jid})")
     else:
         gh(wt, "pr", "merge", br, f"--{value}", "--match-head-commit", head)
     if not merged(repo, wt, head, cfg, base):
+        # N4: where the target requires a merge queue, `gh pr merge` only queues the PR (or turns auto-merge on until
+        # the required checks pass): a PR still open at the reviewed head waits there, it did not fail to merge
+        if kind == "gh" and _open_at(review.pr_view(wt, br), head):
+            ev.append("merge_queued", batch=batch_id, repo=repo.id, head=head)
+            return False
         ev.append("merge_unverified", batch=batch_id, repo=repo.id, head=head, severity="P0")
         raise FlowError(f"{repo.id}: the merge reported success but {head} is not in the target (P0)")
     ev.append("merge", dedupe_id=dedupe, batch=batch_id, repo=repo.id, head=head)
+    return True
 
 
-def _merge_group(root, batch_id, pairs, hd, cfg, bs, already, pre):
+def _open_at(pr, head) -> bool:
+    return bool(pr) and pr.get("state") == "OPEN" and pr.get("headRefOid") == head
+
+
+def _queued(root, batch_id, pairs, hd) -> set:
+    """Repos a gate run left in the host's merge queue at their current head (`merge_queued`) whose PR is still open
+    there: past their merge, waiting on the host; a later run or L0 reconcile sees them merged."""
+    # ponytail: a PR the queue dropped (red checks) still reads as queued; gh pr view has no queue field
+    # (isInMergeQueue is GraphQL only): ask `gh api graphql` if that bites
+    ids = {(e.get("repo"), e.get("head")) for e in review.all_events(root)
+           if e["type"] == "merge_queued" and e.get("batch") == batch_id}
+    return {r.id for r, wt in pairs if (r.id, hd[r.id]) in ids and _open_at(review.pr_view(wt, review.branch(wt)),
+                                                                             hd[r.id])}
+
+
+def _unmergeable(cfg, pairs) -> list[str]:
+    """N3: repos merging through `gh pr merge` whose PR the host does not find mergeable (mergeStateStatus), each
+    with its status. Asked after foremind/gate is written: a branch protection requiring it reads BLOCKED before.
+    The host recomputes the status after that write: UNKNOWN or BLOCKED is asked again SETTLE_TRIES times in all."""
+    bad = []
+    for r, wt in pairs:
+        if (_merge_way(cfg, r) or ("",))[0] != "gh":
+            continue
+        for n in range(SETTLE_TRIES):
+            if n:
+                time.sleep(SETTLE_S)
+            p = _run(["gh", "pr", "view", review.branch(wt), "--json", "mergeStateStatus"], wt, check=False)
+            try:
+                st = json.loads(p.stdout).get("mergeStateStatus") if p.returncode == 0 else None
+            except (ValueError, AttributeError):
+                st = None
+            if st not in ("UNKNOWN", "BLOCKED"):
+                break
+        if st not in MERGEABLE:
+            bad.append(f"{r.id} {st or p.stderr.strip() or 'no answer'}")
+    return bad
+
+
+def _merge_group(root, batch_id, pairs, hd, cfg, bs, skip, pre) -> list[str]:
     """A batch's repos are one merge group (§1.8): all checks passed before the first merge; a failure after some
-    merged is recorded as partially_merged (P0) and never rolled back automatically. `already`: repos merged before
-    this run (a rerun finishes a group cut short); a repo without a recorded base checks its merge against `pre`,
-    its merge-base with the target taken before this run merged anything."""
-    done = []
+    merged is recorded as partially_merged (P0) and never rolled back automatically. `skip`: repos merged or queued
+    before this run (a rerun finishes a group cut short); a repo without a recorded base checks its merge against
+    `pre`, its merge-base with the target taken before this run merged anything. Returns the repos it queued."""
+    done, queued = [], []
     for r, wt in pairs:
         try:
-            if r.id not in already:
-                _merge_one(root, batch_id, r, wt, hd[r.id], cfg, bs.get(r.id) or pre[r.id])
+            if r.id not in skip and not _merge_one(root, batch_id, r, wt, hd[r.id], cfg, bs.get(r.id) or pre[r.id]):
+                queued.append(r.id)
         except FlowError as e:
             if done:
                 review.events(root).append("merge_group_partial", batch=batch_id, merged=done, failed=r.id,
                                            error=str(e), severity="P0")
             raise
         done.append(r.id)
+    return queued
 
 
 def _remote_heads(pairs) -> dict:
@@ -451,12 +526,16 @@ def may_merge(role, session) -> bool:
     return role in MERGE_ROLES or (not role and not session)
 
 
+def batch_lock(root, batch_id):
+    """batches/<id>.gate.lock, not waited for (LockBusy): one gate or `foremind update` run per batch at a time."""
+    return file_lock(review.batch_path(root, batch_id).with_name(f"{batch_id}.gate.lock"), blocking=False)
+
+
 def run(root, batch_id, cfg, **kw) -> dict:
     """kw: role and session (the caller's FOREMIND_ROLE / FOREMIND_SESSION), rerun, merge."""
     with contextlib.ExitStack() as stack:
         try:  # two gates on one batch could both merge, or overwrite each other's acceptance results
-            stack.enter_context(file_lock(review.batch_path(root, batch_id).with_name(f"{batch_id}.gate.lock"),
-                                          blocking=False))
+            stack.enter_context(batch_lock(root, batch_id))
         except LockBusy:
             raise FlowError(f"{batch_id}: another gate run holds this batch; try again when it is done") from None
         return _gate(root, batch_id, cfg, **kw)
@@ -472,7 +551,12 @@ def _gate(root, batch_id, cfg, *, role=None, session=None, rerun=False, merge=Tr
     trefs = {r.id: review.target_ref(r, wt, cfg) for r, wt in pairs}
     remote = _remote_heads(pairs)
     wts = {r.id: wt for r, wt in pairs}
-    diverged = sorted(rid for rid, sha in remote.items() if sha and not is_ancestor(wts[rid], sha, hd[rid]))
+    # a remote still at a head our own `foremind update` replaced holds nothing new: stale, not diverged (§7.6)
+    replaced = {(rid, sha) for e in review.all_events(root)
+                if e["type"] == "batch_updated" and e.get("batch") == batch_id
+                for rid, sha in (e.get("prior_heads") or {}).items()}
+    diverged = sorted(rid for rid, sha in remote.items()
+                      if sha and (rid, sha) not in replaced and not is_ancestor(wts[rid], sha, hd[rid]))
     checks, pending = [], set()
 
     def add(name, ok, detail="", wait=False):
@@ -485,24 +569,25 @@ def _gate(root, batch_id, cfg, *, role=None, session=None, rerun=False, merge=Tr
         _local_check(root, batch_id, cfg, h, hd, kind, add, may_run=receipt_ok, rerun=rerun)
     diffs = _diffs(pairs, hd, trefs)
     outside = [f"{rid}:{f}" for rid, (_, files) in diffs.items() for f in files
-               if not any(fnmatchcase(f"{rid}:{f}", p) for p in h["owns_paths"])]
+               if not pathmatch.owns(f"{rid}:{f}", h["owns_paths"])]
     add("owns_paths", not outside, f"outside owns_paths: {outside}" if outside else "")
     waiting = _upstream(root, h)
     add("merge_after", not waiting, f"not merged yet: {waiting}" if waiting else "")
     deps = _dependency_problems(root, batch_id, pairs, hd, diffs)
     add("dependencies", not deps, "; ".join(deps))
-    levels = {r.id: review.repo_cfg(cfg, r.id, "level", "delivery.level", "done") for r, _ in pairs}
+    levels = {r.id: review.repo_cfg(cfg, r.id, "level", "delivery.level", TABLE["delivery.level"])
+              for r, _ in pairs}
     add("delivery", all(v in ("done", "merge_dev") for v in levels.values()), json.dumps(levels))
 
     has_checks = bool(cfg.get("gate.checks"))
-    ci = {r.id: _ci_check(cfg, r, wt, hd[r.id], "approval", has_checks) for r, wt in pairs}
+    ci = {r.id: _ci_check(root, cfg, r, wt, hd[r.id], "approval", has_checks) for r, wt in pairs}
     if st == "in_review" and all(c["ok"] for c in checks if c["name"] in APPROVAL) and all(c[1] for c in ci.values()):
         review.set_state(root, batch_id, "approved", expect=("in_review",), heads=hd)
         st = "approved"
     if st != "in_review" and all(c["ok"] for c in checks):  # local_first: its one CI run starts only now
         for r, wt in pairs:
             if review.ci_mode(cfg, r.id) == "local_first":
-                ci[r.id] = _ci_check(cfg, r, wt, hd[r.id], "delivery", has_checks)
+                ci[r.id] = _ci_check(root, cfg, r, wt, hd[r.id], "delivery", has_checks)
     for name, ok, detail, wait in ci.values():
         add(name, ok, detail, wait)
     merging = merge and all(v == "merge_dev" for v in levels.values())
@@ -510,16 +595,53 @@ def _gate(root, batch_id, cfg, *, role=None, session=None, rerun=False, merge=Tr
         bs = bases(root, batch_id, pairs, hd)
         # repos merged by an earlier run are past these checks (behind the target, branch deleted by the host)
         already = {r.id for r, wt in pairs if merged(r, wt, hd[r.id], cfg, bs.get(r.id))}
-        todo = [(r, wt) for r, wt in pairs if r.id not in already]
+        queued = _queued(root, batch_id, [(r, wt) for r, wt in pairs if r.id not in already], hd)
+        todo = [(r, wt) for r, wt in pairs if r.id not in already | queued]
         who = role or (f"none, in session {session}" if session else "user")
         add("role", may_merge(role, session), f"caller role {who}")
         stuck = [r.id for r, _ in todo if not _merge_way(cfg, r)]
         add("merge_way", not stuck, f"no merge_command, and no PR with a merge_method: {stuck}" if stuck else "")
         behind = [r.id for r, wt in todo if not is_ancestor(wt, trefs[r.id], hd[r.id])]
-        add("up_to_date", not behind, f"behind the target, update first (§7.6): {behind}" if behind else "")
-        unpushed = sorted(rid for rid, sha in remote.items() if rid not in already and sha != hd[rid])
+        add("up_to_date", not behind,
+            f"behind the target: run `foremind update {batch_id}` first (§7.6): {behind}" if behind else "")
+        unpushed = sorted(rid for rid, sha in remote.items() if rid not in already | queued and sha != hd[rid])
         add("pushed", not unpushed, f"push the reviewed head first: {unpushed}" if unpushed else "")
 
+    result, path = _record(root, batch_id, hd, checks, pending)
+
+    # §20 I49: the state this run ends in decides the status, so success never precedes the pre-delivery audit
+    failing = [c["name"] for c in checks if not c["ok"]]
+    after = st
+    if not failing and st == "approved":
+        after = "awaiting_audit" if pre_delivery_audit(h, cfg) else "delivered"
+    final = "merged" if not failing and after == "delivered" and merging else after
+    status = None  # merge prechecks alone leave the status as it is: a success stays (N9)
+    if gating := [f for f in failing if f not in MERGE_PRE]:
+        status = ("pending" if set(gating) <= pending else "failure"), f"failing: {', '.join(failing)}"
+    elif not failing:
+        status = ("success", "passed") if final in ("delivered", "merged") else \
+            ("pending", "awaiting pre-delivery audit")
+    warnings = _post_statuses(pairs, hd, remote, *status) if status else []
+
+    if after != st:
+        review.set_state(root, batch_id, after, expect=(st,), heads=hd)
+    if final != after:
+        if bad := _unmergeable(cfg, todo):  # N3: none of the group merges while one cannot
+            checks.append({"name": "mergeable", "ok": False, "detail": f"the host finds these not mergeable: {bad}"})
+            result, path = _record(root, batch_id, hd, checks, pending)
+            return {**result, "state": after, "path": str(path), "warnings": warnings}
+        waiting = sorted(queued | set(_merge_group(root, batch_id, pairs, hd, cfg, bs, already | queued,
+                                                   {rid: d[0] for rid, d in diffs.items()})))
+        if waiting:  # stays delivered; the next gate run or L0 reconcile finds the queue's merge
+            warnings.append(f"in the host's merge queue, not merged yet: {waiting}")
+            return {**result, "state": after, "path": str(path), "warnings": warnings}
+        review.set_state(root, batch_id, final, expect=(after,), heads=hd)
+    return {**result, "state": final, "path": str(path), "warnings": warnings}
+
+
+def _record(root, batch_id, hd, checks, pending) -> tuple:
+    """Writes batches/<id>.gate.<heads-hash>.json and its `gate_result` event, which also names the failing checks
+    and the pending ones (the update phase reads them)."""
     result = {"batch": batch_id, "heads": hd, "checks": checks,
               "verdict": "pass" if all(c["ok"] for c in checks) else "fail"}
     if errs := schemas.validate("gate_result", result):
@@ -528,27 +650,9 @@ def _gate(root, batch_id, cfg, *, role=None, session=None, rerun=False, merge=Tr
     path = state_dir(root) / "batches" / f"{batch_id}.gate.{review.heads_hash(hd)}.json"
     atomic_write(path, data)
     review.events(root).append("gate_result", batch=batch_id, heads=hd, path=path.name,
-                               sha256=sha256_bytes(data.encode()), verdict=result["verdict"])
-
-    # §20 I49: the state this run ends in decides the status, so success never precedes the pre-delivery audit
-    failing = [c["name"] for c in checks if not c["ok"]]
-    after = st
-    if not failing and st == "approved":
-        after = "awaiting_audit" if pre_delivery_audit(h, cfg) else "delivered"
-    final = "merged" if not failing and after == "delivered" and merging else after
-    if failing:
-        status = ("pending" if set(failing) <= pending else "failure"), f"failing: {', '.join(failing)}"
-    else:
-        status = ("success", "passed") if final in ("delivered", "merged") else \
-            ("pending", "awaiting pre-delivery audit")
-    warnings = _post_statuses(pairs, hd, remote, *status)
-
-    if after != st:
-        review.set_state(root, batch_id, after, expect=(st,), heads=hd)
-    if final != after:
-        _merge_group(root, batch_id, pairs, hd, cfg, bs, already, {rid: d[0] for rid, d in diffs.items()})
-        review.set_state(root, batch_id, final, expect=(after,), heads=hd)
-    return {**result, "state": final, "path": str(path), "warnings": warnings}
+                               sha256=sha256_bytes(data.encode()), verdict=result["verdict"],
+                               failing=[c["name"] for c in checks if not c["ok"]], pending=sorted(pending))
+    return result, path
 
 
 # --- release-check ------------------------------------------------------------------------

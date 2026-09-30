@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from foremind.plan import coupling
+from foremind.plan import coupling, render
 from foremind.plan.validate import validate
 from test_plan_helpers import ProjectCase, header, make_plan
 
@@ -58,9 +58,31 @@ class CouplingTest(ProjectCase):
         self.assertIn("high coupling", r["warnings"][0])
         self.assertIn("needs merge_after", r["warnings"][1])
 
-    def test_no_repo_no_signal(self):
-        p = coupling.analyze(self.plan, {}, None)
-        self.assertEqual([c["ref"] + c["cochange"] for c in p], [0, 0, 0])
+    def test_no_repo_signals_unknown(self):
+        # nothing to analyse is unknown, not zero: C is the declared score alone
+        p = {(c["a"], c["b"]): c for c in coupling.analyze(self.plan, {}, None)}
+        self.assertEqual({(c["ref"], c["cochange"]) for c in p.values()}, {(None, None)})
+        self.assertEqual([(c["score"], c["tier"]) for c in p.values()], [(1.0, "high"), (0.0, "low"), (1.0, "high")])
+        r = validate(self.root, self.plan, coupling=list(p.values()))
+        self.assertIn("x.1 / x.2: C=1.00 (ref, cochange unknown), high coupling", r["warnings"][0])
+        self.assertIn("引用 未知 · 共改 未知 · 语义 1 → C=1.00 high", render.summary(self.plan, r))
+        self.assertIn("<td>未知</td>", render.html(self.plan, r))
+
+    def test_no_history_is_unknown(self):
+        # .py files to read but no commit in the last one touching either batch: ref known, cochange unknown
+        plan = make_plan("x", [header("x.1", ["main:pkg/c.py"]),
+                               header("x.2", ["main:pkg/__init__.py"],
+                                      coupling=[{"batch": "x.1", "score": 0.5, "reason": "r"}])])
+        (c,) = coupling.analyze(plan, {"main": self.repo}, {"plan.coupling.history": 1})
+        self.assertEqual((c["ref"], c["cochange"]), (0.0, None))
+        self.assertAlmostEqual(c["score"], 0.3 * 0.5 / 0.7, places=5)
+
+    def test_one_sided_is_unknown(self):
+        # x.2's files do not exist yet: neither imports nor history can say anything about the pair (m2a.9 r1)
+        plan = make_plan("x", [header("x.1", ["main:pkg/a.py"]),
+                               header("x.2", ["main:new/*"], coupling=[{"batch": "x.1", "score": 0.5, "reason": "r"}])])
+        (c,) = coupling.analyze(plan, {"main": self.repo})
+        self.assertEqual((c["ref"], c["cochange"], c["score"]), (None, None, 0.5))
 
 
 if __name__ == "__main__":

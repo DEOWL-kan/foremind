@@ -8,17 +8,25 @@ command (GIT_SSH_COMMAND, else `git config --global --includes core.sshCommand`,
 put that one in the global config or the environment. So is a per-directory one under `includeIf`: the one
 matching where the pass runs (if any) is used for every repository. `confirm-exit` is the user's: refused inside a Foremind
 session (§20 I52③)."""
+import contextlib
+import json
 import os
 import shlex
 import subprocess
 import sys
 import time
+from datetime import datetime
 
-from foremind import carriers, config, lock, review, seat, worktree
-from foremind.paths import ProjectNotFound, find_project_root
+from foremind import carriers, cli, config, lock, review, seat, worktree
+from foremind import notify as notifier
+from foremind.defaults import TABLE
+from foremind.events import EventLog
+from foremind.fsutil import atomic_write
+from foremind.paths import ProjectNotFound, find_project_root, state_dir
 from foremind.supervisor import tick as sv
 
 _ERRORS = (OSError, ProjectNotFound, ValueError, config.ConfigError, seat.SeatError)
+TRY = ("supervise", "--help")  # _reexec's try run
 
 
 def register(sub):
@@ -74,15 +82,35 @@ def _tick(args):
 
 
 def _supervise(args):
+    """Finding 23: records itself in supervisor.json; once the package's code changed and then held still for one
+    interval, tries the new code (`foremind supervise --help`, 30 s: it imports this module and the tick; the cli
+    skips a module that does not import) and re-executes itself on it (`supervisor_reexec`), else keeps the old code
+    (`supervisor_reexec_failed`, one notice per new fingerprint)."""
     try:
         root = find_project_root()
     except ProjectNotFound as e:
         return _fail("supervise", e)
+    env = dict(os.environ)  # as started: _unattended adds to GIT_SSH_COMMAND
+    env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(filter(None, [str(sv.PKG_PARENT),
+                                                                    *env.get("PYTHONPATH", "").split(os.pathsep)])))
+    argv = sv.fm("supervise")
     _unattended()
+    code = seen = sv.code_fingerprint()
+    failed = None
+    try:
+        atomic_write(sv.supervisor_path(root), json.dumps({
+            "pid": os.getpid(), "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "code": code, "argv": argv}))
+    except OSError as e:
+        return _fail("supervise", e)
     try:
         while True:
-            interval = sv.DEFAULTS["supervisor.tick_s"]
+            interval = TABLE["supervisor.tick_s"]
             try:
+                if (now := sv.code_fingerprint()) != code and now == seen and now != failed:  # after each sleep
+                    failed = now
+                    _reexec(root, argv, env, code, now)  # returns only when the new code does not run
+                seen = now
                 sv.tick(root)
                 interval = sv.setting(config.load(root), "supervisor.tick_s")
             except Exception as e:  # SF-3: one bad pass does not stop the loop
@@ -90,6 +118,31 @@ def _supervise(args):
             time.sleep(interval)
     except KeyboardInterrupt:
         return 0
+
+
+def _reexec(root, argv, env, frm, to):
+    log = EventLog(state_dir(root) / "events.jsonl")
+    try:
+        r = subprocess.run(sv.fm(*TRY), env=env, cwd=root, capture_output=True, text=True, timeout=30,
+                           stdin=subprocess.DEVNULL)
+        lines = r.stderr.strip().splitlines() or [""]  # the cli's skip line says more than argparse's invalid choice
+        err = None if r.returncode == 0 else (next((x for x in lines if x.startswith(cli.SKIPPED)), lines[-1])
+                                              or f"exit {r.returncode}")
+    except (OSError, subprocess.SubprocessError) as e:
+        err = str(e)
+    if err is None:
+        log.append("supervisor_reexec", **{"from": frm, "to": to})
+        print(f"foremind supervise: new code ({to}), re-executing", file=sys.stderr)
+        sys.stdout.flush()  # a pipe's buffer does not survive exec
+        try:
+            os.execve(sys.executable, argv, env)
+        except OSError as e:
+            err = f"exec: {e}"
+    log.append("supervisor_reexec_failed", **{"from": frm, "to": to}, error=err[-300:])
+    print(f"foremind supervise: new code does not run, keeping the old one: {err}", file=sys.stderr)
+    with contextlib.suppress(config.ConfigError, ValueError):  # a bad config: the tick records it
+        notifier.notify(root, config.load(root), f"supervisor_reexec_failed:{to}", "监督进程没能换上新代码",
+                        "新代码试跑失败，监督进程继续用旧代码；修好后它会再试。foremind doctor 可查看。")
 
 
 def _pause(args):
@@ -105,9 +158,14 @@ def _run(args):
     _unattended()
     try:
         root = find_project_root()
+        states = {b: seat.read_header(root, b).get("state") for b in args.batches}  # every id known before a move
+        for b in args.batches:  # m2b.6: a failed batch is retried from ready
+            if states[b] == "failed":
+                review.set_state(root, b, "ready", expect=("failed",))
+                review.events(root).append("batch_retried", batch=b, by=os.environ.get("FOREMIND_SESSION") or "user")
         sv.request_run(root, args.batches)
         return sv.tick(root)
-    except _ERRORS as e:
+    except (*_ERRORS, review.FlowError) as e:
         return _fail("run", e)
 
 

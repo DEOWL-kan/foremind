@@ -17,6 +17,7 @@ import re
 import tomllib
 from pathlib import Path
 
+from foremind.events import EventLog
 from foremind.fsutil import atomic_write, file_lock, sha256_bytes
 from foremind.install import tomlblock
 from foremind.paths import state_dir, user_config_dir
@@ -37,6 +38,14 @@ def path(d) -> Path:
 
 def _manifest(root, d) -> Path:
     return state_dir(root) / "install" / f"settings-{sha256_bytes(str(Path(d).resolve()).encode())[:12]}.json"
+
+
+def record(root, p, text) -> None:
+    """Before we write a #22 file (§9.2 L0): the hash of what it will hold (None: deleted), so L0 takes the change
+    as the program's, not as one without approval."""
+    EventLog(state_dir(root) / "events.jsonl").append(
+        "program_config_write", path=os.path.realpath(p), by="install",
+        sha256=None if text is None else sha256_bytes(text.encode("utf-8")))
 
 
 def ours(cmd) -> bool:
@@ -184,6 +193,7 @@ def install(root, d, consent=None) -> list[str]:
         data["statusLine"] = {**(sl or {}), "type": "command", "command": mine}
     new = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
     if raw is None or new.encode("utf-8") != raw:
+        record(root, p, new)
         atomic_write(p.resolve(), new)
     return notes
 
@@ -226,17 +236,22 @@ def uninstall(root, d) -> None:
             del data["statusLine"]
     if known and data == clean:
         if orig_text is None and p.is_symlink():
+            record(root, p, None)
             p.resolve().unlink(missing_ok=True)  # it was a dangling link: the link stays, dangling again
         elif orig_text is None:
+            record(root, p, None)
             p.unlink(missing_ok=True)
             try:
                 p.parent.rmdir()  # ponytail: an empty .claude/ the user made before us goes too
             except OSError:
                 pass
         elif raw != orig_text.encode("utf-8"):
+            record(root, p, orig_text)
             atomic_write(p.resolve(), orig_text)
     elif raw is not None and data != before:
-        atomic_write(p.resolve(), json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        new = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+        record(root, p, new)
+        atomic_write(p.resolve(), new)
     m.unlink(missing_ok=True)
 
 

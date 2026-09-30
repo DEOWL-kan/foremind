@@ -8,12 +8,17 @@ A new file is `template` plus the block; removing the block from it deletes the 
 Also used for `.git/info/exclude` (check=False: not TOML).
 """
 import json
+import re
+import sys
 import tomllib
 from datetime import datetime
 from pathlib import Path
 
 from foremind.fsutil import atomic_write, sha256_bytes
 from foremind.paths import user_config_dir
+
+
+BACKUPS_KEPT = 10  # per file: older backups of the same path are deleted
 
 
 class BlockError(Exception):
@@ -80,12 +85,21 @@ def value(v) -> str:
 
 
 def _backup(path, old: bytes):
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    atomic_write(user_config_dir() / "backups" / f"{path.name}.{sha256_bytes(str(path).encode())[:8]}.{stamp}.bak",
-                 old)
+    """Keeps the newest BACKUPS_KEPT of this path's backups (the fixed-width stamp sorts by time); other files stay."""
+    d, prefix = user_config_dir() / "backups", f"{path.name}.{sha256_bytes(str(path).encode())[:8]}."
+    atomic_write(d / f"{prefix}{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.bak", old)
+    try:
+        ours = sorted(p for p in d.iterdir()
+                      if p.name.startswith(prefix) and re.fullmatch(r"\d{8}-\d{6}-\d{6}\.bak", p.name[len(prefix):]))
+        for p in ours[:-BACKUPS_KEPT]:
+            p.unlink(missing_ok=True)
+    except OSError as e:  # a failed cleanup must not stop the write this backup is for
+        print(f"foremind: 旧备份没有删掉（{e}）", file=sys.stderr)
 
 
-def _write(path, old: bytes | None, new: str | None, check):
+def _write(path, old: bytes | None, new: str | None, check, before=None):
+    if before:
+        before(path, new)
     if old is not None:
         _backup(path, old)
     if new is None:
@@ -114,16 +128,17 @@ def _decode(path, old: bytes, check) -> str:
     return text
 
 
-def add(path, name, body, *, template="", check=True) -> None:
+def add(path, name, body, *, template="", check=True, before=None) -> None:
+    """`before(path, new text)` is called before the file is written (settings.record)."""
     path = Path(path).resolve()  # a symlink (dotfiles) stays a link; its target gets the block
     old = path.read_bytes() if path.exists() else None
     text = template if old is None else _decode(path, old, check)
     new = insert(text, name, body)
     if old is None or new.encode("utf-8") != old:
-        _write(path, old, new, check)
+        _write(path, old, new, check, before)
 
 
-def remove(path, name, *, template=None, check=True, dry_run=False) -> bool:
+def remove(path, name, *, template=None, check=True, dry_run=False, before=None) -> bool:
     """Delete the block; True if there was one. The file goes when nothing but `template` is left. `dry_run`: only
     raise what removing would."""
     path = Path(path).resolve()
@@ -134,5 +149,5 @@ def remove(path, name, *, template=None, check=True, dry_run=False) -> bool:
     new = strip(text, name)
     if new == text or dry_run:
         return new != text
-    _write(path, old, None if template is not None and new == template else new, check)
+    _write(path, old, None if template is not None and new == template else new, check, before)
     return True

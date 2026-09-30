@@ -2,14 +2,15 @@
 
 Program-written after a pending is approved. Valid for its batch and category until the batch is delivered or
 `expires_at`, whichever comes first (never counted per use): approving a #3 never releases a #22 or #7 hit, however
-wide its globs. Globs are fnmatch: `paths` against a path's repo-qualified
-(`<repo>:<path>`) or absolute form, `commands` against one command segment, `tools` against the tool name.
+wide its globs. Globs are fnmatch: `paths` against a path's repo-qualified (`<repo>:<path>`) or absolute form
+through pathmatch.owns, `commands` against one command segment, `tools` against the tool name.
 Files that fail the schema are ignored, never trusted.
 """
 import json
 from datetime import datetime, timezone
 from fnmatch import fnmatchcase
 
+from foremind import pathmatch
 from foremind.paths import state_dir
 from foremind.schemas import validate
 from foremind.state import BATCH_SIDE
@@ -36,6 +37,7 @@ def find(root, batch, kind, values, *, category, header=None, now=None) -> str |
         if (validate("exemption", ex) or ex["batch"] != batch or ex["category"] != category
                 or datetime.fromisoformat(ex["expires_at"]) <= now):
             continue
-        if any(fnmatchcase(v, g) for g in ex["match"].get(kind, ()) for v in values):
+        globs = ex["match"].get(kind, ())
+        if any(pathmatch.owns(v, globs) if kind == "paths" else any(fnmatchcase(v, g) for g in globs) for v in values):
             return p.stem
     return None

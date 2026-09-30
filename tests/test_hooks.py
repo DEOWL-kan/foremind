@@ -8,12 +8,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-from foremind import batchlog, handoff, header, heartbeat, hooks, inbox, schemas, seat, worktree
+from foremind import batchlog, config, handoff, header, heartbeat, hooks, inbox, schemas, seat, telemetry, worktree
 from foremind.events import EventLog
 from foremind.hooks import guard
 
@@ -43,6 +44,7 @@ class HookBase(unittest.TestCase):
         self.seat_env = {**self.base_env, "FOREMIND_PROJECT": str(self.root), "FOREMIND_SESSION": SESSION,
                          "FOREMIND_BATCH": BATCH, "FOREMIND_ROLE": "seat"}
         self.use_env(self.seat_env)
+        self.jobs = self.enterContext(mock.patch("foremind.job.start", return_value="job-1"))  # a new Q-n's push job
         self.wt = self.wt_of(BATCH)  # M1-4 layout: <wt root>/<project>/<batch>/<repo>
         (self.wt / "src").mkdir(parents=True)
         self.write_header()
@@ -309,12 +311,18 @@ class PreToolUseTest(HookBase):
     def test_bash_command_patterns(self):
         self.assertIsNone(self.run_hook("PreToolUse", self.data("PreToolUse-Bash")))  # echo done
         cmd = "cd web && FOO=1 sudo npm  install\tleft-pad | tee log"  # N-3: whitespace runs are one space
-        self.assert_denied(self.bash(cmd), "npm install left-pad")
+        raw = "FOO=1 sudo npm install left-pad"  # m2a.5.F1: what a request and an exemption name, prefixes kept
+        self.assert_denied(self.bash(cmd), raw)
         [ev] = self.events("pending_needed")
-        self.assertEqual((ev["kind"], ev["target"], ev["pattern"]), ("commands", ["npm install left-pad"], "npm install *"))
+        self.assertEqual((ev["kind"], ev["target"], ev["pattern"]), ("commands", [raw], "npm install *"))
         # Bash is never path-checked: writing a system file through the shell is left to gate/L0
         self.assertIsNone(self.bash("echo x > CLAUDE.md"))
         self.exemption("Q-6", {"commands": ["npm install left-*"]})
+        self.assertIsNone(self.bash("cd web && npm  install left-pad | tee log"))
+        self.assert_denied(self.bash(cmd), raw)  # VAR=value and sudo change what runs: not covered
+        for cmd2 in ("FOO=1 bash <<'EOF'\nnpm install left-pad\nEOF", "cat <<'EOF' | sudo sh\nnpm install left-pad\nEOF"):
+            self.assert_denied(self.bash(cmd2), "#4")  # m2b.2 r1: a heredoc body a shell reads keeps its reader
+        self.exemption("Q-7", {"commands": ["FOO=1 sudo npm install left-*"]})
         self.assertIsNone(self.bash(cmd))
         # an exemption for one segment does not cover another hit in the same command
         self.assert_denied(self.bash("npm install left-pad; npm publish"), "npm publish", "#20")
@@ -418,6 +426,52 @@ class PreToolUseTest(HookBase):
         self.assertIsNone(hooks.main("NoSuchEvent", "{}"))
         self.assertGreaterEqual(len(self.events("hook_error")), 4)
 
+    def test_a_call_after_stop_in_the_transcript_is_a_real_turn(self):  # REQ-15
+        def tool_use(tid, **kw):
+            return json.dumps({"type": "assistant", **kw, "message": {"content": [
+                {"type": "text", "text": "go on"}, {"type": "tool_use", "id": tid, "name": "Write", "input": {}}]}})
+
+        self.run_hook("Stop", {**self.data("Stop"), "stop_hook_active": False})
+        self.transcript.write_text("\n".join([
+            tool_use("toolu_real"), tool_use("toolu_side", isSidechain=True),
+            json.dumps({"type": "user", "message": {"content": "toolu_said is only mentioned"}})]) + "\n")
+        for tid in ("toolu_side", "toolu_said", "toolu_ghost"):
+            self.run_hook("PreToolUse", {**self.data("PreToolUse-Write", file_path=str(self.wt / "src/a.py")),
+                                         "tool_use_id": tid})
+        self.assertEqual((self.hb()["tool_open"], self.hb()["event"]), (False, "Stop"))
+        self.assertEqual([e["tool_use_id"] for e in self.events("tool_after_stop")],
+                         ["toolu_side", "toolu_said", "toolu_ghost"])
+        self.run_hook("PreToolUse", {**self.data("PreToolUse-Write", file_path=str(self.wt / "src/a.py")),
+                                     "tool_use_id": "toolu_real"})
+        self.assertEqual(self.hb()["open_tools"], ["toolu_real"])
+        self.assertEqual(len(self.events("tool_after_stop")), 3)
+        self.assertFalse(telemetry.has_tool_use(str(self.transcript), "toolu_real", tail=10))  # beyond the tail
+
+    def test_a_late_post_tool_use_confirms_a_tool_after_stop(self):  # REQ-12, m2c.7.F2
+        self.run_hook("Stop", {**self.data("Stop"), "stop_hook_active": False})
+        for tid in ("toolu_late", "toolu_other"):
+            self.run_hook("PreToolUse", {**self.data("PreToolUse-Write", file_path=str(self.wt / "src/a.py")),
+                                         "tool_use_id": tid})
+        self.run_hook("PostToolUse", {**self.data("PostToolUse-Write"), "tool_use_id": "toolu_late"})
+        self.run_hook("PostToolUse", {**self.data("PostToolUse-Write"), "tool_use_id": "toolu_other"})  # not Stop now
+        self.run_hook("PostToolUse", {**self.data("PostToolUse-Write"), "tool_use_id": "toolu_never"})
+        es = self.events("tool_after_stop_confirmed")
+        self.assertEqual([(e["session"], e["batch"], e["tool_use_id"]) for e in es],
+                         [(SESSION, BATCH, "toolu_late"), (SESSION, BATCH, "toolu_other")])
+
+
+    def test_parallel_calls_after_stop_all_get_confirmed(self):  # REQ-12: a turn's first calls come in parallel
+        from concurrent.futures import ThreadPoolExecutor
+        self.run_hook("Stop", {**self.data("Stop"), "stop_hook_active": False})
+        real = hooks._after_stop_ids
+        slow = lambda ctx: (time.sleep(0.05), real(ctx))[1]  # noqa: E731 — widens the read-then-write window
+        tids = [f"toolu_p{n}" for n in range(6)]
+        with mock.patch.object(hooks, "_after_stop_ids", slow), ThreadPoolExecutor(len(tids)) as pool:
+            list(pool.map(lambda t: self.run_hook("PreToolUse", {
+                **self.data("PreToolUse-Write", file_path=str(self.wt / "src/a.py")), "tool_use_id": t}), tids))
+        for t in tids:
+            self.run_hook("PostToolUse", {**self.data("PostToolUse-Write"), "tool_use_id": t})
+        self.assertEqual(sorted(e["tool_use_id"] for e in self.events("tool_after_stop_confirmed")), tids)
 
 class PostToolUseTest(HookBase):
     def test_refreshes_context_from_the_transcript_tail(self):  # SF-9, N-1
@@ -467,18 +521,57 @@ class SessionStartTest(HookBase):
         self.run_hook("SessionStart", resumed)
         self.assertEqual([e["source"] for e in self.events("session_bound")], ["startup", "resume"])
 
+    def test_records_the_messaging_socket(self):  # REQ-12
+        self.use_env({**self.seat_env, "CLAUDE_CODE_MESSAGING_SOCKET": "/tmp/cc.sock"})
+        self.run_hook("SessionStart", self.data("SessionStart"))
+        self.assertEqual(self.hb()["messaging_socket"], "/tmp/cc.sock")
+
     def l1(self):
         return self.run_hook("SessionStart", self.data("SessionStart"))["hookSpecificOutput"]["additionalContext"]
 
     def test_short_note_when_l1_unreadable(self):
         (self.state / "batches" / f"{BATCH}.md").unlink()
         self.assertIn("未能读取本批考纲", self.l1())
-        self.write_header()  # status only: say the handoff doc is missing
+        self.write_header()  # header and status only: say the handoff doc is missing, give the header points
         ctx = self.l1()
-        self.assertIn("未能读取交接文档", ctx)
-        self.assertIn("STATUS-MARK", ctx)
+        for s in ("未能读取交接文档", "## 批次头要点", '- owns_paths: ["api:src/*", "api:package.json"]',
+                  "- hard_block: []", "STATUS-MARK"):
+            self.assertIn(s, ctx)
+        self.assertNotIn("## 目标", ctx)  # no goal.md for plan auth
         (self.state / "batches" / f"{BATCH}.handoff.md").write_bytes(b"\xff\xfe not utf-8")  # SF-10
-        self.assertIn("未能读取交接文档", self.l1())
+        self.assertIn("## 批次头要点", self.l1())
+
+    def test_l1_falls_back_to_header_points_and_goal(self):  # finding 2
+        self.write_header(mode="auto", start_commands=["make test"], state="running", accept_commands=["make check"],
+                          must_read=[{"path": "api:src/a.py:1-9", "why": "MUST-READ"}],
+                          tools=[{"name": "rg", "step": "TOOL-STEP"}],
+                          tiers={"difficulty": "M", "effort": "high", "model": "NOT-SHOWN", "reason": "NOT-SHOWN"})
+        goal = self.state / "plans" / "auth" / "goal.md"
+        goal.parent.mkdir(parents=True)
+        goal.write_text("---\nsha256: FROZEN-HASH\n---\n# 目标\n\nGOAL-MARK REQ-1\n")
+        ctx = self.l1()
+        for s in ("## 批次头要点", "- mode: auto", '- start_commands: ["make test"]',
+                  '- tiers: {"difficulty": "M", "effort": "high"}', '- accept_commands: ["make check"]',
+                  '- must_read: [{"path": "api:src/a.py:1-9", "why": "MUST-READ"}]',
+                  '- tools: [{"name": "rg", "step": "TOOL-STEP"}]', "## 目标", "GOAL-MARK REQ-1", "STATUS-MARK"):
+            self.assertIn(s, ctx)
+        for s in ("NOT-SHOWN", "FROZEN-HASH", "- state:"):
+            self.assertNotIn(s, ctx)
+        goal.write_text("# 目标\nGOAL-HEAD\n" + "长" * 20_000)  # too long: the goal is cut, the rest stays whole
+        ctx = self.l1()
+        self.assertLessEqual(len(ctx.encode()), hooks.L1_MAX_BYTES)
+        for s in ("GOAL-HEAD", "目标超过 L1 上限", ".foremind/plans/auth/goal.md", "- mode: auto", "STATUS-MARK"):
+            self.assertIn(s, ctx)
+
+    def test_l1_status_skips_a_fenced_status_line(self):  # m2b.9 r1/r2 note: cut like plan.model.spec
+        (self.state / "batches" / f"{BATCH}.md").write_text(header.render(
+            {"id": BATCH, "plan_id": "auth", "repos": ["api"], "owns_paths": ["api:src/*"], "state": "running",
+             "hard_block": []},
+            f"\n# {BATCH}\n\n```\n## 状态\nFENCED-MARK\n```\n\n## 状态\n\nREAL-MARK\n\n## 备注\n\nNOT-STATUS\n"))
+        status = self.l1().split("## 状态区", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("REAL-MARK", status)
+        self.assertNotIn("FENCED-MARK", status)
+        self.assertNotIn("NOT-STATUS", status)
 
     def test_l1_is_capped(self):  # N-10
         (self.state / "batches" / f"{BATCH}.handoff.md").write_text("HEAD-MARK\n" + "长" * 20_000)
@@ -495,6 +588,14 @@ class SessionStartTest(HookBase):
         self.assertIn("未通过校验，交接段未注入", ctx)
         self.assertNotIn('"goal"', ctx)
         self.assertTrue(any("LogRewritten" in e["error"] for e in self.events("hook_error")))
+
+    def test_df_index_only_from_the_recorded_length(self):  # m2b.8 item 5
+        batchlog.append(self.root, BATCH, f"- {BATCH}.D1 · a · b · c · #1 · p", author=SESSION)
+        with open(self.state / "batches" / f"{BATCH}.log.md", "a") as f:  # verify() still passes: a longer file
+            f.write(f"- {BATCH}.D2 · UNRECORDED · b · c · #1 · p\n")
+        ctx = self.l1()
+        self.assertIn(f"{BATCH}.D1", ctx)
+        self.assertNotIn("UNRECORDED", ctx)
 
     def test_session_without_batch_gets_heartbeat_only(self):
         self.use_env({**self.base_env, "FOREMIND_PROJECT": str(self.root), "FOREMIND_SESSION": "fm-shop-controller-1",
@@ -518,11 +619,22 @@ class StopTest(HookBase):
         out = self.stop()
         self.assertEqual(out["decision"], "block")
         self.assertIn("硬阈值", out["reason"])
+        self.assertNotIn("早于本次请求", out["reason"])
         self.assertTrue(self.hb()["handoff_requested"])
+        self.assertEqual(self.hb()["transcript_path"], str(self.transcript))  # for stuck.py (m2c.2)
         self.assertIsNone(self.stop(active=True))  # the continued turn may stop
         self.assertEqual(self.stop()["decision"], "block")  # a later turn is blocked again
         snap = json.loads((self.state / "telemetry" / f"{SESSION}.context.json").read_text())
         self.assertEqual(snap["context_tokens"], 170_000)
+
+    def test_a_section_written_before_the_request_is_asked_again(self):  # finding 32
+        self.handoff_section("written just before the request")
+        at = self.events("handoff_written")[0]["ts"]
+        self.usage(170_000)
+        reason = self.stop()["reason"]
+        self.assertIn(f"你在 {at} 写的交接段早于本次请求，不作数；现在用 `foremind handoff --write` 再写一次", reason)
+        self.assertIsNone(self.stop(active=True))
+        self.assertNotIn("早于本次请求", self.stop()["reason"], "only the first request says it")
 
     def test_bookkeeping_failures_never_undo_a_block(self):  # MF-1
         self.usage(170_000)
@@ -549,10 +661,41 @@ class StopTest(HookBase):
         self.assertIn("硬阈值", self.stop()["reason"])
 
     def test_soft_threshold_under_the_absolute_cap(self):  # SF-9: a 1M window is capped at 180k, soft scales down
-        self.assertEqual(hooks.budget({"context.window_tokens": 1_000_000}), (146_250, 180_000))
+        self.assertEqual(hooks.budget({"context.window_tokens": 1_000_000}, "seat", None), (146_250, 180_000))
         self.user_config("[context]\nwindow_tokens = 1000000\n")
         self.usage(150_000)
         self.assertIn("软阈值 146250", self.stop()["reason"])
+
+    def test_budget_by_role_and_model(self):  # m2b.8 item 4
+        cfg = {"context.hard_pct": 50, "context.abs_cap_tokens": 90_000, "context.by_role": {
+            "seat": {"hard_pct": 60, "claude-opus-5-5": {"window_tokens": 100_000, "soft_pct": 30}},
+            "controller": {"claude-opus-5-5": "not a table"}}}
+        self.assertEqual(hooks.budget(cfg, "seat", "claude-opus-5-5"), (30_000, 60_000))  # model, role, then flat
+        self.assertEqual(hooks.budget(cfg, "seat", "other")[1], 90_000)  # role's 60% of 200k, under the flat cap
+        self.assertEqual(hooks.budget(cfg, "controller", "claude-opus-5-5")[1], 90_000)  # 50% of 200k = 100k, capped
+        self.assertEqual(hooks.budget(cfg, None, None), hooks.budget(cfg, "planner", "claude-opus-5-5"))
+
+    def test_budget_by_role_merges_key_by_key_across_layers(self):  # m2b.8 r1-r3 note: controller registration
+        self.user_config('[context.by_role.seat."claude-opus-5-5"]\nabs_cap_tokens = 50000\n')
+        (self.root / ".foremind" / "config.toml").write_text('[context.by_role.seat]\nhard_pct = 60\n')
+        cfg = config.load(self.root)
+        self.assertEqual(cfg["context.by_role.seat.claude-opus-5-5.abs_cap_tokens"], 50000)  # not replaced
+        self.assertEqual(cfg["context.by_role.seat.hard_pct"], 60)
+        self.assertEqual(hooks.budget(cfg, "seat", "claude-opus-5-5")[1], 50_000)  # the user's model cap survives
+        self.assertEqual(hooks.budget(cfg, "seat", "other")[1], 120_000)  # the project's role hard_pct: 60% of 200k
+
+    def test_model_from_the_status_line_else_the_launch(self):
+        self.user_config('[context.by_role.seat."claude-opus-5-5"]\nabs_cap_tokens = 50000\n')
+        self.usage(60_000)
+        self.assertIsNone(self.stop(), "model unknown: the flat keys (160k)")
+        EventLog(self.state / "events.jsonl").append("seat_launch", phase="intent", dedupe_id="seat_launch:x",
+                                                     session=SESSION, model="claude-opus-5-5")
+        self.assertIn("硬阈值（有效预算 50000）", self.stop()["reason"])
+        tel = self.state / "telemetry" / f"{SESSION}.statusline.json"
+        tel.write_text(json.dumps({"model": {"id": "claude-fable-5-1", "display_name": "Fable"}}))
+        self.assertEqual(hooks._model(self.root, SESSION), "claude-fable-5-1")  # what runs now wins
+        tel.write_text(json.dumps({"model": {"id": "claude-opus-5-5[1m]"}}))  # spelled otherwise: no entry
+        self.assertIn("硬阈值（有效预算 50000）", self.stop()["reason"])  # the launch model's entry
 
     def test_inbox_delivery(self):
         inbox.append(SESSION, "msg A", sender="controller", root=self.root)
@@ -581,9 +724,30 @@ class StopTest(HookBase):
         self.assertEqual((self.hb()["tool_open"], self.hb()["open_tools"]), (False, []))
 
 
+class StopFailureTest(HookBase):  # REQ-11
+    def test_records_the_error_type(self):
+        d = {**self.data("Stop"), "hook_event_name": "StopFailure", "error": "rate_limit"}
+        self.assertIsNone(self.run_hook("StopFailure", d))
+        self.assertEqual(self.hb()["api_error"]["type"], "rate_limit")
+        self.assertNotEqual(self.hb().get("event"), "StopFailure")  # the last turn hook stays for the supervisor
+        del d["error"]
+        self.run_hook("StopFailure", {**d, "error_type": "overloaded"})
+        self.run_hook("StopFailure", d)
+        self.assertEqual([(e["session"], e["batch"], e["error_type"]) for e in self.events("api_error")],
+                         [(SESSION, BATCH, t) for t in ("rate_limit", "overloaded", "unknown")])
+        self.assertIn("at", self.hb()["api_error"])
+
+    def test_not_a_foremind_session(self):
+        self.use_env(self.base_env)
+        self.assertIsNone(self.run_hook("StopFailure", {**self.data("Stop"), "error": "rate_limit"}))
+        self.assertEqual(self.events("api_error"), [])
+
+
 class UserPromptSubmitTest(HookBase):
     def test_presence_skips_program_deliveries(self):
         self.use_env(self.base_env)  # the user's own session
+        now = hooks.time.time()
+        clock = self.enterContext(mock.patch.object(hooks.time, "time", return_value=now))
         d = self.data("UserPromptSubmit", self.root)
         d["prompt"] = "  第一行\r\n第二行\r第三行 \n"
         self.assertIsNone(self.run_hook("UserPromptSubmit", d))
@@ -594,7 +758,14 @@ class UserPromptSubmitTest(HookBase):
         self.assertEqual(len(self.events("user_present")), 1)
         with mock.patch.object(hooks, "DELIVERY_WINDOW", timedelta(seconds=-60)):  # delivery too old to match
             self.run_hook("UserPromptSubmit", d)
-        self.assertEqual(len(self.events("user_present")), 2)
+            self.assertEqual(len(self.events("user_present")), 1)  # finding 8: once per session and 10 minutes
+            clock.return_value = now + 600
+            self.run_hook("UserPromptSubmit", d)
+            self.run_hook("UserPromptSubmit", {**d, "session_id": "another-agent-session"})
+        found = self.events("user_present")
+        self.assertEqual(len(found), 3)
+        self.assertNotIn("session", found[0])
+        self.assertEqual(found[2]["agent_session_id"], "another-agent-session")
 
     def test_foremind_sessions_are_never_presence(self):  # SF-5
         self.assertIsNone(self.run_hook("UserPromptSubmit", self.data("UserPromptSubmit")))

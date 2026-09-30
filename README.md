@@ -1,6 +1,6 @@
 # Foremind
 
-> Run an AI development team from one seat. Foremind plans work into batches, opens AI coding sessions ("seats") for them, hands work over between sessions, gets every change reviewed by a separate read-only reviewer, and only merges through a mechanical gate. Pure Python standard library, state lives in files and git. **Status: early alpha (milestone M1 of 3), macOS + Claude Code first.** Documentation is in Chinese.
+> Run an AI development team from one seat. Foremind plans work into batches, opens AI coding sessions ("seats") for them, hands work over between sessions, gets every change reviewed by a separate read-only reviewer, and only merges through a mechanical gate. Pure Python standard library, state lives in files and git. **Status: alpha (milestones M1 and M2 done, M3 packaging next), macOS + Claude Code first.** Documentation is in Chinese.
 
 Foremind 是一个让**一个人带一支 AI 开发团队**的本地开发系统：把需求拆成互不冲突的批次，为每批开一个 AI 编码会话（席位），会话满了自动交接给新会话，每次改动都由另一个只读的审查者零上下文审查，最后只能经过程序化的门禁合入。
 
@@ -8,7 +8,7 @@ Foremind 是一个让**一个人带一支 AI 开发团队**的本地开发系统
 - 状态都在文件和 git 里（项目下的 `.foremind/`），没有数据库和常驻网络服务；监督进程是本地进程。
 - 首发平台：macOS + [Claude Code](https://docs.claude.com/en/docs/claude-code)；Codex 支持在路线图里。
 
-> **现状：早期 alpha。** 已完成里程碑 M1（核心可用），M2（完整治理）与 M3（打包与试运行）尚未开始。接口和文件格式还会变，请勿用于重要项目。
+> **现状：alpha。** 已完成里程碑 M1（核心可用）与 M2 的五段（m2a–m2e，完整治理的主体，由 Foremind 自己开发自己），M3（打包与试运行）尚未开始。接口和文件格式还会变，还没在本项目以外的真实项目上跑过，请勿用于重要项目。
 
 ## 它解决什么问题
 
@@ -50,7 +50,21 @@ Foremind 的做法是把这些都交给程序检查，而不是靠提示词约�
 | 监督进程 | tick / supervise、全局单实例锁、就绪队列、经作业开席与代合、卡住与继任、额度状态机、全阻塞、pause / STOP / run、ntfy 通知（只发送） |
 | 安装 | `init`（单仓/多仓、TOML 带标记块、钩子合并、交付约定的程序检测部分）、`doctor`、`status`、`uninstall`（逐字节还原） |
 
-尚未实现（M2/M3）：决策层与待决的完整流程、交付约定的更新与冲突处理、审计、上下文预算与编目、晨报与 ntfy 双向回复、规划者与总控的会话流程、Codex、herdr 承载、Claude Code 插件打包、示例仓库。
+## M2 已实现的部分（m2a–m2e，50 批）
+
+| 模块 | 内容 |
+|---|---|
+| 决策层 | 待决 Q-n 与 `foremind decide`、放行凭据、决策者处理委托的待决、一次性总控、暂定决定 PV-n 与判例、按推翻率收紧委托 |
+| 规划 | 规划者会话与草稿提交、计划修订与范围扩大（#8）的程序途径、计划校验与耦合计分改进、状态解释入口与缺省值表 |
+| 席位与交接 | 网络中断后自动续跑、StopFailure 按 API 错误分类、交接死锁与退回清单丢失修补、`foremind say`、1M 窗口席位约 30 万 token 交接、继任占名额并看整机负载、关闭会话以进程退出为准、泄漏会话对账关闭 |
+| 审查 | 审查材料含冻结目标、增量重审、审查强度按档可配与对照试验（按位置配对算召回）、每次与每批的美元 / token 上限、结构化输出与成本记录、must_fix 对照目标原文过滤、跨轮对账 |
+| 交付 | 合入前更新分支与回执重绑、`foremind land` 合入命令（含多仓库）、交付说明结构化、合入组预检与 merge queue、门禁与 doctor 对 CI 的判断一致 |
+| 审计与守卫 | L0 事实对账与硬失败、交付前 L1 审计、进行中批次的越界兜底、守卫收紧（包装器、嵌套命令、项目外写入、依赖清单）与误拦修补 |
+| 监督进程 | 代码更新后自动 re-exec、阶段挂点、坏文件不中断、空闲席位让出名额、按行为判卡住、额度状态移到用户层 |
+| 总控 | 交互总控按实际上下文用量把关，固定模板交接并机械核对（`foremind controller`），失误与交接留结构化记录 |
+| 报表与度量 | `foremind report` 运行报告、按实测复算的建议值（只建议不改配置）、开发精度与效率度量（`report --plan`、`foremind defect` 记漏出缺陷） |
+
+尚未实现（M2 余项与 M3）：原生收件箱 socket 投递、编目员与上下文组装（ask、L0/L1 预算估算）、间隔抽审与事件轮转、晨报与 ntfy 回复频道、角色提示词定制、Codex、herdr 承载、多项目统一监督、Claude Code 插件打包、示例仓库。
 
 ## 快速开始（从源码）
 
@@ -59,7 +73,7 @@ Foremind 的做法是把这些都交给程序检查，而不是靠提示词约�
 ```sh
 git clone https://github.com/DEOWL-kan/foremind.git
 cd foremind
-python3 -m unittest discover -s tests          # 全部测试（约 2 分钟）
+python3 -m unittest discover -s tests          # 全部测试（约 5 分钟）
 
 # 在你的项目里初始化（只影响这个项目；会逐项询问，加 --yes 则非交互：取检测结果，检测不到的取最严）
 cd /path/to/your/project
@@ -79,8 +93,12 @@ foremind plan show|validate|approve|amend                          # 审阅与�
 foremind seat <批次>            # 开席（--user：我自己来做）
 foremind review                 # 席位提交就绪、请求审查
 foremind gate <批次>            # 门禁：通过才批准、交付或合入
+foremind land <批次>            # 在临时 worktree 合并、跑验收与全量测试，通过才快进主分支
+foremind decide show Q-n        # 查看待决；foremind decide Q-n <选项> 回答
+foremind say <批次> "<文字>"    # 给正在做该批的会话留言
 foremind supervise              # 前台监督循环（或 launchd 每分钟 foremind tick）
 foremind status [--all]         # 批次、会话、待决与额度
+foremind report [--plan <计划>] # 运行报告；按计划查精度与效率
 ```
 
 ## 信任模型（请务必读）
@@ -97,11 +115,13 @@ foremind status [--all]         # 批次、会话、待决与额度
 
 Foremind 本身由 AI 团队开发：一个交互式总控会话（Claude Opus）规划并派出写手会话，每批经零上下文审查、修复、复审后才合入；设计缺口由总控按「不放宽、只补机制」定下并记入 `DESIGN.md` §20。开发规则见 [`AGENTS.md`](AGENTS.md)。
 
-如实说明：M1 的审查者与实现者是**同一厂商的同一模型**（不同的新会话），不是跨厂商复审；M1 只在 Python 3.14 / 3.13 上运行过测试，未在 3.11 上实跑。开发过程记录（审查报告、交接文档、调研）不在公开仓库中。
+M2 起用 Foremind 自己开发自己：监督进程开席、3 个写手并行、审查、门禁、`foremind land` 合入，总控会话只做规划、裁定与合入后的收尾，自身上下文满了也按固定模板交接给新会话。
+
+如实说明：审查者与实现者是**同一厂商的同一模型**（不同的新会话），不是跨厂商复审；测试只在 Python 3.14 / 3.13 上运行过，未在 3.11 上实跑；还没在本项目以外的真实项目上试跑过。开发过程记录（审查报告、交接文档、调研）不在公开仓库中。
 
 ## 路线图
 
-- **M2 完整治理**（将用 Foremind 自己开发）：决策层、交付约定与冲突、审计、上下文与编目、报表与通知、规划者与总控、Codex、其余运行能力。
+- **M2 余项**：减少总控手工（消息投递、巡查、合入收尾进产品）、审查结论对齐冻结目标、度量补全、跨厂商审查（Codex）等，范围待定。
 - **M3 打包与试运行**：Claude Code 插件、文档、示例仓库、零上下文试装、真实项目试跑。
 
 ## 许可证

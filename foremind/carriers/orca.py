@@ -8,7 +8,10 @@ and returns None. A record is kept after close, so the name is never created twi
 send() is confirmed when Orca reports `turn_started`; `wait --for tui-idle` only works for a recognised agent TUI
 (a plain shell times out); closing an already exited terminal answers `terminal_handle_stale`; close reports
 ptyKilled:false even when the process exits, so exit is confirmed by the handle leaving `list`. close() always asks
-Orca to close first: a handle missing from a `list` alone is never exit evidence (M1-4 r2 MF-A).
+Orca to close first: a handle missing from a `list` alone is never exit evidence (M1-4 r2 MF-A). Nor is Orca's word
+alone (m2d.1.D1): after an Orca restart a running seat's pty lives on without its tab (`orphaned`), its handle answered
+stale or left `list` for a while, and the claude in it kept running; so evidence also waits for the process
+(Carrier._settled).
 """
 import json
 import time
@@ -34,7 +37,6 @@ def _dig(obj, key):
 
 class OrcaCarrier(Carrier):
     name = "orca"
-    exit_timeout_s = 15
 
     def _orca(self, *args, timeout=60):
         r = run(["orca", "terminal", *args, "--json"], timeout=timeout)
@@ -70,7 +72,9 @@ class OrcaCarrier(Carrier):
     def create(self, session, launch):
         if old := self._handle(session):
             raise SessionExists(f"orca: session {session} was created before (handle {old})")
-        res = self._ok(self._orca("create", "--worktree", f"path:{launch.cwd}", "--title", session,
+        # under the project root's Orca entry (the seat's own worktree is no Orca entry, so Orca would keep the
+        # terminal as an invisible background handle): a visible tab; launch.shell() cds into the worktree
+        res = self._ok(self._orca("create", "--worktree", f"path:{self.root}", "--title", session,
                                   "--command", launch.shell()), "create")
         h = _dig(res, "handle")
         if not isinstance(h, str) or not h:
@@ -110,14 +114,14 @@ class OrcaCarrier(Carrier):
         j = self._orca("close", "--terminal", h, "--tab")
         if not j.get("ok"):
             if _dig(j.get("error"), "code") == "terminal_handle_stale":
-                return ExitEvidence(session, self.name, "absent")
+                return self._settled(session, ExitEvidence(session, self.name, "absent"))
             raise CarrierError(f"orca terminal close: {j.get('error')}")
         deadline = time.monotonic() + self.exit_timeout_s
         while h in self._listed():
             if time.monotonic() >= deadline:
                 return None  # still listed: not confirmed
             time.sleep(0.5)
-        return ExitEvidence(session, self.name, "absent")
+        return self._settled(session, ExitEvidence(session, self.name, "absent"))
 
     def list_sessions(self):
         live = self._listed()

@@ -4,21 +4,26 @@
 
 ## 职责
 
-在批次边界内实现、测试、提交；完成后执行 `foremind review`（推送与开 PR 归系统时它会一并做）；边做边写 D/F 记录；到阈值写交接。
+在批次边界内实现、测试、提交；完成后执行 `foremind review`（推送与开 PR 归系统时它一并做）；边做边写 D/F 记录；到阈值写交接。
 
 ## 读
 
-L0（协议、角色卡、主索引）与 L1 考纲（交接文档、状态区、最近一段交接、D/F 索引）。其余按需：代码用 grep/glob；索引「何时读」指向的分册与文档；前任 transcript 只经 `foremind ask` 答疑（只返回原文摘录与行号）。
+L0（协议、角色卡、主索引）与 L1 考纲（交接文档、状态区、最近一段交接、D/F 索引）。其余按需：代码用 grep/glob；索引「何时读」指向的分册与文档；前任 transcript 只经 `foremind ask` 答疑（返回原文摘录与行号）。
 
-遇到问题按顺序：① 查考纲与 D/F 记录；② `foremind ask`；③ 需要别人决定的用 `foremind decide --new`。
+遇到问题按顺序：① 查考纲与 D/F 记录；② 查代码或做小实验取证；③ `foremind ask`；④ 需别人决定的用 `foremind decide --new`。
+- 影响小、可撤回、在你类别内的：记 D，写明「假设：…，依据：…」后继续。
+- 会改变用户可见行为、验收含义或范围的：走待决；交接文档「依据与未决」的假设与未知不能当已确认。
 
 ## 产出
 
-- 代码与测试，只在 `owns_paths` 内。开工先跑起点命令；交付前跑全部验收命令。
-- D/F 记录（`foremind log`）：每条决定标授权表类别；修复失败后写 F 记录。
-- 交接段：schema `handoff_section`，经 `foremind handoff` 提交。
-- 待决：`foremind decide --new`，内容按 schema `pending` 提交：写问题、≤4 个选项、推荐与理由、类别、能否撤回；改依赖清单时声明是 #3 还是 #4。
-- 不同意审查意见时在日志里书面反驳，理由附证据（会标 disputed，交第三方仲裁）。
+- 代码与测试只在 `owns_paths` 内。开工先跑起点命令，交付前跑全部验收命令。
+- 临时脚本用 Write 写成文件，以字面绝对路径运行；变量写法（`$S/x.py`）被拒。
+- foremind 命令用 `PYTHONPATH=<主检出> python3 -P -m foremind …`；否则跑的是本批分支代码，被拒。
+- D/F 记录（`foremind log`）：每条决定标授权表类别；修复失败写 F 记录。
+- 交接段：schema `handoff_section`，经 `foremind handoff` 提交。硬线要求交接时写完即停；其他时候写的是存档，写完继续。Stop 的软线提示只在断点（无未提交改动）给；工具调用间的「回合中途提醒」：软线先提交再写，硬线立即写。
+- 交付说明：验收全过并 commit 后、`foremind review` 前用 `foremind log <批次> --file <文件>` 写 `## 交付说明` 与 json 块（schema `delivery_notes`，无内容给空列表）。
+- 待决：`foremind decide --new`，schema `pending`：问题、≤4 个选项、推荐与理由、类别、能否撤回；改依赖清单时声明是 #3 还是 #4。
+- 不同意审查意见时在日志里书面反驳，理由附证据（标 disputed，交第三方仲裁）。同版本不再审（REQ-19），只反驳不改代码时 `foremind decide --new` 请总控裁定。
 
 ## 禁止
 

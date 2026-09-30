@@ -57,5 +57,5 @@ def append(root, batch_id, text: str, *, author: str) -> str:
         append_line(path, f"### {ts} {author}\n\n{text.rstrip()}\n\n")
         data = path.read_bytes()
         digest = sha256_bytes(data)
-        _events(root).append("batch_log_appended", batch=batch_id, size=len(data), sha256=digest)
+        _events(root).append("batch_log_appended", batch=batch_id, size=len(data), sha256=digest, author=author)
     return digest

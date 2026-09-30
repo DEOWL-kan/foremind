@@ -4,13 +4,17 @@ Sessions are addressed by their Foremind name (`fm-...`, only [A-Za-z0-9_-], so 
 create() never reuses a session: a name the carrier already has raises SessionExists (M1-4 r1 MF-4).
 Programs call deliver(), not send(): it records a `program_delivery` intent (time + sha256 of the normalized text,
 §10.8, §20 I42) before sending, so UserPromptSubmit can tell program input from the user's, and a result after it.
-close() returns lock.ExitEvidence only when the carrier has confirmed the session is gone, else None.
+close() returns lock.ExitEvidence only when the carrier has confirmed the session is gone and so has its process
+(m2d.1, REQ-1): _settled() hands the carrier's evidence to sessions.settle, which sends the session's claude SIGTERM if
+it is still there (an Orca tab closed while its pty lives on, a tmux pane's child left behind) and waits; else None.
+A process whose identity cannot be checked (ps fails, …) gets nothing, the evidence stands (session_close_unverified).
 """
 import subprocess
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from foremind import sessions
 from foremind.events import EventLog
 from foremind.fsutil import sha256_bytes
 from foremind.paths import state_dir
@@ -48,6 +52,8 @@ def run(argv, input=None, timeout=60):
 
 class Carrier:
     name = ""
+    exit_timeout_s = 15
+    ps = None  # sessions.snapshot's ps: a callable returning `ps -Ao` text (tests); None is /bin/ps
 
     def __init__(self, root, cfg=None):
         self.root = Path(root)
@@ -69,6 +75,12 @@ class Carrier:
 
     def close(self, session):
         raise NotImplementedError
+
+    def _settled(self, session, evidence):
+        """The carrier's evidence unless the session's process runs on after SIGTERM (sessions.settle), else None."""
+        if evidence is None or sessions.settle(self.root, session, ps=self.ps, timeout_s=self.exit_timeout_s):
+            return evidence
+        return None
 
     def list_sessions(self) -> list | None:
         """Session names the carrier knows; None when it cannot list (manual)."""

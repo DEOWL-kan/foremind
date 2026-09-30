@@ -81,7 +81,7 @@ class TemplateTest(unittest.TestCase):
 
     def test_handoff_template_matches_schemas(self):
         text = (TEMPLATES / "handoff.md").read_text(encoding="utf-8")
-        self.assertEqual(set(header(text)), set(SPECS["batch_header"]["fields"]))
+        self.assertEqual(set(header(text)), {k for k, s in SPECS["batch_header"]["fields"].items() if not s.get("opt")})
         block = re.search(r"```json\n(.*?)\n```", text, re.S).group(1)
         section = json.loads(block)
         self.assertEqual(set(section), set(SPECS["handoff_section"]["fields"]))
