@@ -303,6 +303,13 @@ class OpenHandoffTest(ControllerBase):
         self.assertTrue(again["session"].endswith("-controller-2"))
         self.assertEqual(again["effort"], "xhigh")
 
+    def test_permission_mode_controller_key_else_seat(self):  # I105
+        for extra, want in (({}, "auto"), ({"controller.permission_mode": "bypassPermissions"}, "bypassPermissions")):
+            out = ctl.open_controller(self.root, carrier=self.carrier,
+                                      config={**self.cfg, "seat.permission_mode": "auto", **extra})
+            argv = self.carrier.created[out["session"]].argv
+            self.assertEqual(argv[argv.index("--permission-mode") + 1], want)
+
     def test_open_without_session_start_closes(self):
         carrier = FakeCarrier(self.root, start=False)
         self.assertRaisesRegex(ctl.ControllerError, "no SessionStart", ctl.open_controller, self.root,

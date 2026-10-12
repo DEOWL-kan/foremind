@@ -1,4 +1,4 @@
-"""Shared fixture for the install / doctor / status tests (no tests here).
+"""Shared fixture for the install / doctor / status tests, and the one test that it stays in its temp dir.
 
 A temp HOME, FOREMIND_CONFIG_HOME and FOREMIND_WT_ROOT; PATH = fake gh, claude, tmux first, then only git's own
 directory and /bin. Fake gh answers from $FAKE_GH_STATE: {"auth": exit code of `gh auth status`,
@@ -12,10 +12,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unittest
 from pathlib import Path
 from unittest import mock
 
 from foremind.cli import main
+from foremind.install import settings
+from foremind.paths import user_config_dir
 
 FAKE_GH = r'''
 import json, os, sys
@@ -89,3 +92,12 @@ class Env:
             except SystemExit as e:
                 rc = e.code
         return rc, out.getvalue()
+
+
+class EnvTest(unittest.TestCase):
+    def test_user_files_stay_in_the_temp_dir(self):  # else a test run writes the real user's config (#22)
+        env = Env(self)
+        for p in (Path.home(), user_config_dir(), settings._claude_home()):
+            self.assertTrue(p.resolve().is_relative_to(env.tmp), p)
+        self.assertNotIn("CLAUDE_CONFIG_DIR", os.environ)
+        self.assertFalse(any(k in os.environ for k in ("FOREMIND_SESSION", "FOREMIND_ROLE", "FOREMIND_BATCH")))

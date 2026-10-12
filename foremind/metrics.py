@@ -2,8 +2,9 @@
 per plan a cumulative section, the same for the run report and `foremind report --plan`.
 
 collect(root, evs, bids, now) is the one place that reads files (review receipts, decisions, heartbeats and the
-transcripts they point at, reviewers' transcripts) and hands them to compute(), pure over the events; lines() writes the
-Markdown. What cannot be read is "unknown", an event missing a field is counted as「未计 n 次」: neither is 0.
+transcripts they point at, reviewers' transcripts: usage_of(), not for a batch with a batch_usage event, m2f REQ-12)
+and hands them to compute(), pure over the events; lines() writes the Markdown. What cannot be read is "unknown", an
+event missing a field is counted as「未计 n 次」: neither is 0.
 Durations in hours (one decimal); tokens are input-equivalent tokens (review.PRICE, the one place)."""
 import json
 import re
@@ -16,7 +17,7 @@ from foremind.decide.pending import DELEGATES
 from foremind.install.settings import _claude_home
 from foremind.paths import state_dir
 from foremind.plan import model
-from foremind.schemas import BATCH_ID
+from foremind.schemas import BATCH_ID, RETURN_CATEGORIES
 
 UNKNOWN = "unknown"
 TERMINAL = ("merged", "cataloged", "cancelled")
@@ -24,7 +25,11 @@ AFTER = ("approved", "awaiting_audit", "delivered")  # a send-back from these is
 EXTRA = ("blocked", "stuck", "paused", "failed", "updating")  # stays listed only when not 0
 STUCK = "sv_say:stuck:"
 NOTE = ("外来提示与退回的来源自 m2e.10 合入起才有记录；漏出缺陷只含用 `foremind defect` 记下的（可补记）；"
-        "m2d.4 之前的审查没有美元与 token，读不到 transcript 的计入「未计」。")
+        "m2d.4 之前的审查没有美元与 token，读不到 transcript 的计入「未计」；"
+        "退回分类、自动退回与总控直投自 m2f 起才有记录。")
+RETURNS = ("requested", "req_conflict")  # the batch_state reasons that are a send-back
+UNSORTED = "未分类"
+HELP = re.compile(r"`([^`]*)`")
 
 
 def _t(ts) -> float:
@@ -75,6 +80,14 @@ def _pending(evs) -> dict:
     return out
 
 
+def _help(e) -> bool:
+    """m2f REQ-12: a hook_denied of usage lookups only: every reason starts with a backquoted command having `--help`
+    or `-h` among its words (guard's matrix reasons start with the command)."""
+    rs = e.get("reasons")
+    return isinstance(rs, list) and bool(rs) and all(
+        isinstance(r, str) and (m := HELP.match(r)) and {"--help", "-h"} & set(m[1].split()) for r in rs)
+
+
 def _tokens(vals) -> tuple[float, int, int]:
     """(sum, how many are None, how many)."""
     return sum(v for v in vals if v is not None), sum(v is None for v in vals), len(vals)
@@ -87,13 +100,14 @@ def row(bev, now, io, pend) -> dict:
     files = io["receipts"]
     if files != UNKNOWN:
         files = [r for r in files if isinstance(r, dict) and "rebound_from" not in r]
-        files = [_musts(r) for r in files] if len(files) == len(rec) else UNKNOWN
-    rets = Counter()
+        files = [(r.get("round", "?"), *_musts(r)) for r in files] if len(files) == len(rec) else UNKNOWN
+    rets, cats = Counter(), Counter()
     for e in bev:
-        if e["type"] == "batch_state" and _to(e) == "changes_requested" and e.get("reason") == "requested":
-            # by is user, controller or a session: --request-changes in a session is the controller's only
-            who = "user" if e.get("by") == "user" else "controller"
+        if e["type"] == "batch_state" and _to(e) == "changes_requested" and e.get("reason") in RETURNS:
+            # by is user, gate, controller or a session: --request-changes in a session is the controller's only
+            who = {"user": "user", "gate": "auto"}.get(e.get("by"), "controller")
             rets["after" if e.get("prior") in AFTER else "during", who] += 1
+            cats[e["category"] if e.get("category") in RETURN_CATEGORIES else UNSORTED] += 1
     moves = sorted(((_t(e["ts"]), _to(e)) for e in bev if e["type"] in ("batch_state", "reconciled", "plan_amended")),
                    key=lambda m: m[0])
     stay = Counter()
@@ -118,11 +132,12 @@ def row(bev, now, io, pend) -> dict:
     stuck = Counter(e["dedupe_id"].rsplit(":", 1)[1] for e in bev
                     if e["type"] == "sv_say" and e.get("ok") is True and e["phase"] == "result")
     retries = [e for e in bev if e["type"] == "api_retry_result"]
+    helps = sum(e["type"] == "hook_denied" and _help(e) for e in bev)
     return {
-        "verdicts": verdicts, "musts": files, "returns": rets,
+        "verdicts": verdicts, "musts": files, "returns": rets, "categories": cats, "help_denied": helps,
         "gate_fail": sum(e["type"] == "gate_result" and e.get("verdict") == "fail" for e in bev),
         "defects": Counter(e.get("source") for e in bev if e["type"] == "defect_found"),
-        "violations": n["hook_denied"] + n["bounds_violation"],
+        "violations": n["hook_denied"] - helps + n["bounds_violation"],
         "moves": moves, "stay": stay, "ms": ms,
         # a later milestone before the earlier one (sent back after delivered and approved again, not yet delivered;
         # approved and reconciled to merged): that stretch is not reached
@@ -141,6 +156,7 @@ def row(bev, now, io, pend) -> dict:
                   "pattern": n["stuck_pattern"]},
         "retry": (len(retries), sum(e.get("tries") or 0 for e in retries), sum(e.get("ok") is False for e in retries)),
         "withdrawn": n["review_withdrawn"], "external": n["seat_prompt_external"],
+        "direct": n["seat_prompt_controller"],
     }
 
 
@@ -196,18 +212,49 @@ def compute(evs, plans, budgets, io, now) -> dict:
                       for p, bs in plans.items()}}
 
 
-def _usage_of(path, read):
+def _read(path, read):
     try:
         return read(path) if path else None
     except (OSError, ValueError):
         return None
 
 
+def usage_of(root, bev, read=controller.usage) -> dict:
+    """{writer: {session: usage | None}, reviewer: {reviewer_session: usage | None}} of one batch's events (group()):
+    each seat_opened not continued_from by its heartbeat's transcript; each review_receipt and review_failed not
+    rebound_from by the event's four token counts when it has them, else by the reviewer's transcript."""
+    out = {"writer": {}, "reviewer": {}}
+    for e in bev:
+        if e["type"] == "seat_opened" and "continued_from" not in e and (s := e.get("session")):
+            try:
+                tp = (heartbeat.read(root, s) or {}).get("transcript_path")
+            except ValueError:
+                tp = None
+            out["writer"][s] = _read(tp, read)
+        elif e["type"] in ("review_receipt", "review_failed") and "rebound_from" not in e \
+                and isinstance(rs := e.get("reviewer_session"), str):
+            if review.tokens(e) is not None:  # never over a transcript read: a token-less event of rs counts that
+                out["reviewer"].setdefault(rs, {k: e[k] for k in review.PRICE})
+            else:
+                found = sorted(_claude_home().glob(f"projects/*/{rs}.jsonl"))
+                out["reviewer"][rs] = _read(found[0] if found else None, read)
+    return out
+
+
+def _recorded(bev) -> dict | None:
+    """The batch's batch_usage event's {writer, reviewer}, None when it has none (or one not of that shape)."""
+    u = next((e for e in reversed(bev) if e["type"] == "batch_usage"), None)
+    if u and all(isinstance(u.get(k), dict) for k in ("writer", "reviewer")):
+        return {k: u[k] for k in ("writer", "reviewer")}
+    return None
+
+
 def collect(root, evs, bids, now, read=controller.usage) -> dict:
-    """compute() for `bids` and the plans they belong to (all of those plans' batches), the files read here."""
-    # ponytail: every call reads whole transcripts of every seat and reviewer (tokens missing) of those plans; the
-    # supervisor makes a report only when a run comes to rest, so this is rare; the way out when slow is recording a
-    # session's usage in an event when it closes (m2f)
+    """compute() for `bids` and the plans they belong to (all of those plans' batches), the files read here; a batch's
+    usage from its batch_usage event when it has one (m2f REQ-12), read by usage_of() otherwise."""
+    # ponytail: a batch with no batch_usage yet (not merged, or merged before m2f.9 until phases/usage.py caught up)
+    # has its seats' and reviewers' whole transcripts read on every call; the supervisor makes a report only when a run
+    # comes to rest, so this is rare
     plans, budgets, failed = {}, {}, {}
     for pid in model.plan_ids(root):
         try:
@@ -230,17 +277,9 @@ def collect(root, evs, bids, now, read=controller.usage) -> dict:
         except (review.FlowError, OSError):
             io["receipts"][b] = UNKNOWN
         io["qs"][b] = UNKNOWN if dec == UNKNOWN else [q.get("id") for q in dec if b in (q.get("blocks") or [])]
-        for e in by.get(b, []):
-            if e["type"] == "seat_opened" and "continued_from" not in e and (s := e.get("session")):
-                try:
-                    tp = (heartbeat.read(root, s) or {}).get("transcript_path")
-                except ValueError:
-                    tp = None
-                io["writer"][s] = _usage_of(tp, read)
-            elif e["type"] in ("review_receipt", "review_failed") and "rebound_from" not in e \
-                    and review.tokens(e) is None and isinstance(rs := e.get("reviewer_session"), str):
-                found = sorted(_claude_home().glob(f"projects/*/{rs}.jsonl"))
-                io["reviewer"][rs] = _usage_of(found[0] if found else None, read)
+        u = _recorded(by.get(b, [])) or usage_of(root, by.get(b, []), read)
+        io["writer"].update(u["writer"])
+        io["reviewer"].update(u["reviewer"])
     m = compute(evs, plans, budgets, io, now)
     for b in bids:  # a batch of no loaded plan: its plan's section is unknown, never left out
         if not any(b in bs for bs in plans.values()):
@@ -288,7 +327,13 @@ def _usd(t) -> str:
 
 
 def _rets(c, kind) -> str:
-    return f"{c[kind, 'controller'] + c[kind, 'user']}（总控 {c[kind, 'controller']}、用户 {c[kind, 'user']}）"
+    a, b, n = c[kind, "controller"], c[kind, "user"], c[kind, "auto"]
+    return f"{a + b + n}（总控 {a}、用户 {b}、自动 {n}）"
+
+
+def _cats(c) -> str:
+    """The send-backs' categories not 0, schemas.RETURN_CATEGORIES' order then「未分类」."""
+    return "、".join(f"{k} {c[k]}" for k in (*RETURN_CATEGORIES, UNSORTED) if c[k]) or "—"
 
 
 def _defects(c) -> str:
@@ -314,22 +359,21 @@ GAPS = ("开席→提审", "提审→approved", "approved→delivered", "deliver
 
 def batch_lines(b, r) -> list:
     m = r["musts"]
-    musts = UNKNOWN if m == UNKNOWN else " · ".join(f"r{i} {a}（降级 {lo}、撤回 {w}）" for i, (a, lo, w) in
-                                                   enumerate(m, 1)) or "—"
+    musts = UNKNOWN if m == UNKNOWN else " · ".join(f"r{i} {a}（降级 {lo}、撤回 {w}）" for i, a, lo, w in m) or "—"
     w = r["wait_user"]
     wait = UNKNOWN if w == UNKNOWN else _h(w[0]) + (f"（未计 {w[1]} 次）" if w[1] else "")
     st, (rn, rt, rf) = r["stuck"], r["retry"]
     rets = sum(r["returns"].values())
     return [
         f"- {b} 精度：{_first(r)}；must_fix {musts}；退回 审查中 {_rets(r['returns'], 'during')} · approved 后 "
-        f"{_rets(r['returns'], 'after')}；门禁失败 {r['gate_fail']}；漏出缺陷 {_defects(r['defects'])}；"
-        f"协议违反 {r['violations']}",
+        f"{_rets(r['returns'], 'after')}；退回分类 {_cats(r['categories'])}；门禁失败 {r['gate_fail']}；漏出缺陷 "
+        f"{_defects(r['defects'])}；协议违反 {r['violations']}",
         f"- {b} 效率：{' · '.join(f'{k} {_h(g)}' for k, g in zip(GAPS, r['gaps']))}；{_stays(r['stay'])}；"
         f"等用户 {wait}；写手 token {_tok(r['writer'], '会话')}；审查 {_usd(r['review_usd'])}、token "
         f"{_tok(r['review_tok'])}；席位 {r['seats']}（用户自做 {r['seat_user']}）· 交接 {r['handoffs']} · 破锁 "
         f"{r['lock_broken']}；卡住提醒 remind {st['remind']}、ask {st['ask']}，转 stuck {st['to_stuck']}，模式 "
         f"{st['pattern']}；API 续跑 {rn} 串 {rt} 次、失败 {rf}；总控介入 退回 {rets} · 撤回 {r['withdrawn']} · "
-        f"外来提示 {r['external']}",
+        f"总控直投 {r['direct']}；外来提示 {r['external']}",
     ]
 
 
@@ -346,9 +390,10 @@ def plan_lines(pid, rows, s) -> list:
     got = [r for r in rs if r["verdicts"]]
     to_ok = [r["verdicts"].index("approved") + 1 for r in got if "approved" in r["verdicts"]]
     musts = [x for r in rs if r["musts"] != UNKNOWN for x in r["musts"]]
-    mf, lo, wd = (sum(x[i] for x in musts) for i in range(3))
+    mf, lo, wd = (sum(x[i] for x in musts) for i in (1, 2, 3))
     unread = sum(r["musts"] == UNKNOWN and bool(r["verdicts"]) for r in rs)
     rets, defects = sum((r["returns"] for r in rs), Counter()), sum((r["defects"] for r in rs), Counter())
+    cats = sum((r["categories"] for r in rs), Counter())
     span = s["span"]
     long = span[1] - span[0] if span else None
     per = lambda x: f"{x * 86400 / long:.2f}/天" if long else "—"  # noqa: E731
@@ -371,9 +416,10 @@ def plan_lines(pid, rows, s) -> list:
         f"- 精度：首轮通过率 {_pct(first, len(got))}；到 approved 平均 {_avg(sum(to_ok), len(to_ok))} 轮；每轮平均 "
         f"must_fix {_avg(mf, len(musts))}，降级占 {_avg(lo, mf, True)}、撤回占 {_avg(wd, mf, True)}"
         + (f"（{unread} 批回执文件读不到）" if unread else "") +
-        f"；退回 审查中 {_rets(rets, 'during')} · approved 后 {_rets(rets, 'after')}；门禁失败 "
+        f"；退回 审查中 {_rets(rets, 'during')} · approved 后 {_rets(rets, 'after')}；退回分类 {_cats(cats)}；门禁失败 "
         f"{sum(r['gate_fail'] for r in rs)}；漏出缺陷 {_defects(defects)}；协议违反 "
-        f"{sum(r['violations'] for r in rs)}；L0 硬失败 {s['l0'] if span else UNKNOWN}",
+        f"{sum(r['violations'] for r in rs)}；查用法拒绝 {sum(r['help_denied'] for r in rs)}（不计）；L0 硬失败 "
+        f"{s['l0'] if span else UNKNOWN}",
         f"- 效率：跨度 {_h(long) if span else UNKNOWN}；吞吐 {s['merged']} 批合入、{per(s['merged'])}；归一吞吐 "
         f"{per(budget)}" + (f"（{miss} 批无 budget_estimate）" if miss else "") +
         f"；并行对照 串行所需 {_h(serial)}" + (f"（未计 {no_open} 次）" if no_open else "") +
@@ -386,9 +432,9 @@ def plan_lines(pid, rows, s) -> list:
         f"{st['ask']}，转 stuck {st['to_stuck']}，模式 {st['pattern']}；API 续跑 {rn} 串 {rt} 次、失败 {rf}",
         f"- 用户投入：待决 {n_q if span else UNKNOWN}（交给代理 {routed}）；答复耗时 中位 {_h(a_med)}、最长 {_h(a_max)}；"
         f"打扰 {sum(bother.values())}" + (f"（{'、'.join(f'{k} {v}' for k, v in sorted(bother.items(), key=str))}）"
-                                        if bother else ""),
-        f"- 总控介入：退回 {sum(rets.values())} · 撤回 {sum(r['withdrawn'] for r in rs)} · 外来提示 "
-        f"{sum(r['external'] for r in rs)} · controller_slip {s['slips']} · controller_handoff {s['ctl_handoffs']}",
+                                        if bother else "") + f"；外来提示 {sum(r['external'] for r in rs)}",
+        f"- 总控介入：退回 {sum(rets.values())} · 撤回 {sum(r['withdrawn'] for r in rs)} · 总控直投 "
+        f"{sum(r['direct'] for r in rs)} · controller_slip {s['slips']} · controller_handoff {s['ctl_handoffs']}",
     ]
 
 

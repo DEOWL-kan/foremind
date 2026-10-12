@@ -653,16 +653,17 @@ _ANY = {None: {"version", "status", "report", "ask", "handoff", "release-check",
         "seat": {"gate"}, "controller": {"run", "say"}}
 _ALLOWED = {None: ("version、status、report、ask、handoff、release-check、statusline；不带 --author 的 log；decide 只允许"
                    "无参数、show [Q-n]、--new …、--notify <字面 Q-n>；plan show、plan validate；不带 --reset 的 quota；"
-                   "不带 --rescan 的 doctor"),
+                   "不带 --rescan 的 doctor；只查用法的调用（单独的 `--` 之前有 --help 或 -h，各词都是字面）"),
             "seat": "review [批次]（不带选项）；gate", "controller":
-            "review --request-changes；不带 --user-approved 的 plan amend；run；say", "planner": "plan submit"}
+            "review --request-changes --category <字面分类>；不带 --user-approved 的 plan amend；run；say",
+            "planner": "plan submit"}
 # argparse options (name: takes a value) of the subcommands allowed only in some forms
 _DECIDE = {"--note": 1, "--void": 1, "--reason": 1, "--new": 0, "--question": 1, "--option": 1, "--recommended": 1,
            "--category": 1, "--irreversible": 0, "--path": 1, "--command": 1, "--approve-option": 1, "--blocks": 1,
            "--notify": 1}
 _NEW = {"--new", "--question", "--option", "--recommended", "--reason", "--category", "--irreversible", "--path",
         "--command", "--approve-option", "--blocks"}
-_REVIEW = {"--run-reviewer": 0, "--request-changes": 0, "--item": 1}
+_REVIEW = {"--run-reviewer": 0, "--request-changes": 0, "--item": 1, "--category": 1}
 _AMEND = {"--reason": 1, "--batch": 1, "--drop": 1, "--goal": 1, "--user-approved": 0}
 _QUOTA = {"--reset": 0, "--group": 1}
 _LOG = {"--author": 1, "--file": 1}
@@ -719,7 +720,8 @@ def _allowed(args, role) -> bool:
         return _without(rest, _LOG, "--author")
     if sub == "review":  # a seat's is `review [batch]`: --run-reviewer is the supervisor's (commands/review.py)
         return (role == "seat" and len(rest) <= 1 and not any(a[:1] == "-" or _SPECIAL.search(a) for a in rest)
-                or role == "controller" and _with(rest, _REVIEW, "--request-changes") is not None)
+                or role == "controller" and _with(rest, _REVIEW, "--request-changes") is not None
+                and all(v and not _SPECIAL.search(v) for n, _, v in _opts(rest, _REVIEW)[0] if n == "--category"))
     if sub != "decide":
         return False
     if not rest or rest[0] == "show":
@@ -736,18 +738,31 @@ def _session_denied(w, role) -> bool:
     """`foremind …` (or `python* -m foremind …`) outside `role`'s whitelist (_ANY, _allowed). Fail-closed: the
     subcommand must be literal and a lone `--` denies (argparse may skip it before a subcommand); the forms allowed
     only without an option deny on any word left with shell syntax, those allowed with one (decide --new, review
-    --request-changes) on such a word before it; `decide show` and `--notify` take a literal Q-n. FOREMIND_SESSION is
-    trivially unset inside a command, so every Foremind session is held to this."""
-    args = _foremind_args(w)
+    --request-changes) on such a word before it; `decide show` and `--notify` take a literal Q-n, review's --category
+    a literal value (m2f REQ-4). FOREMIND_SESSION is
+    trivially unset inside a command, so every Foremind session is held to this. A usage query of foremind's own cli
+    (_usage; not `-m foremind.<module>`, whose main may not read it) is none of these (m2f REQ-7)."""
+    mod = []
+    args = _foremind_args(w, module=mod)
     if args is None:
+        return False
+    if (w[0] == "foremind" or mod == ["foremind"]) and _usage(args):
         return False
     return not args or "--" in args or bool(_SPECIAL.search(args[0])) or not _allowed(args, role)
 
 
-def _foremind_args(w, flags=None, code=None) -> list | None:
+def _usage(args) -> bool:
+    """argparse prints the usage and exits on a word `--help` or `-h` before any lone `--`, running no subcommand;
+    every word literal (an expansion may be anything, a `--` included)."""
+    head = args[:args.index("--")] if "--" in args else args
+    return bool({"--help", "-h"} & set(head)) and not any(map(_SPECIAL.search, args))
+
+
+def _foremind_args(w, flags=None, code=None, module=None) -> list | None:
     """The words after `foremind` in `w` (_norm) running it, else None. `flags`: a set that gets the one-letter options
-    before `-m`/`-c` of a python* (`-P -m`, `-Pm`); `code`: a list that gets the text of its -c. What xargs adds
-    (_STDIN) where python* reads an option or its program may be `-m foremind`: the words after it."""
+    before `-m`/`-c` of a python* (`-P -m`, `-Pm`); `code`: a list that gets the text of its -c; `module`: a list that
+    gets the module of its -m. What xargs adds (_STDIN) where python* reads an option or its program may be `-m
+    foremind`: the words after it."""
     if w[0] == "foremind":
         return w[1:]
     if not _PYTHON.fullmatch(w[0]):
@@ -774,6 +789,8 @@ def _foremind_args(w, flags=None, code=None) -> list | None:
                 code.append(val)
             return None
         if a[k] == "m":
+            if module is not None:
+                module.append(val)
             return w[i:] if val.partition(".")[0] == "foremind" or _SPECIAL.search(val) else None
     return None
 

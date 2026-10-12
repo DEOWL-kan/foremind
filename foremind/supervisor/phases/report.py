@@ -3,7 +3,8 @@ too.
 
 - A batch the event log shows moved to `failed` (review.py: review_failures, review_timeouts) is told once per that
   batch_state event, at P1: retry with `foremind run <batch>`; for review_timeouts with the count and what to change
-  first (the only notice of it, m2c.7).
+  first (the only notice of it, m2c.7); for auto_land_failed (phases/land.py) with the failed count and the output
+  directory (m2f REQ-2).
 - A stretch of unattended running has come to a rest when every unfinished batch waits on the user (blocked: the
   tick's full block, `t.block` from announce_block) or none is unfinished. Then one report (report.generate) and one
   push of its summary (ids and counts, §8.7), once per fingerprint: under a full block that of its reasons, as
@@ -84,5 +85,8 @@ def failed(t):
         if e.get("reason") == "review_timeouts":  # the one notice of it (m2c.7, m2b.6 r3): update.py told it too
             why += (f"：审查在同一组 heads 上连续 {e.get('failures')} 次超时，已停止重跑；"
                     "调大 oneshot.timeout_min 或缩小改动后")
+        elif e.get("reason") == "auto_land_failed":  # m2f REQ-2: the land phase's one notice of it
+            why += (f"：自动合入的测试两次没过（失败 {e.get('failed')} 条，输出在 {e.get('out_dir')}），已停止自动合入；"
+                    "看批次文件的「## 状态」，处理后")
         t.notify(f"failed:{bid}:{e['id']}", f"{bid} 连续失败已停",
                  f"{bid} 连续失败已停{why}，用 foremind run {bid} 重试。")

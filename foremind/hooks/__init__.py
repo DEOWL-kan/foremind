@@ -22,8 +22,9 @@ waits on someone at the terminal; heartbeat waiting_input until the next turn ho
 after a Stop that ended the turn whose tool_use is not in the transcript's tail: not counted as an open tool, finding
 26); tool_after_stop_confirmed (its PostToolUse came after all: the first tool of a turn going on, m2c.7.F2);
 handoff_requested (a seat's first request at the hard line, Stop or mid-turn, REQ-10); api_error (StopFailure: the
-turn ended on an API error, heartbeat api_error{type, at}, REQ-11); seat_prompt_external (a seat's prompt that
-matches no program_delivery, the same match as presence, m2e REQ-14); hook_error.
+turn ended on an API error, heartbeat api_error{type, at}, REQ-11); seat_prompt_controller (a seat's prompt that
+matches no program_delivery but a controller_delivery intent, `say --direct`, m2f REQ-5); seat_prompt_external (a
+seat's prompt that matches neither, the same match and window as presence, m2e REQ-14); hook_error.
 """
 import contextlib
 import hashlib
@@ -57,6 +58,7 @@ GIT_TIMEOUT_S = 10
 INBOX_WAIT_S = 3  # Stop waits this long for the inbox lock, then delivers next turn (the supervisor waits for it)
 # §10.8: carriers write this event (text hash) right before delivering; a matching prompt is not the user
 DELIVERY_EVENT, DELIVERY_HASH, DELIVERY_WINDOW = "program_delivery", "text_sha256", timedelta(minutes=10)
+CONTROLLER_DELIVERY = "controller_delivery"  # `say --direct` (m2f REQ-5): counted apart, never as presence
 DF_FULL = 10  # §6.1: the last 10 D/F records in full, older ones as id + gist
 L1_MAX_BYTES = 12_000  # §6.1 L1 ≤ 4k tokens; UTF-8 bytes, since a CJK character (3 bytes) can be a token or more
 
@@ -728,15 +730,25 @@ def delivery_sha(text) -> str:
     return _sha(text.replace("\r\n", "\n").replace("\r", "\n").strip())
 
 
-def _program_delivery(root, prompt) -> bool:
+def _deliveries(root, prompt) -> set:
+    """Who delivered this prompt within DELIVERY_WINDOW: DELIVERY_EVENT and/or CONTROLLER_DELIVERY (its intent)."""
     h, since = delivery_sha(prompt), datetime.now(timezone.utc) - DELIVERY_WINDOW
-    return any(e.get("type") == DELIVERY_EVENT and e.get(DELIVERY_HASH) == h
-               and datetime.fromisoformat(e["ts"]) >= since for e in EventLog(state_dir(root) / "events.jsonl").iter())
+    return {e["type"] for e in EventLog(state_dir(root) / "events.jsonl").iter()
+            if (e.get("type") == DELIVERY_EVENT or e.get("type") == CONTROLLER_DELIVERY and e["phase"] == "intent")
+            and e.get(DELIVERY_HASH) == h and datetime.fromisoformat(e["ts"]) >= since}
+
+
+def _program_delivery(root, prompt) -> bool:
+    return DELIVERY_EVENT in _deliveries(root, prompt)
 
 
 def _external(ctx, prompt):
-    if not _program_delivery(ctx.root, prompt):
-        _event(ctx.root, "seat_prompt_external", session=ctx.session, batch=ctx.batch, sha256=delivery_sha(prompt))
+    """m2f REQ-5: a seat's prompt is the program's (not recorded), else the controller's `say --direct`, else
+    external."""
+    who = _deliveries(ctx.root, prompt)
+    if DELIVERY_EVENT not in who:
+        _event(ctx.root, "seat_prompt_controller" if CONTROLLER_DELIVERY in who else "seat_prompt_external",
+               session=ctx.session, batch=ctx.batch, sha256=delivery_sha(prompt))
 
 
 def user_prompt_submit(ctx):

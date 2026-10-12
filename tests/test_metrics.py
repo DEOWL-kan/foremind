@@ -1,5 +1,6 @@
 """m2e.10 REQ-14: precision and efficiency (metrics.py), the report's section, `report --plan`, `foremind defect`,
-the controller's send-back `by`, the hook's seat_prompt_external."""
+the controller's send-back `by`, the hook's seat_prompt_external; m2f REQ-12's measures (batch_usage first, send-backs
+by source and category, usage lookups left out of violations, the two kinds of prompt, the receipts' rounds)."""
 import contextlib
 import io
 import json
@@ -59,7 +60,7 @@ class PureTest(unittest.TestCase):
     def test_one_batch_through_a_send_back_to_merged(self):
         m = metrics.compute(FLOW, {"p": ["p.1"]}, {"p.1": "1000"}, io_(), NOW)
         r = m["batches"]["p.1"]
-        self.assertEqual((r["verdicts"], r["musts"]), (["changes_requested", "approved"], [(2, 1, 0), (1, 0, 1)]))
+        self.assertEqual((r["verdicts"], r["musts"]), (["changes_requested", "approved"], [(1, 2, 1, 0), (2, 1, 0, 1)]))
         self.assertEqual([round(g / 60) for g in r["gaps"]], [60, 120, 10, 120])
         self.assertEqual(r["wait_user"], (130 * 60, 0))  # Q-1 30 min answered, Q-2 open 100 min to now
         self.assertEqual(sum(r["returns"].values()), 0)  # the reviewer's changes_requested is no send-back
@@ -79,10 +80,60 @@ class PureTest(unittest.TestCase):
                ev("batch_state", 2, batch="p.1", prior="in_review", state="changes_requested", reason="requested",
                   by="user"),
                ev("batch_state", 3, batch="p.1", prior="approved", state="changes_requested",
-                  reason="head changed after approval", by="controller")]
+                  reason="head changed after approval", by="controller"),
+               ev("batch_state", 4, batch="p.1", prior="in_review", state="changes_requested", reason="req_conflict",
+                  by="gate", category="deviates_req"),
+               ev("batch_state", 5, batch="p.1", prior="delivered", state="changes_requested", reason="requested",
+                  by="fm-p-1", category="missing_test"),  # a session: the controller's
+               ev("batch_state", 6, batch="p.1", prior="in_review", state="changes_requested", reason="requested",
+                  by="user", category="bogus")]
         r = metrics.compute(evs, {}, {}, io_(receipts={"p.1": []}), NOW)["batches"]["p.1"]
-        self.assertEqual(dict(r["returns"]), {("after", "controller"): 1, ("during", "user"): 1})
-        self.assertIn("退回 审查中 1（总控 0、用户 1） · approved 后 1（总控 1、用户 0）", metrics.batch_lines("p.1", r)[0])
+        self.assertEqual(dict(r["returns"]), {("after", "controller"): 2, ("during", "user"): 2, ("during", "auto"): 1})
+        prec = metrics.batch_lines("p.1", r)[0]
+        self.assertIn("退回 审查中 3（总控 0、用户 2、自动 1） · approved 后 2（总控 2、用户 0、自动 0）；"
+                      "退回分类 deviates_req 1、missing_test 1、未分类 3；", prec)
+        m = metrics.compute(evs, {"p": ["p.1"]}, {}, io_(receipts={"p.1": []}), NOW)
+        self.assertIn("退回分类 deviates_req 1、missing_test 1、未分类 3；", "\n".join(metrics.lines(m, [])))
+        r = metrics.compute([], {}, {}, io_(receipts={"p.1": []}), NOW)["batches"]["p.1"]
+        self.assertIn("退回分类 —；", metrics.batch_lines("p.1", r)[0])
+
+    def test_usage_lookups_are_no_violation(self):
+        deny = lambda *rs: ev("hook_denied", 1, batch="p.1", reasons=list(rs))  # noqa: E731
+        evs = [deny("`foremind review --help`：Foremind 会话按角色白名单执行", "`git -h`：x"),
+               deny("`foremind gate p.1 -h`：x"),
+               deny("`foremind review --help`：x", "`foremind seat p.1`：x"),  # one is no lookup: counted
+               deny("`foremind --helpful`：x"), deny("写 foo --help：x"), deny(),  # no word --help; no command; none
+               ev("hook_denied", 1, batch="p.1"), ev("bounds_violation", 1, batch="p.1")]
+        m = metrics.compute(evs, {"p": ["p.1"]}, {}, io_(receipts={"p.1": []}), NOW)
+        r = m["batches"]["p.1"]
+        self.assertEqual((r["violations"], r["help_denied"]), (6, 2))
+        self.assertIn("协议违反 6", metrics.batch_lines("p.1", r)[0])
+        self.assertIn("协议违反 6；查用法拒绝 2（不计）；", "\n".join(metrics.lines(m, [])))
+
+    def test_the_controllers_prompts_apart_from_external_ones(self):
+        evs = [ev("seat_prompt_controller", 1, batch="p.1"), ev("seat_prompt_controller", 2, batch="p.1"),
+               ev("seat_prompt_external", 3, batch="p.1")]
+        m = metrics.compute(evs, {"p": ["p.1"]}, {}, io_(receipts={"p.1": []}), NOW)
+        eff = metrics.batch_lines("p.1", m["batches"]["p.1"])[1]
+        self.assertTrue(eff.endswith("总控介入 退回 0 · 撤回 0 · 总控直投 2；外来提示 1"), eff)
+        text = "\n".join(metrics.lines(m, []))
+        self.assertRegex(text, r"- 用户投入：[^\n]*；外来提示 1\n")
+        self.assertIn("- 总控介入：退回 0 · 撤回 0 · 总控直投 2 · controller_slip", text)
+        self.assertIn("退回分类、自动退回与总控直投自 m2f 起才有记录", metrics.NOTE)
+
+    def test_must_fix_rounds_are_the_receipts(self):  # m2e.10 r1 note: r1 failed, the files are r2 and r3
+        evs = [ev("review_receipt", 1, batch="p.1", round=2, verdict="changes_requested"),
+               ev("review_receipt", 2, batch="p.1", round=3, verdict="approved")]
+        files = [{"round": 2, "issues": [{"severity": "must_fix"}]}, {"round": 3, "issues": []}]
+        r = metrics.compute(evs, {}, {}, io_(receipts={"p.1": files}), NOW)["batches"]["p.1"]
+        self.assertIn("must_fix r2 1（降级 0、撤回 0） · r3 0（降级 0、撤回 0）；", metrics.batch_lines("p.1", r)[0])
+
+    def test_routed_to_the_user_is_no_delegate(self):  # m2e.10 r3 note
+        evs = [ev("plan_approved", 0, plan="p"), *moves("p.1", (0, "running")),
+               ev("pending_created", 1, question="Q-1"), ev("pending_routed", 1, question="Q-1", to="user"),
+               ev("pending_created", 2, question="Q-2"), ev("pending_routed", 2, question="Q-2", to="decider")]
+        m = metrics.compute(evs, {"p": ["p.1"]}, {}, io_(receipts={"p.1": []}), NOW)
+        self.assertIn("待决 2（交给代理 1）", "\n".join(metrics.lines(m, [])))
 
     def test_missing_fields_are_uncounted_or_unknown_never_zero(self):
         evs = [ev("review_receipt", 1, batch="p.1", verdict="approved", reviewer_session="r9"),  # before m2d.4
@@ -158,6 +209,26 @@ class CollectTest(Base):
                          {str(home / "projects" / "x" / "r1.jsonl"), str(self.tmp / "seat.jsonl")})
         self.assertIn("写手 token 250；审查 unknown（未计 1 次）、token 250", metrics.lines(m, ["p.1"])[1])
         self.assertEqual(m["batches"]["p.1"]["musts"], metrics.UNKNOWN)  # the receipt file is not there
+
+    def test_batch_usage_is_taken_and_no_transcript_read(self):  # m2f REQ-12
+        self.plan("p", {"state": "merged"})
+        self.plan("q", {"state": "running"})
+        self.log.append("review_receipt", batch="p.1", round=1, verdict="approved", reviewer_session="r1")
+        self.log.append("review_failed", batch="p.1", round=2, reviewer_session="r2")
+        self.log.append("seat_opened", batch="p.1", session="fm-p-1", successor=False)
+        self.log.append("seat_opened", batch="p.1", session="fm-p-1b", successor=True)
+        self.log.append("batch_usage", batch="p.1", writer={"fm-p-1": USE, "fm-p-1b": None},
+                        reviewer={"r1": USE, "r2": None})
+        self.beat("fm-p-1", "p.1", self.now, transcript_path=str(self.tmp / "seat.jsonl"))
+        self.log.append("seat_opened", batch="q.1", session="fm-q-1", successor=False)  # none yet: read as before
+        self.beat("fm-q-1", "q.1", self.now, transcript_path=str(self.tmp / "seat2.jsonl"))
+        m = metrics.collect(self.root, report.events(self.root), ["p.1"], self.now,
+                            read=mock.Mock(side_effect=AssertionError("read")))
+        self.assertIn("写手 token ≥ 250（1 个会话读不到）；审查 unknown（未计 2 次）、token 250（未计 1 次）",
+                      metrics.lines(m, ["p.1"])[1])
+        read = mock.Mock(return_value=USE)
+        metrics.collect(self.root, report.events(self.root), ["p.1", "q.1"], self.now, read=read)
+        self.assertEqual([str(c.args[0]) for c in read.call_args_list], [str(self.tmp / "seat2.jsonl")])
 
 
 def run(argv):
@@ -246,7 +317,7 @@ class RequestChangesByTest(unittest.TestCase):
             with mock.patch.dict(os.environ, env):
                 if "FOREMIND_CONTROLLER" not in env:
                     os.environ.pop("FOREMIND_CONTROLLER", None)
-                code, _, _ = review_cli(["review", "shop.1", "--request-changes", "--item", "x"])
+                code, _, _ = review_cli(["review", "shop.1", "--request-changes", "--category", "other", "--item", "x"])
             self.assertEqual(code, 0)
             self.assertEqual([p.events(t)[-1]["by"] for t in ("batch_state", "changes_requested_by")], [by, by])
 

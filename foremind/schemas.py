@@ -51,6 +51,12 @@ ISSUE_STATUSES = ("new", "repeat", "disputed")
 REVIEW_BASES = ("req", "authz", "regression")  # REQ-15: what a must_fix rests on
 # REQ-15 (-> note), REQ-16 (-> should_fix): why the program lowered a must_fix
 REVIEW_FILTERS = ("no_basis", "outside_coverage", "withdrawn", "outside_delta", "over_cap")
+# m2f REQ-3: a should_fix / note's conflict with a REQ's text as the program checked the reviewer's claim, and why a
+# claimed one (true) did not check out, the first of the checks in this order
+CONFLICTS = ("yes", "no", "missing", "rejected")
+CONFLICT_WHYS = ("not_batch_req", "no_quote", "goal_unreadable", "quote_mismatch", "outside_coverage", "withdrawn")
+# m2f REQ-4: why a batch was sent back (--request-changes, the gate's req_conflict); nothing else is taken
+RETURN_CATEGORIES = ("deviates_req", "regression", "missing_test", "overreach", "protocol", "controller_slip", "other")
 CATEGORIES = range(24)  # 授权表 #0–#23 (§8.1)
 AUDIT_SEVERITIES = ("P0", "P1", "P2", "P3")
 AUDIT_TRIGGERS = ("l0_fail", "pre_delivery", "plan_amend", "controller_context", "decider",
@@ -120,8 +126,16 @@ def _receipt_check(r):
     out = [] if r["verdict"] == want else [("verdict", f"must be {want!r} given the issues' severities")]
     if (r["scope"] == "incremental") != ("delta_from" in r):  # REQ-6: the heads an incremental review goes on from
         out.append(("delta_from", "present exactly when scope is 'incremental'"))
-    return out + [(f"issues[{k}]", "was and filtered go together") for k, i in enumerate(r["issues"])
-                  if ("was" in i) != ("filtered" in i)]
+    for k, i in enumerate(r["issues"]):
+        if ("was" in i) != ("filtered" in i):
+            out.append((f"issues[{k}]", "was and filtered go together"))
+        if "conflict" in i and i["severity"] == "must_fix":
+            out.append((f"issues[{k}].conflict", "only on should_fix and note"))
+        if i.get("conflict") == "yes" and not ("req" in i and "quote" in i):
+            out.append((f"issues[{k}]", "conflict yes needs req and quote"))
+        if (i.get("conflict") == "rejected") != ("conflict_why" in i):
+            out.append((f"issues[{k}]", "conflict rejected and conflict_why go together"))
+    return out
 
 
 def _gate_check(g):
@@ -226,14 +240,17 @@ SPECS = {
         "pointers": _obj({"transcript": _STR, "turns": _list(_STR), "files": _list(_STR)}),
     }),
     # §7.1, §20 I33; the program takes *only* verdict and issues[].{severity, location, summary, disputed, basis,
-    # req} from the reviewer output (and checks a must_fix's quote, category, form, broken without keeping them);
+    # req, quote} from the reviewer output (and checks a must_fix's quote, category, form, broken without keeping
+    # them; a should_fix / note's conflict, req, quote, form into its conflict);
     # every other field (batch, heads, reviewer_session, model, effort, round, scope,
     # rebound_from, delta_from, and per issue id, fingerprint, status new | repeat) is written by the program.
     # disputed: true becomes status "disputed" and the key is deleted, then the receipt is validated (§20 I9, I25).
     # incremental (REQ-6): a re-review of what changed since delta_from, the previous receipt's heads; delta is the
     # §7.6 conflict increment. REQ-15/16 (program-written): an issue's basis and req as the reviewer gave them; a
     # must_fix the program lowered keeps was (its severity before) and filtered (why); resolved / unresolved = the
-    # previous receipt's must_fix and should_fix fingerprints not reported again / reported again this round
+    # previous receipt's must_fix and should_fix fingerprints not reported again / reported again this round.
+    # m2f REQ-3 (program-written, harvest only): conflict on every should_fix and note; yes keeps the reviewer's req
+    # and quote, rejected keeps conflict_why
     "review_receipt": _obj({
         "batch": _s(BATCH_ID),
         "scope": _enum("full", "incremental", "delta"),
@@ -254,11 +271,17 @@ SPECS = {
             "req": _opt(_s(REQ_ID)),
             "was": _opt(_enum(*SEVERITIES)),
             "filtered": _opt(_enum(*REVIEW_FILTERS)),
+            "conflict": _opt(_enum(*CONFLICTS)),
+            "conflict_why": _opt(_enum(*CONFLICT_WHYS)),
+            "quote": _opt(_STR),
         })),
         "rebound_from": _opt(_HEADS),
         "delta_from": _opt(_HEADS),
         "resolved": _opt(_list(_s(FINGERPRINT), unique=True)),
         "unresolved": _opt(_list(_s(FINGERPRINT), unique=True)),
+        # m2f REQ-13 (program-written): who reviewed, and how that relates to the batch's tiers.model
+        "vendor": _opt(_enum("claude", "codex")),
+        "relation": _opt(_enum("cross_vendor", "same_vendor", "same_model")),
     }, check=_receipt_check),
     # §7.2
     "acceptance_result": _obj({

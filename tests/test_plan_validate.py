@@ -90,7 +90,7 @@ class ValidateTest(ProjectCase):
 
     def test_finished_batches_still_cover_and_count(self):
         plan = make_plan("p", [header("p.1", ["main:a.py"], state="merged"),
-                               header("p.2", ["main:b.py"], reqs=["REQ-2"])], goal="REQ-1 a\nREQ-2 b\n", approved=True)
+                               header("p.2", ["main:b.py"], reqs=["REQ-2"])], goal="REQ-1: a\nREQ-2: b\n", approved=True)
         self.assertTrue(self.check(plan)["ok"], self.check(plan)["errors"])
         plan.batches["p.1"].header["state"] = "cancelled"
         self.assertIn("REQ-1: not covered by any batch", self.check(plan)["errors"])
@@ -169,7 +169,7 @@ class ValidateTest(ProjectCase):
         self.assertFalse(any("p.2" in w for w in self.check(plan, user_approved=True)["warnings"]))
 
     def test_reqs_count_budget_goal(self):
-        plan = make_plan("p", [header("p.1", ["main:a.py"], reqs=["REQ-1", "REQ-9"])], goal="REQ-1 a\nREQ-2 b\n")
+        plan = make_plan("p", [header("p.1", ["main:a.py"], reqs=["REQ-1", "REQ-9"])], goal="REQ-1: a\nREQ-2: b\n")
         errs = self.check(plan)["errors"]
         self.assertIn("REQ-2: not covered by any batch", errs)
         self.assertIn("p.1: REQ-9 not in goal.md", errs)
@@ -184,6 +184,15 @@ class ValidateTest(ProjectCase):
         plan = make_plan("p", [header("p.1", ["main:a.py"])])
         plan.goal.body = "REQ-1 changed\n"
         self.assertIn("goal.md: changed after it was frozen", self.check(plan)["errors"][0])
+
+    def test_only_line_start_definitions_are_reqs(self):  # m2f REQ-10
+        goal = "REQ-1: a，沿用 m2d REQ-14\nREQ-2：b\n  WHEN 同 REQ-3 THEN c\n"
+        plan = make_plan("p", [header("p.1", ["main:a.py"], reqs=["REQ-1", "REQ-2"])], goal=goal)
+        self.assertTrue(self.check(plan)["ok"], self.check(plan)["errors"])
+        plan = make_plan("p", [header("p.1", ["main:a.py"], reqs=["REQ-1"])], goal=goal)
+        self.assertEqual([e for e in self.check(plan)["errors"] if "REQ" in e], ["REQ-2: not covered by any batch"])
+        plan = make_plan("p", [header("p.1", ["main:a.py"])], goal="见 m2d REQ-1：x\n REQ-1: 缩进的不算\n")
+        self.assertIn("goal.md: no REQ-n", self.check(plan)["errors"])
 
     def test_schema_errors_stop_early(self):
         plan = make_plan("p", [header("p.1", ["a.py"], accept_commands=[])])

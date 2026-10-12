@@ -21,7 +21,7 @@ BATCH_PLAIN = {
     ("updating", "approved"), ("updating", "changes_requested"),
     ("running", "stuck"), ("stuck", "running"),
     *((s, "paused") for s in ACTIVE),
-    *((s, "failed") for s in ("running", "review_ready", "in_review", "changes_requested")),
+    *((s, "failed") for s in ("running", "review_ready", "in_review", "changes_requested", "delivered")),
     ("failed", "ready"),
     *((s, "cancelled") for s in BATCH_MAIN + BATCH_SIDE if s not in ("merged", "cataloged", "cancelled")),
 }

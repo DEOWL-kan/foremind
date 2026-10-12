@@ -4,7 +4,8 @@ Refer to other events by `id`, never by `hash`: rotate() re-chains the entries i
 Dedupe on (dedupe_id, phase) only sees the current file; entries already rotated to the archive are not consulted.
 
 An event claiming the user (one of CLAIMS is "user", a USER_TYPES type or USER_VIA: what the user's own commands
-write) gets `seat_ancestor` (REQ-11 ④, m2c.6): the session whose settings file is on an ancestor's command line
+write) or the controller (one of CLAIMS is "controller": a seat could clear FOREMIND_SESSION and set FOREMIND_ROLE,
+m2f REQ-8) gets `seat_ancestor` (REQ-11 ④, m2c.6): the session whose settings file is on an ancestor's command line
 (seat_ancestor), "unknown" when ps cannot tell; no field otherwise. audit.l0 and supervisor/phases/bounds.py act on it.
 """
 import json
@@ -92,7 +93,8 @@ class EventLog:
             raise ValueError(f"phase must be 'intent' or 'result', not {phase!r}")
         if phase == "intent" and dedupe_id is None:
             raise ValueError("intent events need a dedupe_id so a result can close them")
-        if (type in USER_TYPES or fields.get("via") in USER_VIA or any(fields.get(k) == "user" for k in CLAIMS)) and \
+        if (type in USER_TYPES or fields.get("via") in USER_VIA
+                or any(fields.get(k) in ("user", "controller") for k in CLAIMS)) and \
                 (s := seat_ancestor(self.path.parent / "sessions")) is not None:  # before the lock: ps is slow
             fields["seat_ancestor"] = s
         with self._lock():

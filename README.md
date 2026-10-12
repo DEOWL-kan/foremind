@@ -1,14 +1,14 @@
 # Foremind
 
-> Run an AI development team from one seat. Foremind plans work into batches, opens AI coding sessions ("seats") for them, hands work over between sessions, gets every change reviewed by a separate read-only reviewer, and only merges through a mechanical gate. Pure Python standard library, state lives in files and git. **Status: alpha (milestones M1 and M2 done, M3 packaging next), macOS + Claude Code first.** Documentation is in Chinese.
+> Run an AI development team from one seat. Foremind plans work into batches, opens AI coding sessions ("seats") for them, hands work over between sessions, gets every change reviewed by a separate read-only reviewer, and only merges through a mechanical gate. Pure Python standard library, state lives in files and git. **Status: alpha (milestones M1 and M2 m2a–m2f done; next: M3 — installable, upgradable package), macOS + Claude Code first.** Documentation is in Chinese.
 
 Foremind 是一个让**一个人带一支 AI 开发团队**的本地开发系统：把需求拆成互不冲突的批次，为每批开一个 AI 编码会话（席位），会话满了自动交接给新会话，每次改动都由另一个只读的审查者零上下文审查，最后只能经过程序化的门禁合入。
 
 - 只用 Python 3.11+ 标准库，没有第三方依赖。
 - 状态都在文件和 git 里（项目下的 `.foremind/`），没有数据库和常驻网络服务；监督进程是本地进程。
-- 首发平台：macOS + [Claude Code](https://docs.claude.com/en/docs/claude-code)；Codex 支持在路线图里。
+- 首发平台：macOS + [Claude Code](https://docs.claude.com/en/docs/claude-code)；Codex 目前可作跨厂商审查者。
 
-> **现状：alpha。** 已完成里程碑 M1（核心可用）与 M2 的五段（m2a–m2e，完整治理的主体，由 Foremind 自己开发自己），M3（打包与试运行）尚未开始。接口和文件格式还会变，还没在本项目以外的真实项目上跑过，请勿用于重要项目。
+> **现状：alpha。** 已完成里程碑 M1（核心可用）与 M2 的六段（m2a–m2f，完整治理的主体，由 Foremind 自己开发自己）；下一步 M3（m3a–m3e：能装、能升级、上手即用、可配置的开源包）。接口和文件格式还会变，还没在本项目以外的真实项目上跑过，请勿用于重要项目。
 
 ## 它解决什么问题
 
@@ -50,7 +50,7 @@ Foremind 的做法是把这些都交给程序检查，而不是靠提示词约�
 | 监督进程 | tick / supervise、全局单实例锁、就绪队列、经作业开席与代合、卡住与继任、额度状态机、全阻塞、pause / STOP / run、ntfy 通知（只发送） |
 | 安装 | `init`（单仓/多仓、TOML 带标记块、钩子合并、交付约定的程序检测部分）、`doctor`、`status`、`uninstall`（逐字节还原） |
 
-## M2 已实现的部分（m2a–m2e，50 批）
+## M2 已实现的部分（m2a–m2f，60 批）
 
 | 模块 | 内容 |
 |---|---|
@@ -62,9 +62,10 @@ Foremind 的做法是把这些都交给程序检查，而不是靠提示词约�
 | 审计与守卫 | L0 事实对账与硬失败、交付前 L1 审计、进行中批次的越界兜底、守卫收紧（包装器、嵌套命令、项目外写入、依赖清单）与误拦修补 |
 | 监督进程 | 代码更新后自动 re-exec、阶段挂点、坏文件不中断、空闲席位让出名额、按行为判卡住、额度状态移到用户层 |
 | 总控 | 交互总控按实际上下文用量把关，固定模板交接并机械核对（`foremind controller`），失误与交接留结构化记录 |
-| 报表与度量 | `foremind report` 运行报告、按实测复算的建议值（只建议不改配置）、开发精度与效率度量（`report --plan`、`foremind defect` 记漏出缺陷） |
+| 报表与度量 | `foremind report` 运行报告、按实测复算的建议值（只建议不改配置）、开发精度与效率度量（`report --plan`、`foremind defect` 记漏出缺陷）、每批用量补记 |
+| 自动合入与审查对齐（m2f） | 用户授权（`[land] auto = true`）后监督进程对 done 级、门禁通过、无待决的批次自动 `land`；与冻结目标原文冲突的审查意见自动退回、退回按理由分类；门禁偶发失败自动重跑一次；`foremind watch` 巡查与 `say --direct` 直投；Codex 作为跨厂商审查者（`tiers.review = cross_vendor`） |
 
-尚未实现（M2 余项与 M3）：原生收件箱 socket 投递、编目员与上下文组装（ask、L0/L1 预算估算）、间隔抽审与事件轮转、晨报与 ntfy 回复频道、角色提示词定制、Codex、herdr 承载、多项目统一监督、Claude Code 插件打包、示例仓库。
+尚未实现：从 wheel 安装与升级（M3 第一段）、编目员与上下文组装（ask、L0/L1 预算估算）、间隔抽审与事件轮转、晨报与 ntfy 回复频道、角色提示词定制、Codex 席位（Codex 目前只当审查者）、herdr 承载、多项目统一监督、示例仓库。
 
 ## 快速开始（从源码）
 
@@ -97,6 +98,7 @@ foremind land <批次>            # 在临时 worktree 合并、跑验收与全�
 foremind decide show Q-n        # 查看待决；foremind decide Q-n <选项> 回答
 foremind say <批次> "<文字>"    # 给正在做该批的会话留言
 foremind supervise              # 前台监督循环（或 launchd 每分钟 foremind tick）
+foremind watch                  # 巡查：持续输出需要总控处理的事件
 foremind status [--all]         # 批次、会话、待决与额度
 foremind report [--plan <计划>] # 运行报告；按计划查精度与效率
 ```
@@ -115,14 +117,14 @@ foremind report [--plan <计划>] # 运行报告；按计划查精度与效率
 
 Foremind 本身由 AI 团队开发：一个交互式总控会话（Claude Opus）规划并派出写手会话，每批经零上下文审查、修复、复审后才合入；设计缺口由总控按「不放宽、只补机制」定下并记入 `DESIGN.md` §20。开发规则见 [`AGENTS.md`](AGENTS.md)。
 
-M2 起用 Foremind 自己开发自己：监督进程开席、3 个写手并行、审查、门禁、`foremind land` 合入，总控会话只做规划、裁定与合入后的收尾，自身上下文满了也按固定模板交接给新会话。
+M2 起用 Foremind 自己开发自己：监督进程开席、3 个写手并行、审查、门禁、`foremind land` 合入（m2f 起由监督进程自动合入），总控会话只做规划、裁定与合入后的收尾，自身上下文满了也按固定模板交接给新会话。
 
-如实说明：审查者与实现者是**同一厂商的同一模型**（不同的新会话），不是跨厂商复审；测试只在 Python 3.14 / 3.13 上运行过，未在 3.11 上实跑；还没在本项目以外的真实项目上试跑过。开发过程记录（审查报告、交接文档、调研）不在公开仓库中。
+如实说明：到 m2f 为止，各批审查者与实现者是**同一厂商的同一模型**（不同的新会话）；Codex 跨厂商审查已实现，尚未在真实批次上跑过；测试只在 Python 3.14 / 3.13 上运行过，未在 3.11 上实跑；还没在本项目以外的真实项目上试跑过。开发过程记录（审查报告、交接文档、调研）不在公开仓库中。
 
 ## 路线图
 
-- **M2 余项**：减少总控手工（消息投递、巡查、合入收尾进产品）、审查结论对齐冻结目标、度量补全、跨厂商审查（Codex）等，范围待定。
-- **M3 打包与试运行**：Claude Code 插件、文档、示例仓库、零上下文试装、真实项目试跑。
+- **M3**（进行中，每段一个计划）：m3a 稳定能装（wheel 安装、升级、CI）→ m3b CLI 英文化 → m3c 上手即用 → m3d 可配置 → m3e 开源门面与发布（英文文档另配中文版）。
+- **m2g**：飞书接入（机器人私信收发、多维表格看板），排在 M3 之后。
 
 ## 许可证
 

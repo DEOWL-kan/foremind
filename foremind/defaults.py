@@ -13,6 +13,7 @@ TABLE = {
     "audit.daily_cap": 10,
     "authz.preset": "balanced",
     "carrier.kind": "tmux",
+    "controller.permission_mode": None,  # I105: unset falls back to seat.permission_mode
     # §6.3, the runtime's (hooks); a seat whose status line reports a 1M window gets hooks' REQ-8 ones instead
     "context.abs_cap_tokens": 180_000,
     "context.hard_pct": 80,
@@ -33,6 +34,7 @@ TABLE = {
     "gate.ci": "none",
     "gate.ci_pending_max_min": 120,
     "hard_block.categories": [],
+    "land.auto": False,  # m2f REQ-2: only the user layer's own boolean true authorizes (commands/land.py)
     "land.commands": ["python3 -m unittest discover -s tests"],
     "notify.channel": "none",
     "notify.p1": "push",

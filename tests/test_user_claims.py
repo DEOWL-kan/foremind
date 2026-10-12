@@ -1,5 +1,6 @@
 """m2d.7 ⑦ and item 8: what the user's own commands write claims the user, so events.append checks seat_ancestor
-(REQ-11 ④); the session regex behind it is anchored and folds with the volume."""
+(REQ-11 ④); the session regex behind it is anchored and folds with the volume. m2f REQ-8: a claim of the controller
+too."""
 import os
 import subprocess
 import tempfile
@@ -8,10 +9,12 @@ from pathlib import Path
 from unittest import mock
 
 import test_seat
-from foremind import batchlog, events
+from foremind import batchlog, events, review
 from foremind.events import EventLog
 from foremind.plan import freeze
+from test_gate_fixture import Project
 from test_plan_helpers import ProjectCase
+from test_review import cli
 
 NO_SESSION = {"FOREMIND_SESSION": "", "FOREMIND_ROLE": "", "FOREMIND_JOB": ""}
 
@@ -38,6 +41,33 @@ class ClaimsTest(ProjectCase):
         self.assertEqual([(e["author"], e.get("seat_ancestor")) for e in self.events("batch_log_appended")],
                          [("user", "fm-x-1"), ("fm-p-1", None)])
         self.assertTrue(batchlog.verify(self.root, "p.1"))
+
+
+class ControllerClaimsTest(unittest.TestCase):  # m2f REQ-8
+    def test_any_claim_of_the_controller(self):  # the general fallback; a session, gate or supervisor is none
+        log = EventLog(Path(self.enterContext(tempfile.TemporaryDirectory())) / "events.jsonl")
+        with mock.patch.object(events, "seat_ancestor", return_value="fm-x-1"):
+            for k in events.CLAIMS:
+                self.assertEqual(log.append("x", **{k: "controller"}).get("seat_ancestor"), "fm-x-1", k)
+                for v in ("fm-p-1", "gate", "supervisor"):
+                    self.assertNotIn("seat_ancestor", log.append("x", **{k: v}), (k, v))
+
+    def test_listed_forms(self):  # a seat that cleared FOREMIND_SESSION and set FOREMIND_ROLE or FOREMIND_CONTROLLER
+        p = Project(self)
+        p.batch(state="approved")
+        p.batch("shop.2", state="merged")
+        fp = "0" * 16
+        for env, argv in (({"FOREMIND_ROLE": "controller"},
+                           ["review", "shop.1", "--request-changes", "--category", "overreach", "--item", "x"]),
+                          ({"FOREMIND_ROLE": "controller"}, ["review", "shop.1", "--withdraw", fp, "--reason", "r"]),
+                          ({"FOREMIND_CONTROLLER": "c-1"}, ["defect", "shop.2", "--source", "run", "--note", "n"])):
+            with mock.patch.dict(os.environ, {**NO_SESSION, **env}), \
+                    mock.patch.object(events, "seat_ancestor", return_value="fm-shop-shop.1-1"), \
+                    mock.patch.object(review, "load_receipts", return_value=[{"issues": [{"fingerprint": fp}]}]):
+                self.assertEqual(cli(argv)[0], 0, argv)
+        self.assertEqual([(e["by"], e.get("seat_ancestor")) for t in ("batch_state", "changes_requested_by",
+                                                                       "review_withdrawn", "defect_found")
+                          for e in p.events(t)], [("controller", "fm-shop-shop.1-1")] * 4)
 
 
 class SeatOpenTest(unittest.TestCase):

@@ -84,7 +84,7 @@ _SIDE_FROM = {
     "blocked": _ACTIVE,
     "stuck": ("running",),
     "paused": _ACTIVE,
-    "failed": ("running", "review_ready", "in_review", "changes_requested"),
+    "failed": ("running", "review_ready", "in_review", "changes_requested", "delivered"),  # delivered: m2f REQ-2
 }
 
 

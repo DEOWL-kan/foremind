@@ -4,14 +4,16 @@ Seat side: `request()` checks every repo's head is committed, pushes and opens P
 and moves the batch to review_ready. Supervisor side: `start()` checks the requested heads out detached into
 reviews/<session>/<repo> (§20 I50) and launches a read-only headless `claude -p` on them through job.start;
 `harvest()` deletes the checkouts and turns its stdout into `batches/<id>.review.r<n>.json`. The reviewer only supplies `verdict`
-and `issues[].{severity, location, summary, disputed}` and a must_fix's basis (REQ-15); everything else is written by the
-program, which lowers the must_fix it cannot back and sets the verdict from what is left (REQ-15, REQ-16).
+and `issues[].{severity, location, summary, disputed, conflict}`, a must_fix's basis (REQ-15) and a conflict's req and
+quote (m2f REQ-3); everything else is written by the program, which lowers the must_fix it cannot back, sets the verdict
+from what is left (REQ-15, REQ-16) and checks the conflicts (m2f REQ-3).
 
 Also the shared plumbing of review / acceptance / gate: batch header, repos and worktrees, heads, git and gh.
 Config keys read here (flat, merged by config.load): delivery.repo.<id>.{target_branch, push_pr, ci}, gate.ci,
-routes.reviewer.{model, effort, effort_s, effort_m, effort_l, effort_security}, exclude.models, exclude.providers,
-oneshot.timeout_min, oneshot.exclude_dynamic_prompt, review.max_rounds, review.max_failures, review.max_budget_usd,
-review.cost_cap_usd_{s, m, l}, review.cost_cap_tokens_{s, m, l}, review.new_must_fix_max, quota.stale_min.
+routes.reviewer.{model, cross_model, effort, effort_s, effort_m, effort_l, effort_security}, exclude.models,
+exclude.providers, oneshot.timeout_min, oneshot.exclude_dynamic_prompt, review.max_rounds, review.max_failures,
+review.max_budget_usd, review.cost_cap_usd_{s, m, l}, review.cost_cap_tokens_{s, m, l}, review.new_must_fix_max,
+quota.stale_min, quota.backoff_min.
 """
 import json
 import re
@@ -30,17 +32,21 @@ from foremind.fsutil import atomic_write, project_lock, sha256_bytes
 from foremind.paths import find_project_root, state_dir
 from foremind.plan import model
 from foremind.supervisor import quota
+from foremind.vendors import codex
 
 _ROLE_CARD = Path(__file__).resolve().parent.parent / "templates" / "roles" / "reviewer.md"
 READ_ONLY_TOOLS = "Read,Grep,Glob"
-# the reviewer's output (`--json-schema`, REQ-13): the fields assemble() takes; a must_fix's basis (REQ-15) is
-# checked there, not here, so a must_fix without one is lowered and kept rather than failing the review
+PROMPT = "Read ./prompt.md and follow it. Output only the JSON object it asks for."
+LAST_MESSAGE = "last-message.json"  # Codex's -o, in the materials directory (m2f REQ-13)
+# the reviewer's output (`--json-schema`, REQ-13): the fields assemble() takes; a must_fix's basis (REQ-15) and a
+# conflict's req and quote (m2f REQ-3) are checked there, not here, so a must_fix without one is lowered and kept
+# rather than failing the review; conflict is required on every issue, ignored on a must_fix
 REVIEW_SCHEMA = {"type": "object", "required": ["verdict", "issues"], "properties": {
     "verdict": {"enum": ["approved", "changes_requested"]},
     "issues": {"type": "array", "items": {
-        "type": "object", "required": ["severity", "location", "summary"],
+        "type": "object", "required": ["severity", "location", "summary", "conflict"],
         "properties": {"severity": {"enum": list(schemas.SEVERITIES)}, "location": {"type": "string"},
-                       "summary": {"type": "string"}, "disputed": {"type": "boolean"},
+                       "summary": {"type": "string"}, "conflict": {"type": "boolean"}, "disputed": {"type": "boolean"},
                        "basis": {"enum": list(schemas.REVIEW_BASES)}, "req": {"type": "string"},
                        "quote": {"type": "string"}, "form": {"enum": ["listed", "new"]}, "broken": {"type": "string"},
                        "category": {"type": "integer", "minimum": schemas.CATEGORIES[0],
@@ -148,12 +154,16 @@ def set_state(root, batch_id, to, *, expect=None, before=None, status=None, **fi
 STATUS_MAX_LINES = 40
 
 
-def request_changes(root, batch_id, items, *, by, reason="requested", title="总控要求修改") -> str:
+def request_changes(root, batch_id, items, *, by, reason="requested", title="总控要求修改", category=None) -> str:
     """The controller's (or the user's) must-fix list (§1.6): -> changes_requested, event changes_requested_by, the
     items as the batch file's `## 状态` section (outside plan_hash, in L1), at most STATUS_MAX_LINES lines. A holder
     (not user) gets them in its inbox and the batch moves on to running; with none it stays changes_requested for the
     supervisor's successor, who reads them in L1. Returns the state it ends in. `foremind update` sends its conflict
-    and re-review lists the same way, under its own `reason` and `title`."""
+    and re-review lists the same way, under its own `reason` and `title`. `category` (m2f REQ-4): why it is sent
+    back, one of schemas.RETURN_CATEGORIES, on both events; None (the program's other moves) leaves it out."""
+    if category is not None and category not in schemas.RETURN_CATEGORIES:
+        raise FlowError(f"category {category!r} is not one of {list(schemas.RETURN_CATEGORIES)}")
+    cat = {} if category is None else {"category": category}
     lines = [ln.strip() for i in items for ln in str(i).splitlines() if ln.strip()]
     if not lines:
         raise FlowError("request-changes needs at least one --item")
@@ -169,8 +179,8 @@ def request_changes(root, batch_id, items, *, by, reason="requested", title="总
         if s:
             inbox.append(s, f"Foremind：{status}\n改完提交，再执行 `foremind review`。", sender="controller", root=root)
 
-    set_state(root, batch_id, "changes_requested", before=tell, status=status, reason=reason, by=by)
-    events(root).append("changes_requested_by", batch=batch_id, by=by, items=lines)
+    set_state(root, batch_id, "changes_requested", before=tell, status=status, reason=reason, by=by, **cat)
+    events(root).append("changes_requested_by", batch=batch_id, by=by, items=lines, **cat)
     if not s:
         return "changes_requested"
     set_state(root, batch_id, "running", expect=("changes_requested",))
@@ -498,8 +508,16 @@ def route(cfg, h=None, root=None) -> tuple[str, str]:
     """Reviewer model and effort; exclusions are never bypassed (DESIGN §1.5). Given the batch header (and the
     project root, for its goal.md) the effort goes by tier (REQ-7), first one configured: effort_security for a
     batch covering a [防误操作] / [防对抗] REQ, effort_s / _m / _l by tiers.difficulty, effort, then xhigh."""
-    # ponytail: Claude only; cross-vendor routing comes with vendors/ (M1-4) and Codex (M2-7)
     model = cfg.get("routes.reviewer.model", "claude-opus-5-5")
+    effort = _effort(cfg, h, root)
+    if "claude" in cfg.get("exclude.providers", defaults.TABLE["exclude.providers"]):
+        raise FlowError("reviewer vendor claude is excluded")
+    if pat := _excluded(cfg, "claude", model):
+        raise FlowError(f"reviewer model {model} is excluded by {pat!r}")
+    return model, effort
+
+
+def _effort(cfg, h, root) -> str:
     keys = []
     if h is not None:
         keys += ["routes.reviewer.effort_security"] if security(root, h) else []
@@ -507,12 +525,52 @@ def route(cfg, h=None, root=None) -> tuple[str, str]:
     effort = next((cfg[k] for k in (*keys, "routes.reviewer.effort") if cfg.get(k) is not None), "xhigh")
     if h is not None and effort not in schemas.EFFORTS:  # r1 #3: tick.probes asks for the model only
         raise FlowError(f"reviewer effort {effort!r} (routes.reviewer.*) is not one of {list(schemas.EFFORTS)}")
-    if "claude" in cfg.get("exclude.providers", defaults.TABLE["exclude.providers"]):
-        raise FlowError("reviewer vendor claude is excluded")
-    for pat in cfg.get("exclude.models", defaults.TABLE["exclude.models"]):
-        if any(fnmatchcase(name.lower(), pat.lower()) for name in (model, f"claude:{model}")):
-            raise FlowError(f"reviewer model {model} is excluded by {pat!r}")
-    return model, effort
+    return effort
+
+
+def _excluded(cfg, vendor, model) -> str | None:
+    """The exclude.models pattern that matches `model` or `<vendor>:<model>`."""
+    return next((pat for pat in cfg.get("exclude.models", defaults.TABLE["exclude.models"])
+                 if any(fnmatchcase(n.lower(), pat.lower()) for n in (model, f"{vendor}:{model}"))), None)
+
+
+def reviewer(cfg, h, root, now=None) -> dict:
+    """m2f REQ-13: who reviews the batch, {vendor, model, effort, relation}. Codex (routes.reviewer.cross_model
+    `codex:<model>`) when tiers.review is cross_vendor, the key is set, neither codex nor the model is excluded, codex
+    is on PATH and the Codex quota back-off is over; else Claude as route() has it. The effort goes by route()'s
+    tiers either way. relation: to the batch's tiers.model, cross_vendor only for another vendor."""
+    cross = cfg.get("routes.reviewer.cross_model")
+    model = cross.removeprefix("codex:") if isinstance(cross, str) and cross.startswith("codex:") else ""
+    if (model and h["tiers"]["review"] == "cross_vendor"
+            and "codex" not in cfg.get("exclude.providers", defaults.TABLE["exclude.providers"])
+            and not _excluded(cfg, "codex", model) and shutil.which("codex")
+            and codex_backoff(all_events(root), time.time() if now is None else now) is None):
+        vendor, effort = "codex", _effort(cfg, h, root)
+    else:
+        vendor, (model, effort) = "claude", route(cfg, h, root)
+    seat = h["tiers"]["model"]
+    # ponytail: a seat model not named codex:<model> counts as Claude's, seats launch Claude only (vendors.get)
+    rel = ("cross_vendor" if ("codex" if seat.startswith("codex:") else "claude") != vendor
+           else "same_model" if seat.removeprefix("codex:") == model else "same_vendor")
+    return {"vendor": vendor, "model": model, "effort": effort, "relation": rel}
+
+
+def _codex_exhausted(evs) -> list:
+    """codex_quota_exhausted events since the latest harvested Codex review (its review_receipt's vendor)."""
+    out = []
+    for e in evs:
+        if e["type"] == "review_receipt" and e.get("vendor") == "codex":
+            out = []
+        elif e["type"] == "codex_quota_exhausted":
+            out.append(e)
+    return out
+
+
+def codex_backoff(evs, now) -> float | None:
+    """m2f REQ-13: the epoch the Codex quota back-off ends at, None outside one."""
+    ex = _codex_exhausted(evs)
+    until = ex and datetime.fromisoformat(ex[-1]["until"]).timestamp()
+    return until if until and until > now else None
 
 
 def full_behind(rs) -> bool:
@@ -584,7 +642,8 @@ def _materials(root, h, pairs, hd, cfg, mat, n, scope, prev=None, evs=(), at=Non
     found = req_texts(goal(root, h) or "")  # REQ-15: what a must_fix's quote is checked against
     if texts := [found[r].rstrip() for r in h["reqs"] if r in found]:
         (mat / "reqs.md").write_text("\n\n".join(texts) + "\n", encoding="utf-8")
-        lines.append("- ./reqs.md：本批覆盖的各 REQ 在 goal.md 里的原文；must_fix 以 REQ 为依据时，quote 从这里逐字摘")
+        lines.append("- ./reqs.md：本批覆盖的各 REQ 在 goal.md 里的原文；must_fix 以 REQ 为依据、或意见的 conflict 为 "
+                     "true 时，quote 从这里逐字摘")
     if gone := withdrawn(evs, h["id"], at and at["reviewer_session"]):
         said = {i.get("fingerprint"): i for r in load_receipts(root, h["id"]) for i in r.get("issues", [])}
         (mat / "withdrawn.md").write_text("".join(
@@ -628,7 +687,13 @@ _SCREENING = (
     "不是该 REQ 原文的一段、授权表类别不存在、没写被破坏行为的位置）；[防对抗] REQ 的新形式（覆盖范围外，留给后续批次）；"
     "总控或用户已撤回的问题（./withdrawn.md）。第 3 轮起，新报的 must_fix 若不在上一份回执以来改动的文件里，降为 "
     "should_fix；配置了每轮新 must_fix 上限时，超出的部分按你给出的顺序降为 should_fix，所以最要紧的排在前面。verdict "
-    "最后由程序按降级后是否仍有 must_fix 定。")
+    "最后由程序按降级后是否仍有 must_fix 定。\n\n"
+    "## 每条意见的 conflict\n\n"
+    "每条意见都写 conflict（布尔值）：与本批某条 REQ 的原文冲突写 true，并写 req（REQ-n）与 quote（从 ./reqs.md 逐字摘"
+    "该 REQ 原文的一段）；不冲突写 false，与 REQ 无关的意见也写 false。must_fix 上的 conflict 程序不看。程序核对后，"
+    "在回执的每条 should_fix、note（含降级来的）上记 conflict：yes（true，且核对通过，记下 req 与 quote）；no（false）；"
+    "missing（没写，或不是布尔值）；rejected（true 但核对不过，依次核：req 是本批的 REQ、quote 非空、goal.md 读得出、"
+    "quote 去掉空白后是该 REQ 原文的一段、[防对抗] REQ 不是新形式、不是已撤回的问题；记第一个不过的原因）。")
 
 
 def start(root, batch_id, cfg, *, started_by="supervisor") -> str:
@@ -636,7 +701,8 @@ def start(root, batch_id, cfg, *, started_by="supervisor") -> str:
     h = load_batch(root, batch_id)
     if h.get("state") != "review_ready":  # checked again under the lock below
         raise FlowError(f"{batch_id} is {h.get('state', 'planned')}, not review_ready")
-    model, effort = route(cfg, h, root)
+    rv = reviewer(cfg, h, root)
+    model, effort = rv["model"], rv["effort"]
     cap = cfg.get("review.new_must_fix_max")  # REQ-16; fixed for the round here, as the effort is
     if cap is not None and not re.fullmatch(r"[0-9]+", str(cap)):
         raise FlowError(f"review.new_must_fix_max {cap!r} is not a whole number >= 0")
@@ -656,9 +722,12 @@ def start(root, batch_id, cfg, *, started_by="supervisor") -> str:
     session = str(uuid.uuid4())
     mat = state_dir(root) / "reviews" / session
     meta = {"batch": batch_id, "round": n, "scope": scope, "heads": hd, "reviewer_session": session,
-            "model": model, "effort": effort, **({"delta_from": prev["heads"]} if prev else {}),
+            "model": model, "effort": effort, "vendor": rv["vendor"], "relation": rv["relation"],
+            **({"unrestricted": list(codex.UNRESTRICTED)} if rv["vendor"] == "codex" else {}),
+            **({"delta_from": prev["heads"]} if prev else {}),
             "difficulty": h["tiers"]["difficulty"], "security": security(root, h),
-            **({"new_must_fix_max": int(cap)} if cap is not None else {}), "quota_start": reading(root, cfg)}
+            **({"new_must_fix_max": int(cap)} if cap is not None else {}),
+            "quota_start": _reading(root, cfg, rv["vendor"])}
 
     def begin(_h):
         """Under the state lock: one of two concurrent starts wins, and only on the heads the seat asked to have
@@ -678,29 +747,35 @@ def start(root, batch_id, cfg, *, started_by="supervisor") -> str:
         drop_checkouts(pairs, mat)
         raise
     try:
-        meta["job_id"] = _launch(root, batch_id, cfg, model, effort, session, pairs)
+        meta["job_id"] = _launch(root, batch_id, cfg, model, effort, session, pairs, rv["vendor"])
     except Exception as e:
         drop_checkouts(pairs, mat)
-        _failed(root, batch_id, session, hd, cfg, f"reviewer did not start: {e}", infra=True)
+        _failed(root, batch_id, session, hd, cfg, f"reviewer did not start: {e}", infra=True,
+                usd=_no_usage(rv["vendor"]), vendor=rv["vendor"])
         raise FlowError(f"{batch_id}: reviewer did not start: {e}") from None
     atomic_write(mat / "meta.json", json.dumps(meta))
     return session
 
 
-def _launch(root, batch_id, cfg, model, effort, session, pairs) -> str:
+def _launch(root, batch_id, cfg, model, effort, session, pairs, vendor="claude") -> str:
     """Starts the reviewer on reviews/<session> (materials written) and returns its job id. §20 I47: --restricted
     drops the command tools and ignores user/project settings (defaultMode, allow rules); --tools is the whitelist.
     REQ-13: the output schema, and a dollar cap per review once review.max_budget_usd is set; A10: the per-machine
-    system prompt sections move out once oneshot.exclude_dynamic_prompt is on."""
+    system prompt sections move out once oneshot.exclude_dynamic_prompt is on. m2f REQ-13: Codex gets the same
+    prompt and materials, the schema in strict form as schema.json, its last message in LAST_MESSAGE."""
     mat = state_dir(root) / "reviews" / session
     budget = cfg.get("review.max_budget_usd")
-    argv = ["claude", "-p", "--restricted", "--tools", READ_ONLY_TOOLS, "--permission-mode", "plan",
-            "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
-            "--model", model, "--effort", effort, "--output-format", "json", "--session-id", session,
-            "--json-schema", json.dumps(REVIEW_SCHEMA), *(["--max-budget-usd", str(budget)] if budget is not None else []),
-            *(["--exclude-dynamic-system-prompt-sections"] if cfg.get("oneshot.exclude_dynamic_prompt") is True else []),
-            *(x for r, _ in pairs for x in ("--add-dir", str(mat / r.id))),
-            "--", "Read ./prompt.md and follow it. Output only the JSON object it asks for."]
+    if vendor == "codex":
+        atomic_write(mat / "schema.json", json.dumps(codex.strict_schema(REVIEW_SCHEMA)))
+        argv = codex.argv(model, effort, mat, mat / "schema.json", mat / LAST_MESSAGE, PROMPT)
+    else:
+        argv = ["claude", "-p", "--restricted", "--tools", READ_ONLY_TOOLS, "--permission-mode", "plan",
+                "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+                "--model", model, "--effort", effort, "--output-format", "json", "--session-id", session,
+                "--json-schema", json.dumps(REVIEW_SCHEMA), *(["--max-budget-usd", str(budget)] if budget is not None else []),
+                *(["--exclude-dynamic-system-prompt-sections"] if cfg.get("oneshot.exclude_dynamic_prompt") is True else []),
+                *(x for r, _ in pairs for x in ("--add-dir", str(mat / r.id))),
+                "--", PROMPT]
     env = {"CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD": "1",
            "FOREMIND_SESSION": session, "FOREMIND_ROLE": "reviewer", "FOREMIND_BATCH": batch_id}
     return job.start(state_dir(root) / "jobs", argv, cwd=mat, env=env,
@@ -757,6 +832,17 @@ def cost(raw: str, capped=False) -> tuple[dict, bool]:
                                                                  in json.dumps([top.get("errors"), top.get("result")]).lower())
 
 
+def _no_usage(vendor) -> dict:
+    """m2f REQ-13: a Codex review reports no dollars and other token counts: COST_KEYS null, codex_usage apart (null
+    until read)."""
+    return {**dict.fromkeys(COST_KEYS), "codex_usage": None} if vendor == "codex" else {}
+
+
+def _reading(root, cfg, vendor):
+    """reading() is the Claude account's: none for a Codex review."""
+    return reading(root, cfg) if vendor == "claude" else None
+
+
 def reading(root, cfg) -> dict:
     """REQ-2: {five_hour_pct, seven_day_pct, ts} of the account's newest status line reading, recorded as is, never
     acted on; a window null when there is no reading, it is older than quota.stale_min or the window has reset since."""
@@ -789,6 +875,22 @@ def _unbacked(it, fp, rules) -> str | None:
     elif basis != "regression" or not _squash(it.get("broken")):
         return "no_basis"
     return "withdrawn" if fp in rules["withdrawn"] else None
+
+
+def _conflict(it, fp, rules) -> tuple[str, str | None]:
+    """m2f REQ-3: (conflict, conflict_why) of a should_fix or note from the reviewer's `it`: yes, no, missing, or
+    rejected with the first of the checks, in order, its claim fails (schemas.CONFLICT_WHYS)."""
+    c = it.get("conflict")
+    if type(c) is not bool:
+        return "missing", None
+    if not c:
+        return "no", None
+    req, quote, texts = it.get("req"), _squash(it.get("quote")), rules["texts"]
+    why = ("not_batch_req" if req not in rules["reqs"] else "no_quote" if not quote
+           else "goal_unreadable" if texts is None else "quote_mismatch" if quote not in _squash(texts.get(req))
+           else "outside_coverage" if req in rules["adversarial"] and it.get("form") == "new"
+           else "withdrawn" if fp in rules["withdrawn"] else None)
+    return ("rejected", why) if why else ("yes", None)
 
 
 _QUOTED = re.compile(r'"((?:[^"\\]|\\.)*)"', re.S)
@@ -868,7 +970,9 @@ def assemble(out, meta, previous, rules=None) -> dict:
     req} are taken; a verdict that contradicts the reviewer's own severities is invalid output. `previous` = the
     receipts before this round. `rules` (harvest; ab() compares raw output and passes none, see screen_rules):
     must_fix lowered with was and filtered (REQ-15 to note; REQ-16 new ones outside `delta` or over `cap` to
-    should_fix), the verdict set from the must_fix left, resolved / unresolved against the previous receipt."""
+    should_fix), the verdict set from the must_fix left, then every should_fix and note (lowered ones too) gets its
+    conflict (m2f REQ-3, _conflict), resolved / unresolved against the previous receipt. Issues keep the output's
+    order (id = position), which harvest pairs them back by."""
     if not isinstance(out, dict) or not isinstance(out.get("issues"), list):
         raise ValueError("reviewer output needs an object with an `issues` list")
     seen = {i.get("fingerprint") for r in previous for i in r.get("issues", [])}
@@ -901,7 +1005,15 @@ def assemble(out, meta, previous, rules=None) -> dict:
             if why:
                 x.update(severity=to, was="must_fix", filtered=why)
         verdict = "changes_requested" if any(x["severity"] == "must_fix" for x in issues) else "approved"
-    keep = ("batch", "scope", "heads", "reviewer_session", "model", "effort", "round", "delta_from")
+        for it, x in zip(out["issues"], issues):
+            if x["severity"] == "must_fix":
+                continue
+            x["conflict"], why = _conflict(it, x["fingerprint"], rules)
+            if x["conflict"] == "yes":
+                x.update(req=it["req"], quote=it["quote"])
+            elif why:
+                x["conflict_why"] = why
+    keep = ("batch", "scope", "heads", "reviewer_session", "model", "effort", "round", "delta_from", "vendor", "relation")
     receipt = {**{k: meta[k] for k in keep if k in meta}, "verdict": verdict, "issues": issues}
     if previous:  # REQ-16
         now = {x["fingerprint"] for x in issues}
@@ -968,7 +1080,8 @@ def _current(root, batch_id, session, at, cfg):
 MAX_TIMEOUTS = 3  # consecutive reviewer timeouts on one set of heads; the knob that helps is oneshot.timeout_min
 
 
-def _failed(root, batch_id, session, at, cfg, error, *, infra=False, timed_out=False, reason=None, usd=None):
+def _failed(root, batch_id, session, at, cfg, error, *, infra=False, timed_out=False, reason=None, usd=None,
+            vendor="claude"):
     """Record a failed review (`at` = the heads it started on) and hand the batch back: review_ready for another
     try, or failed after review.max_failures consecutive failures of the reviewer on the same heads. `infra`
     failures (never started, runner lost, out of quota, timed out) are the machine's, not the model's: not counted;
@@ -978,7 +1091,8 @@ def _failed(root, batch_id, session, at, cfg, error, *, infra=False, timed_out=F
     review.max_budget_usd, the model's; `usd` = what the run cost (REQ-13)."""
     events(root).append("review_failed", dedupe_id=f"review:{batch_id}:{session}", batch=batch_id,
                         reviewer_session=session, heads=at, error=error, infra=infra, timed_out=timed_out,
-                        **({"reason": reason} if reason else {}), **(usd or {}), quota_end=reading(root, cfg))
+                        **({"reason": reason} if reason else {}), **(usd or {}),
+                        quota_end=_reading(root, cfg, vendor))
     if _current(root, batch_id, session, at, cfg) is None:
         return
     n = t = 0
@@ -1073,12 +1187,37 @@ _QUOTA = re.compile(r"rate[ _-]?limit|usage limit|session limit|quota|hit your \
 
 def _out_of_quota(root, meta) -> bool:
     """The reviewer's account ran out (e.g. Claude's "You've hit your session limit"): the machine's failure, not
-    the model's (§10.5: interrupted review, discard and rerun)."""
+    the model's (§10.5: interrupted review, discard and rerun). Codex's stdout is its --json event stream: the
+    items there other than errors (messages, reasoning, the output of the commands it ran) are not the CLI's word."""
     if meta is None:
         return False
     d = state_dir(root) / "jobs" / meta["job_id"]
-    return any(_QUOTA.search(p.read_text(encoding="utf-8", errors="replace"))
-               for p in (d / "stdout.log", d / "stderr.log") if p.is_file())
+    texts = [p.read_text(encoding="utf-8", errors="replace") for p in (d / "stdout.log", d / "stderr.log") if p.is_file()]
+    if meta.get("vendor") == "codex" and (d / "stdout.log").is_file():
+        texts[0] = "\n".join(x for x in texts[0].splitlines() if not _codex_item(x))
+    return any(_QUOTA.search(t) for t in texts)
+
+
+def _codex_item(line) -> bool:
+    """A Codex --json line holding an item that is not an error."""
+    try:
+        e = json.loads(line)
+    except ValueError:
+        return False
+    item = e.get("item") if isinstance(e, dict) and str(e.get("type")).startswith("item.") else None
+    return isinstance(item, dict) and item.get("type") != "error"
+
+
+_OPTIONAL = set(REVIEW_SCHEMA["properties"]["issues"]["items"]["properties"]) - set(
+    REVIEW_SCHEMA["properties"]["issues"]["items"]["required"])
+
+
+def _drop_nulls(out) -> dict:
+    """m2f REQ-13: Codex's strict schema gives an optional field it leaves out as null; dropped ahead of assemble()."""
+    if isinstance(out.get("issues"), list):
+        out["issues"] = [{k: v for k, v in i.items() if v is not None or k not in _OPTIONAL}
+                         if isinstance(i, dict) else i for i in out["issues"]]
+    return out
 
 
 def harvest(root, batch_id, session, cfg=None) -> dict | None:
@@ -1110,7 +1249,11 @@ def harvest(root, batch_id, session, cfg=None) -> dict | None:
         pass  # ponytail: the batch's worktrees are gone; git's own gc prunes the checkouts' registrations
     # OSError (never started, runner or its files lost, timed out) or no verdict for want of quota = the machine's
     # failure: not counted against review.max_failures
-    out, usd, budget = None, {}, False
+    # no meta.json: start() was cut short after in_review; its review_started event still has the heads and vendor
+    began = meta or next((e for e in reversed(all_events(root)) if e["type"] == "review_started"
+                          and e.get("batch") == batch_id and e.get("reviewer_session") == session), None)
+    vendor = (began or {}).get("vendor", "claude")
+    out, usd, budget = None, _no_usage(vendor), False
     try:
         if meta is None:
             raise OSError("reviewer was never started")
@@ -1119,34 +1262,56 @@ def harvest(root, batch_id, session, cfg=None) -> dict | None:
         if st.get("timed_out"):  # cut off by oneshot.timeout_min: the machine's, like a lost runner (§10.5)
             raise OSError(f"reviewer job timed out: {st}")
         raw = (state_dir(root) / "jobs" / meta["job_id"] / "stdout.log").read_text(encoding="utf-8", errors="replace")
-        usd, budget = cost(raw, cfg.get("review.max_budget_usd") is not None)
+        if vendor == "codex":
+            usd["codex_usage"] = codex.usage(raw)
+        else:
+            usd, budget = cost(raw, cfg.get("review.max_budget_usd") is not None)
         atomic_write(mat / "meta.json", json.dumps({**meta, **usd}))
         if budget:
             raise ValueError(f"reviewer stopped at review.max_budget_usd {cfg.get('review.max_budget_usd')}")
         if st["exit_code"] != 0:
             raise ValueError(f"reviewer job {st}")
-        out = parse_output(raw)
+        if vendor == "codex":
+            try:
+                last = (mat / LAST_MESSAGE).read_text(encoding="utf-8", errors="replace")
+            except OSError as e:  # exited 0 without its answer: the run's, counted (not a lost runner)
+                raise ValueError(f"codex wrote no last message: {e}") from None
+            out = _drop_nulls(parse_output(last))
+        else:
+            out = parse_output(raw)
         prev = [r for r in load_receipts(root, batch_id) if r.get("round", 0) < meta["round"]]
         receipt = assemble(out, meta, prev, screen_rules(root, load_batch(root, batch_id), meta, cfg, prev))
         if errs := schemas.validate("review_receipt", receipt):
             raise ValueError("receipt fails schema: " + "; ".join(errs[:3]))
     except (ValueError, OSError) as err:
-        # no meta.json: start() was cut short after in_review; its review_started event still has the heads
-        began = meta or next((e for e in reversed(all_events(root)) if e["type"] == "review_started"
-                              and e.get("batch") == batch_id and e.get("reviewer_session") == session), None)
+        quota_out = not budget and out is None and _out_of_quota(root, meta)
+        if quota_out and vendor == "codex":  # m2f REQ-13: ahead of the batch going back to review_ready
+            n = len(_codex_exhausted(all_events(root))) + 1
+            mins = float(cfg.get("quota.backoff_min", defaults.TABLE["quota.backoff_min"])) * 2 ** min(n - 1, 20)
+            until = datetime.fromtimestamp(time.time() + min(mins * 60, 5 * 3600), timezone.utc)
+            events(root).append("codex_quota_exhausted", dedupe_id=f"codex_quota:{batch_id}:{session}",
+                                batch=batch_id, n=n, until=until.isoformat(timespec="seconds"))
         _failed(root, batch_id, session, began and began.get("heads"), cfg, str(err),
-                infra=not budget and (isinstance(err, OSError) or (out is None and _out_of_quota(root, meta))),
+                infra=not budget and (isinstance(err, OSError) or quota_out),
                 timed_out=meta is not None and st.get("timed_out") is True, reason="budget" if budget else None,
-                usd=usd)
+                usd=usd, vendor=vendor)
         raise FlowError(f"{batch_id} review {session}: {err}") from None
     data = json.dumps(receipt, ensure_ascii=False, indent=2) + "\n"
     sha = sha256_bytes(data.encode())
     # event first: a crash before the file leaves an event that a re-harvest (same bytes, deduped) completes
     ev = events(root).append("review_receipt", dedupe_id=dedupe, batch=batch_id, round=meta["round"],
                              path=path.name, sha256=sha, verdict=receipt["verdict"], reviewer_session=session, **usd,
-                             quota_end=reading(root, cfg))
+                             **{k: meta[k] for k in ("vendor", "relation") if k in meta},
+                             quota_end=_reading(root, cfg, vendor))
     if ev["type"] != "review_receipt" or ev.get("sha256") != sha:
         raise FlowError(f"{batch_id} review {session} was already recorded as {ev['type']} with other content")
+    # m2f REQ-3, ahead of the file as the receipt's event is: a re-harvest writes the same ones (deduped)
+    for it, x in zip(out["issues"], receipt["issues"]):
+        if x.get("conflict") == "rejected":
+            fp = x["fingerprint"]
+            events(root).append("review_conflict_rejected", dedupe_id=f"conflict_rejected:{batch_id}:{session}:{fp}",
+                                batch=batch_id, round=meta["round"], fingerprint=fp,
+                                req=it["req"] if isinstance(it.get("req"), str) else None, why=x["conflict_why"])
     atomic_write(path, data)
     return _settle(root, batch_id, receipt, cfg)
 
@@ -1163,6 +1328,8 @@ def ab(root, batch_id, cfg, effort, *, by="user") -> dict:
     base = next((r for r in reversed(load_receipts(root, batch_id)) if r.get("scope") == "full"), None)
     if base is None:
         raise FlowError(f"{batch_id}: no full review receipt to compare with")
+    if base.get("vendor") == "codex":  # m2f REQ-13: the comparison reruns the base's model, and that on Claude only
+        raise FlowError(f"{batch_id}: the latest full review is Codex's; --ab compares Claude reviews only")
     # the same model, or it compares more than the effort; exclusions still apply (route)
     model, _ = route({**cfg, **({"routes.reviewer.model": base["model"]} if base.get("model") else {})}, h, root)
     pairs = batch_repos(root, h, cfg, main=True)

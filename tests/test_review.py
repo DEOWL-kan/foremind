@@ -170,7 +170,7 @@ class ReviewerTest(unittest.TestCase):
         self.assertNotIn("rebound_from", r)
         self.assertEqual(r["issues"], [{"id": "1", "fingerprint": review.fingerprint("api:src/app.py:3", "Nit"),
                                         "severity": "note", "status": "new", "location": "api:src/app.py:3",
-                                        "summary": "Nit"}])
+                                        "summary": "Nit", "conflict": "missing"}])
         path = state_dir(p.root) / "batches" / "shop.1.review.r1.json"
         self.assertEqual(p.events("review_receipt")[-1]["sha256"], sha256_bytes(path.read_bytes()))
         self.assertEqual(p.head(), head)  # the receipt lives in .foremind/, never in the worktree
@@ -645,15 +645,35 @@ class RequestChangesTest(unittest.TestCase):
         p = Project(self)
         p.batch(state="approved")
         with mock.patch.dict(os.environ, {"FOREMIND_SESSION": "fm-shop-shop.1-1", "FOREMIND_ROLE": "seat"}):
-            code, _, err = cli(["review", "shop.1", "--request-changes", "--item", "x"])
+            code, _, err = cli(["review", "shop.1", "--request-changes", "--category", "other", "--item", "x"])
         self.assertEqual((code, p.state()), (1, "approved"))
         self.assertIn("controller", err)
-        code, _, err = cli(["review", "shop.1", "--request-changes"])
+        code, _, err = cli(["review", "shop.1", "--request-changes", "--category", "other"])
         self.assertEqual((code, p.state()), (1, "approved"))
         with mock.patch.dict(os.environ, {"FOREMIND_SESSION": "fm-ctl-1", "FOREMIND_ROLE": "controller"}):
-            code, out, _ = cli(["review", "shop.1", "--request-changes", "--item", "补测试"])
+            code, out, _ = cli(["review", "shop.1", "--request-changes", "--category", "missing_test",
+                                "--item", "补测试"])
         self.assertEqual((code, json.loads(out)["state"]), (0, "changes_requested"))
         self.assertEqual(p.events("changes_requested_by")[-1]["by"], "fm-ctl-1")
+        self.assertEqual([p.events(t)[-1].get("category") for t in ("batch_state", "changes_requested_by")],
+                         ["missing_test", "missing_test"])
+
+    def test_cli_category(self):  # m2f REQ-4: checked before request_changes, so nothing is written
+        p = Project(self)
+        p.batch(state="approved")
+        before = review.all_events(p.root)
+        for argv, msg in ((["--request-changes", "--item", "x"], "needs --category"),
+                          (["--request-changes", "--category", "taste", "--item", "x"], "'taste' is not taken"),
+                          (["--category", "regression"], "--category goes with --request-changes"),
+                          # r1 should_fix: without a value, ours too (exit 1, the categories listed)
+                          (["--request-changes", "--item", "x", "--category"], "needs --category"),
+                          (["--request-changes", "--category", "--item", "x"], "needs --category"),
+                          (["--category"], "--category goes with --request-changes")):
+            code, _, err = cli(["review", "shop.1", *argv])
+            self.assertEqual((code, p.state(), review.all_events(p.root)), (1, "approved", before), argv)
+            self.assertIn(msg, err)
+            if argv[0] == "--request-changes":
+                self.assertIn(", ".join(schemas.RETURN_CATEGORIES), err)
 
 
 RAW_CLAUDE = r'''

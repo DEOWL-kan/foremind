@@ -325,7 +325,8 @@ def open_controller(root, *, carrier, config=None, predecessor=None) -> dict:
     # no --settings: the project's installed hooks already run in its root, a second copy would fire twice
     spec = get_vendor(seat._vendor(model)).launch(
         session=name, batch="", role="controller", project_root=root, cwd=root, settings_path=None,
-        permission_mode=seat.setting(cfg, "seat.permission_mode"), model=model, effort=effort,
+        permission_mode=seat.setting(cfg, "controller.permission_mode") or seat.setting(cfg, "seat.permission_mode"),
+        model=model, effort=effort,
         env={"FOREMIND_ROLE": "controller", MARKER: name, "FOREMIND_PROJECT": str(root)})
     timeout = seat.setting(cfg, "seat.manual_sessionstart_timeout_s" if carrier.name == "manual"
                            else "seat.sessionstart_timeout_s")

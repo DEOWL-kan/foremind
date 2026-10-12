@@ -33,6 +33,8 @@ BEFORE = {
     "supervisor.tick_s": 30}
 ADDED = {  # REQ-3: keys read with a literal default somewhere, or registered with "unset" meaning none
     "stuck.pattern_repeat": 3, "oneshot.exclude_dynamic_prompt": False, "quota.probe_command": None,
+    "controller.permission_mode": None,
+    "land.auto": False,  # m2f.1: the supervisor's automatic land, off unless the user layer sets true
     "review.max_budget_usd": None, "review.new_must_fix_max": None,
     **{f"review.cost_cap_{u}_{s}": None for u in ("usd", "tokens") for s in "sml"}}
 SKIP = {"defaults.py", "config.py"}

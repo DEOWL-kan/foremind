@@ -33,7 +33,7 @@ _FORBIDDEN = re.compile("|".join(_WORD.format(re.escape(w)) if w.isascii() else 
                         re.I | re.ASCII)
 _PROSE_KEYS = ("reason", "why", "step")  # header strings that are prose; commands and paths are not checked
 ALLOW_WORD = "<!-- fm-allow-word -->"  # a body line carrying it is not checked for forbidden words; header fields always are
-REQ = re.compile(r"\bREQ-[1-9][0-9]*\b")
+REQ = re.compile(r"^(REQ-[1-9][0-9]*)[:：]", re.M)  # a REQ definition opens its line; "m2d REQ-14" is a reference
 
 
 def effective_budget(config: dict) -> int:
@@ -137,7 +137,7 @@ def _check_batches(root, plan, mine, config, user_approved, config_bound, errors
         elif plan.doc.header["goal_hash"] != h:
             errors.append("plan.md: goal_hash is not the frozen goal's hash; restore goal.md, "
                           "or plan amend --goal --user-approved")
-        goal_reqs = set(REQ.findall(plan.goal.body))
+        goal_reqs = {m[1] for m in REQ.finditer(plan.goal.body)}
         if not goal_reqs:
             errors.append("goal.md: no REQ-n")
     live = {b: d for b, d in plan.batches.items() if d.header.get("state") != "cancelled"}  # finished ones count

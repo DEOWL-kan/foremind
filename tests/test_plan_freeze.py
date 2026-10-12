@@ -27,6 +27,9 @@ class FreezeTest(ProjectCase):
             freeze.freeze_goal(self.root, "p")
         with self.assertRaisesRegex(PlanError, "REQ-n"):
             freeze.freeze_goal(self.root, "q", "没有编号\n")
+        with self.assertRaisesRegex(PlanError, "REQ-n"):  # m2f REQ-10: a reference is no definition
+            freeze.freeze_goal(self.root, "q", "沿用 m2d REQ-14 的做法\n")
+        self.assertTrue(freeze.freeze_goal(self.root, "q", "REQ-1：全角冒号\n"))
 
     def test_approve(self):
         self.save(make_plan("p", [header("p.1", ["main:a.py"]), header("p.2", ["main:b.py"], ["p.1"])]))

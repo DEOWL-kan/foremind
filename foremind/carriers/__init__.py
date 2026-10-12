@@ -19,6 +19,8 @@ from foremind.events import EventLog
 from foremind.fsutil import sha256_bytes
 from foremind.paths import state_dir
 
+DELIVERY_EVENT = "program_delivery"
+
 
 class CarrierError(Exception):
     pass
@@ -86,18 +88,19 @@ class Carrier:
         """Session names the carrier knows; None when it cannot list (manual)."""
         raise NotImplementedError
 
-    def deliver(self, session, text) -> bool | None:
+    def deliver(self, session, text, *, event=DELIVERY_EVENT, **fields) -> bool | None:
+        """`event` and `fields` (added to the intent) name another sender (m2f REQ-5's controller_delivery)."""
         text = normalize(text)
         log = EventLog(state_dir(self.root) / "events.jsonl")
         did = uuid.uuid4().hex
-        log.append("program_delivery", phase="intent", dedupe_id=did, session=session, carrier=self.name,
-                   text_sha256=sha256_bytes(text.encode("utf-8")))
+        log.append(event, phase="intent", dedupe_id=did, session=session, carrier=self.name,
+                   text_sha256=sha256_bytes(text.encode("utf-8")), **fields)
         try:
             confirmed = self.send(session, text)
         except Exception as e:
-            log.append("program_delivery", dedupe_id=did, session=session, ok=False, error=str(e))
+            log.append(event, dedupe_id=did, session=session, ok=False, error=str(e))
             raise
-        log.append("program_delivery", dedupe_id=did, session=session, ok=True, confirmed=confirmed)
+        log.append(event, dedupe_id=did, session=session, ok=True, confirmed=confirmed)
         return confirmed
 
 

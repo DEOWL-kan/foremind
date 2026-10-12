@@ -308,7 +308,7 @@ DENIED = ["foremind plan approve p1", "foremind plan amend p1 --reason r --user-
           "foremind decide Q-3 1 -- --new",
           # m2b.2: a whitelist, so what is not listed is denied, new commands included
           "foremind catalog apply out.json", "foremind update b.1", "foremind seat b.1", "foremind pause",
-          "foremind tick", "foremind supervise", "foremind", "foremind -h", "foremind decide show Q-3 1",
+          "foremind tick", "foremind supervise", "foremind", "foremind decide show Q-3 1",
           "foremind decide --question q $X --new", "foremind decide --new --question q extra",
           "foremind decide --n --question q", "foremind decide --new -q x", "foremind quota '>' --reset",
           "foremind plan freeze p", "foremind plan new req", "foremind future-command x"]
@@ -332,10 +332,24 @@ BY_ROLE = {"seat": (["foremind review b.1", "foremind review", "foremind gate b.
                     ["foremind review b.1 --request-changes --item x", "foremind review --req", "foremind review $B",
                      "foremind review --item x b.1", "foremind review b.1 b.2", "foremind review -- b.1",
                      "foremind run b.1", "foremind say x", "foremind plan submit p --dir d",
-                     "foremind plan amend p --reason r"]),
+                     "foremind plan amend p --reason r",
+                     "foremind review b.1 --request-changes --category regression --item x"]),
            "controller": (["foremind review b.1 --request-changes --item 'x?'", "foremind review b.1 --req --item x",
-                           "foremind plan amend p --reason r --batch f.md", "foremind run b.1 b.2", "foremind say hi"],
+                           "foremind plan amend p --reason r --batch f.md", "foremind run b.1 b.2", "foremind say hi",
+                           # m2f REQ-4
+                           "foremind review b.1 --request-changes --category deviates_req --item x --item y",
+                           "foremind review b.1 --category=other --request-changes --item x"],
                           ["foremind review b.1", "foremind review $B --request-changes", "foremind gate b.1",
+                           "foremind review b.1 --category other --item x",
+                           "foremind review b.1 --category $C --request-changes --item x",
+                           # m2f.5 r1 must_fix: its value literal after --request-changes too, present
+                           "foremind review b.1 --request-changes --category $C --item x",
+                           "foremind review b.1 --request-changes --category 'a*' --item x",
+                           "foremind review b.1 --request-changes --category=$C --item x",
+                           "foremind review b.1 --request-changes --cat=`c` --item x",
+                           "foremind review b.1 --request-changes --category= --item x",
+                           "foremind review b.1 --request-changes --category --item x",
+                           "foremind review b.1 --request-changes --item x --category",
                            "foremind plan amend p --reason r --user", "foremind plan submit p --dir d"]),
            "planner": (["foremind plan submit p --dir d", 'foremind plan submit p --dir "$D"'],
                        ["foremind plan amend p --reason r", "foremind review b.1", "foremind gate b.1"]),
@@ -365,6 +379,32 @@ class WhitelistTest(unittest.TestCase):  # m2b.2 item 7 (replaces the user-only 
             for cmd in no:
                 self.assertTrue(ev(cmd, role=role).matrix, (role, cmd))
         self.assertEqual(ev("foremind plan approve p1", session=None).matrix, [])  # the user's own session
+
+    def test_usage_query(self):  # m2f REQ-7: argparse prints the usage and exits, running no subcommand
+        pre, white = f"PYTHONPATH={claude._PKG_PARENT} python3 -P -m foremind", "按角色白名单"
+        for cmd in ("foremind status --help", "foremind decide --new -h", f"{pre} land --help", "foremind --help",
+                    "foremind -h", "foremind plan approve p1 --help", "foremind log b.1 --author user -h",
+                    "foremind land b.1 --help 2>&1 | head -20", "foremind -h -- x"):
+            for role in (None, "seat", "controller", "planner", "reviewer"):
+                v = ev(cmd, role=role)
+                self.assertEqual((v.matrix, v.pending), ([], []), (role, cmd))
+        for cmd, why in (("foremind log x -- --help", white), ("foremind log x --author=--help", white),
+                         ("foremind plan approve -- -h", white), ("foremind $X --help", white),
+                         ("foremind land 'b?' --help", white), ("foremind --he land", white),
+                         ("foremind land --help-me", white),
+                         (f"{pre}.commands.supervise --help", white),  # another module's main may not read it
+                         ("env -u FOREMIND_SESSION foremind status --help", "不能改写 FOREMIND_SESSION"),
+                         ("FOREMIND_SESSION= foremind land --help", "不能改写 FOREMIND_SESSION"),
+                         ("python3 -m foremind --help", "固定走主检出代码"),
+                         ("PATH=/wt/.venv/bin:/usr/bin foremind land --help", "固定走主检出代码"),
+                         ("fore$X land --help", "命令名里有未展开的 shell 写法"),
+                         ("timeout --bogus 5 foremind land --help", "选项认不出"),
+                         ("python3 > -x -m foremind land --help", "看不出是重定向还是参数")):
+            for role in ("seat", "controller"):
+                v = ev(cmd, role=role)
+                self.assertTrue(any(why in r for r in v.matrix), (role, cmd, v.matrix))
+        v = ev("foremind land --help && git push", role="seat")  # hard blocks as before
+        self.assertEqual((v.matrix, [c for c, _ in hits("foremind land --help && git push")]), ([], [23]))
 
     def test_planner_commits_nothing(self):  # m2b.9 r1, Q-21: a cd into the main checkout does not change that
         for cmd in ("git add .", "git commit -m x", "cd /proj && git commit -am x", "git -C /proj commit -m x",

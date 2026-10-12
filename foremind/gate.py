@@ -16,6 +16,8 @@ in_review -> approved -> awaiting_audit | delivered -> merged (merge_dev only), 
 (checked before and after) or `gh pr merge --match-head-commit`. Right before the group's first merge each gh repo's
 PR must be mergeable to the host (mergeStateStatus in MERGEABLE, else check `mergeable` fails and nothing merges); a
 PR the merge queue took is `merge_queued` and the batch stays delivered until a later run (or L0) sees it merged.
+An in_review batch whose receipt passes but holds a conflict with a REQ's text the program checked (m2f REQ-3) goes
+back to the seat instead (check req_conflict, review.request_changes by gate), with nothing run.
 """
 import contextlib
 import json
@@ -23,6 +25,7 @@ import re
 import time
 import tomllib
 from datetime import datetime, timezone
+from pathlib import Path
 
 from foremind import acceptance, job, pathmatch, review, schemas
 from foremind.defaults import TABLE
@@ -41,6 +44,8 @@ MAX_PAGES = 50  # of a host list (100 per page)
 # added later stop the whole merge group (N3)
 MERGEABLE = ("CLEAN", "HAS_HOOKS", "UNSTABLE")
 SETTLE_TRIES, SETTLE_S = 3, 5
+TAIL_ERR, TAIL_OUT, TAIL_CHARS = 30, 10, 300  # m2f REQ-9: lines of a failed command's stderr.log, stdout.log; width
+TAIL_BLOCK = 64 * 1024  # bytes per backward read while looking for line breaks
 
 _DEPISH = re.compile(r"depend|requires|overrides|resolutions", re.I)
 _MISSING = object()
@@ -182,7 +187,9 @@ def _implementers(root, batch_id, evs) -> set:
     return out - {None, ""}
 
 
-def _receipt_checks(root, batch_id, hd, diverged, add) -> bool:
+def _receipt_checks(root, batch_id, hd, diverged, add) -> tuple:
+    """Adds receipt, reviewer and receipt_event; (the latest receipt, None when there is none or it fails its schema,
+    whether all three pass)."""
     rs = review.receipts(root, batch_id)
     r = None
     if rs:
@@ -197,7 +204,7 @@ def _receipt_checks(root, batch_id, hd, diverged, add) -> bool:
         why = f"r{n}: {'; '.join(errs[:3])}" if rs else "no review receipt"
         for name in ("receipt", "reviewer", "receipt_event"):
             add(name, False, why)
-        return False
+        return None, False
     probs = [] if r["batch"] == batch_id else [f"receipt is for {r['batch']}"]
     if r["verdict"] != "approved":
         probs.append(f"verdict {r['verdict']}")
@@ -224,7 +231,7 @@ def _receipt_checks(root, batch_id, hd, diverged, add) -> bool:
     add("reviewer", not impl, f"reviewer {r['reviewer_session']}" + (" also implemented this batch" if impl else ""))
     ok = receipt_backed(evs, batch_id, path.name, data, r)
     add("receipt_event", ok, "" if ok else "receipt does not match a review started by the program")
-    return not probs and not impl and ok
+    return r, not probs and not impl and ok
 
 
 def receipt_backed(evs, batch_id, name, data, r) -> bool:
@@ -278,7 +285,49 @@ def _local_check(root, batch_id, cfg, h, hd, kind, add, *, may_run, rerun):
             probs.append(f"failed: {failed}")
     if not recorded:
         probs.append("file does not match the program's run record")
-    add(name, not probs, "; ".join(probs) or f"{len(want)} passed")
+    tails = [] if errs else [x for c in res["commands"] if c["exit_code"] != 0 for x in _output_tail(c)]
+    add(name, not probs, "\n".join(["; ".join(probs) or f"{len(want)} passed", *tails]))
+
+
+def _tail(p, n) -> list[str]:
+    """The last n lines of log p, each its first TAIL_CHARS characters: read backward from the end only for the line
+    breaks, then the head of each line, so a long line is never read whole."""
+    with open(p, "rb") as f:
+        size = f.seek(0, 2)
+        if not size:
+            return []
+        f.seek(size - 1)
+        end = size - 1 if f.read(1) == b"\n" else size  # where the last line's text ends
+        breaks, pos = [], end  # "\n" offsets before `end`, latest first
+        while pos and len(breaks) < n:
+            step = min(TAIL_BLOCK, pos)
+            pos -= step
+            f.seek(pos)
+            block, i = f.read(step), step
+            while len(breaks) < n and (i := block.rfind(b"\n", 0, i)) >= 0:
+                breaks.append(pos + i)
+        starts = ([0] if len(breaks) < n else []) + [b + 1 for b in reversed(breaks)]
+        out = []
+        for a, b in zip(starts, [*(x - 1 for x in starts[1:]), end]):
+            f.seek(a)
+            out.append(f.read(min(b - a, TAIL_CHARS * 4)).decode("utf-8", "replace")[:TAIL_CHARS].rstrip("\r"))
+    return out
+
+
+def _output_tail(c) -> list[str]:
+    """m2f REQ-9: the end of a failed command's output for its check's detail: stderr.log, then stdout.log, from
+    the job directory of its output_path; one line when either cannot be read."""
+    d = Path(c["output_path"]).parent
+    out = []
+    for log, n in (("stderr.log", TAIL_ERR), ("stdout.log", TAIL_OUT)):
+        try:
+            out += _tail(d / log, n)
+        except OSError:
+            out = [f"    （输出读不到：{d / log}）"]
+            break
+    else:
+        out = [f"    | {x}" for x in out]
+    return [f"  {c['command']}（exit {c['exit_code']}）输出末尾：", *out]
 
 
 def required_checks(root, repo_id) -> list[str] | None:
@@ -564,7 +613,17 @@ def _gate(root, batch_id, cfg, *, role=None, session=None, rerun=False, merge=Tr
         if wait:
             pending.add(name)
 
-    receipt_ok = _receipt_checks(root, batch_id, hd, diverged, add)
+    r, receipt_ok = _receipt_checks(root, batch_id, hd, diverged, add)
+    # m2f REQ-3: an approved receipt on the current heads, all three checks passed, with a conflict with a REQ's text
+    # the program checked (yes) sends the batch back, running nothing, as a failed receipt does; not past in_review
+    if st == "in_review" and receipt_ok and (yes := [i for i in r["issues"] if i.get("conflict") == "yes"]):
+        add("req_conflict", False, "; ".join(f"{i['location']} {i['req']}" for i in yes))
+        result, path = _record(root, batch_id, hd, checks, pending)
+        warnings = _post_statuses(pairs, hd, remote, "failure", "failing: req_conflict")
+        items = [" ".join(f"{i['location']}：{i['summary']}（{i['req']} 原文：「{i['quote']}」）".split()) for i in yes]
+        after = review.request_changes(root, batch_id, items, by="gate", reason="req_conflict", category="deviates_req",
+                                       title="审查意见与 REQ 原文冲突，自动退回")
+        return {**result, "state": after, "path": str(path), "warnings": warnings}
     for kind in ("accept", "checks"):
         _local_check(root, batch_id, cfg, h, hd, kind, add, may_run=receipt_ok, rerun=rerun)
     diffs = _diffs(pairs, hd, trefs)

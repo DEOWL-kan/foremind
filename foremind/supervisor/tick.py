@@ -87,7 +87,7 @@ WAIT_TEXT = {"watch": "等你在场（或 foremind run）", "accompany": "等你
              "user": "等你认领（foremind seat --user）"}
 LOW_TEXT = "Foremind：额度偏低。到下一个安全点写交接段（`foremind handoff --write`），写完可以继续。"
 RESUME_TEXT = "Foremind：额度已恢复，继续。"
-GATE_TEXT = "Foremind：门禁未通过：\n{fails}\n处理后提交，再执行 `foremind review`。"
+GATE_TEXT = "Foremind：{note}门禁未通过：\n{fails}\n处理后提交，再执行 `foremind review`。"
 ERRORS = (OSError, ValueError, config.ConfigError, carriers.CarrierError, lock.LockError, review.FlowError,
           seat.SeatError, handoff.HandoffError, worktree.WorktreeError, inbox.InboxCorrupt, NotImplementedError)
 KINDS = ("seat", "successor", "gate", "probe")  # jobs of the tick itself; phases add their KIND
@@ -1065,19 +1065,44 @@ class Tick:
     _after_successor = _after_seat
 
     def _after_gate(self, it, ok, st, jid):
+        """门禁未通过 to the holder, each FAIL line with the output lines under it (m2f REQ-9); a held failure
+        (_held, recorded as gate_held so later passes do not judge it again) waits for the next pass (_rerun)."""
         bid = it["batch"]
         if ok or st.get("exit_code") != 1 or not jid:
             return
         try:
             if seat.read_header(self.root, bid).get("state") != "in_review":
                 return  # approved and waiting (CI): the retry says nothing new
-            out = (self.sd / "jobs" / jid / "stdout.log").read_text(encoding="utf-8", errors="replace")
+            if g := self._held(it):
+                self.emit("gate_held", dedupe_id=f"gate_held:{it['dedupe_id']}", batch=bid, round=it.get("round"),
+                          job=jid, heads=g["heads"], failing=g["failing"])
+                return
+            fails = self._gate_fails(jid)
         except (OSError, seat.SeatError):
             return
-        fails = [x for x in out.splitlines() if x.startswith("FAIL")]
         s = lock.holder(self.root, bid)
         if fails and s and s != lock.USER:
-            self.say(s, GATE_TEXT.format(fails="\n".join(fails)), f"gate_failed:{jid}")
+            note = "已自动重跑一次，仍未通过；" if it.get("rerun") else ""
+            self.say(s, GATE_TEXT.format(note=note, fails="\n".join(fails)), f"gate_failed:{jid}")
+
+    def _gate_fails(self, jid) -> list[str]:
+        """The FAIL lines gate job `jid` printed, each with the two-space indented lines right under it."""
+        out, keep = [], False
+        for x in (self.sd / "jobs" / jid / "stdout.log").read_text(encoding="utf-8", errors="replace").splitlines():
+            keep = x.startswith("FAIL") or (keep and x.startswith("  "))
+            if keep:
+                out.append(x)
+        return out
+
+    def _held(self, it) -> dict | None:
+        """m2f REQ-9: the gate_result of in_review gate run `it` (ended exit 1) when its 门禁未通过 waits a pass: not a
+        rerun, and failing only acceptance and checks. In_review starts no other gate of the round once one answered,
+        so this is the round's first such failure."""
+        if it.get("rerun") or it.get("state") != "in_review":
+            return None
+        g = next((e for e in reversed(self.evs[self.evs.index(it) + 1:])  # at harvest: no result yet
+                  if e["type"] == "gate_result" and e.get("batch") == it["batch"]), None)
+        return g if g and g.get("failing") and set(g["failing"]) <= {"acceptance", "checks"} else None
 
     def _after_probe(self, it, ok, st, jid):
         tel = quota.read_account_telemetry(self.root) if ok else None
@@ -1256,7 +1281,7 @@ class Tick:
     def announce(self):
         """Stops the user may not see otherwise, each told once: an approved plan edited by hand since (findings 19:
         no seat nor successor opens on it; per plan_hash), a batch delivered for the user to merge (20: per the
-        batch_state event that moved it there)."""
+        batch_state event that moved it there; not one the land phase merges itself, m2f REQ-2)."""
         for pid, p in self.plans.items():
             if self.bound[pid] or "approved_at" not in p.doc.header or not p.active():
                 continue  # never approved: waits() says 计划待批准
@@ -1266,12 +1291,18 @@ class Tick:
                         f"计划 {pid} 在批准后被手改（批次头、正文或 plan.md），调度已停：不再提升批次、开席、开继任；"
                         f"改回原样，或用 foremind plan amend {pid} 重新走修订。")
         for bid in self.order:
-            if self.state(bid) != "delivered" or self.bcfg(bid) is None or self.merge_dev(bid):
+            if self.state(bid) != "delivered" or self.bcfg(bid) is None or self.merge_dev(bid) or self.auto_land(bid):
                 continue
             e = next((e for e in reversed(self.evs) if e["type"] == "batch_state" and e.get("batch") == bid
                       and "delivered" in (e.get("state"), e.get("to"))), None)
             self.notify(f"delivered:{bid}:{e['id'] if e else '-'}", f"{bid} 已交付，等你合入",
                         f"{bid} 已交付，等你合入；合入后监督进程补记 merged。")
+
+    def auto_land(self, bid) -> bool:
+        """m2f REQ-2: the land phase merges `bid` itself (phases/land.py auto: items 1-8 and 10), so it does not wait
+        on the user. load_phases, not self.phases: status's Tick has no __init__."""
+        m = next((m for m in self.load_phases() if m.__name__.endswith(".land")), None)
+        return bool(m and m.auto(self, bid))
 
     def waits(self):
         """({batch: reason} of batches waiting on the user, {batch: why_not_ready} of the other planned/ready)."""
@@ -1292,6 +1323,7 @@ class Tick:
                       and h.get("blocked_reason") == "pending"
                       else Reason("失败，等你决定", "failed") if st == "failed"
                       else Reason("等你合入", "land") if st == "delivered" and not self.merge_dev(bid)
+                      and not self.auto_land(bid)
                       else (Reason("等审计放行", "audit_held") if audit.held(self.evs, bid) else None)
                       if st == "awaiting_audit"  # held: P0/P1, or no report; until then the auditor is due,
                       # whoever holds the batch
@@ -1377,24 +1409,55 @@ class Tick:
         # in_review: until the gate has answered this receipt (exit 0 or 1); an error (exit 2) is retried
         runs = [e for e in self.evs if e["type"] == "sv_gate" and e.get("batch") == bid
                 and (retry or e.get("round") == n)]
-        if st == "in_review" and any(self.result(e["dedupe_id"]).get("exit_code") in (0, 1)
-                                     for e in runs if e["phase"] == "intent" and self.result(e["dedupe_id"])):
+        done = [e for e in runs if e["phase"] == "intent" and (res := self.result(e["dedupe_id"]))
+                and res.get("exit_code") in (0, 1)]
+        if st == "in_review" and done:
+            if len(done) == 1 and (held := self.result(f"gate_held:{done[0]['dedupe_id']}")):
+                self._rerun(bid, n, held, runs)
             return
         last = max((e["at"] for e in runs if e["phase"] == "intent"), default=None)
         if last is None or self.now - last >= setting(self.cfg, "supervisor.gate_retry_min") * 60:
             self.start_job("gate", f"{bid}:r{n}:t{int(self.now)}", fm("gate", bid), env={"FOREMIND_ROLE": "supervisor"},
                            timeout_s=self.job_timeout(bid, "gate"), batch=bid, round=n, state=st)
 
+    def _rerun(self, bid, n, held, runs):
+        """m2f REQ-9, the pass after a held failure (its gate_held), not waiting gate_retry_min: heads as then ->
+        `foremind gate --rerun` once (its own failure is _after_gate's); heads moved, or the rerun ended without an
+        answer (exit 2, timed out, lost) -> the held 门禁未通过 goes out now, with why it was not rerun."""
+        jid, key = held["job"], f"gate_failed_late:{held['job']}"
+        if held["at"] >= self.now or self.result(f"sv_say:{key}"):
+            return  # held this pass: the next one decides
+        if tries := [e for e in runs if e["phase"] == "intent" and e.get("rerun")]:
+            did = tries[-1]["dedupe_id"]
+            code, state = (self.result(did) or {}).get("exit_code"), (self.result(did) or {}).get("job_state")
+            why = "超时" if self.result(f"sv_gate_timed_out:{did}") else f"exit {code}" if code is not None \
+                else state or "作业没起来"
+            note = f"自动重跑没有结果（{why}）；"
+        elif (cfg := self.bcfg(bid)) is None:
+            return
+        elif review.heads(review.batch_repos(self.root, self.headers[bid], cfg)) != held["heads"]:
+            note = "未自动重跑：heads 已变；"
+        else:
+            self.start_job("gate", f"{bid}:r{n}:rerun", fm("gate", "--rerun", bid), env={"FOREMIND_ROLE": "supervisor"},
+                           timeout_s=self.job_timeout(bid, "gate"), batch=bid, round=n, state="in_review", rerun=True)
+            return
+        s = self.holders.get(bid)
+        if s and s != lock.USER and (fails := self._gate_fails(jid)):
+            self.say(s, GATE_TEXT.format(note=note, fails="\n".join(fails)), key)
+
     def start_reviews(self):
-        cap = setting(self.cfg, "supervisor.max_oneshot")
-        if self.q("oneshot")["state"] == quota.LOW:
-            cap = max(1, cap // 2)
+        cap = setting(self.cfg, "supervisor.max_oneshot")  # Codex and Claude reviewers together
+        half = max(1, cap // 2) if self.q("oneshot")["state"] == quota.LOW else cap  # Claude's quota only
         n = self.oneshots()
         for bid in self.order:
             if self.state(bid) != "review_ready" or n >= cap or (cfg := self.bcfg(bid)) is None:
                 continue
-            if not self.may_call("oneshot"):
-                return
+            try:  # m2f REQ-13: the vendor first, then its quota; Codex's is not Claude's
+                codex = review.reviewer(cfg, self.headers[bid], self.root, self.now)["vendor"] == "codex"
+            except self.ERRORS:
+                codex = False  # start() raises it again and it is reported there
+            if not codex and (n >= half or not self.may_call("oneshot")):
+                continue
             try:
                 s = review.start(self.root, bid, cfg)
             except self.ERRORS as e:  # e.g. commits after `foremind review`: the seat has to ask again

@@ -209,7 +209,7 @@ def installed_dirs(root) -> list[Path]:
 
 
 def uninstall(root) -> list[str]:
-    """Also the registered repos without a manifest (lost): our hook entries there would keep the project on."""
+    """Also the registered repos without a manifest (lost): their entries that look like ours are only reported."""
     root = Path(root).resolve()
     try:
         repos = project_repos(root)
@@ -218,16 +218,16 @@ def uninstall(root) -> list[str]:
     dirs = list(dict.fromkeys([*settings_dirs(root, repos), *installed_dirs(root)]))
     tops = dict.fromkeys(t for d in dirs if (t := toplevel(d)) is not None)
     excludes = [exclude_file(t) for t in tops]
-    for d in dirs:  # an unreadable file stops us before anything changed
+    for d in dirs:  # an unreadable file stops us before anything changed; a manifest's is settings.uninstall's
         settings.installed_commands(d)
-        settings.original(root, d)
     for p in excludes:
         tomlblock.remove(p, EXCLUDE_BLOCK, check=False, dry_run=True)
     tomlblock.remove(project_config(root), PROJECT_BLOCK, template=PROJECT_TEMPLATE, dry_run=True)
     settings.wrapped()
     registered()
+    notes = []
     for d in dirs:
-        settings.uninstall(root, d)
+        notes += settings.uninstall(root, d)
     for p in excludes:
         if tomlblock.remove(p, EXCLUDE_BLOCK, check=False) and not p.read_text(encoding="utf-8").strip():
             p.unlink()  # the repo had no exclude file (or an empty one) before init
@@ -236,5 +236,5 @@ def uninstall(root) -> list[str]:
     set_registered(root, False)
     if not registered():
         settings.unwrap()
-    return [f"保留了 {state_dir(root)}（计划、批次、事件等数据，其中的 .gitignore 让 git 继续忽略它）；"
+    return notes + [f"保留了 {state_dir(root)}（计划、批次、事件等数据，其中的 .gitignore 让 git 继续忽略它）；"
             f"不再需要时自己删除：rm -rf {state_dir(root)}"]

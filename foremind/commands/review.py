@@ -16,6 +16,10 @@ def register(sub):
     p.add_argument("--request-changes", action="store_true",
                    help="send the batch back with a must-fix list (the controller or the user, never a seat)")
     p.add_argument("--item", action="append", default=[], help="one must-fix item (repeatable, with --request-changes)")
+    # nargs="?": a --category without a value is ours to refuse (exit 1, the categories listed), not argparse's
+    p.add_argument("--category", nargs="?", const="",
+                   help="why it is sent back (m2f REQ-4; required with --request-changes): one of "
+                        + ", ".join(review.schemas.RETURN_CATEGORIES))
     p.add_argument("--ab", metavar="EFFORT", choices=review.schemas.EFFORTS,
                    help="rerun the latest full review once at this effort and compare, outside the rounds and the gate "
                         "(REQ-14; the controller or the user, refused in a Foremind session)")
@@ -44,6 +48,12 @@ def _run(args):
             raise review.FlowError("--request-changes belongs to the controller (or the user outside any session)")
         if args.item and not args.request_changes:
             raise review.FlowError("--item goes with --request-changes")
+        if args.category is not None and not args.request_changes:
+            raise review.FlowError("--category goes with --request-changes")
+        if args.request_changes and args.category not in review.schemas.RETURN_CATEGORIES:
+            raise review.FlowError(("--request-changes needs --category" if not args.category else
+                                    f"--category {args.category!r} is not taken") + ", one of: "
+                                   + ", ".join(review.schemas.RETURN_CATEGORIES))
         if args.ab and session:  # REQ-14; the controller runs without FOREMIND_SESSION (controller.py)
             raise review.FlowError("--ab is refused inside a Foremind session (the controller or the user runs it)")
         if args.ab and (args.run_reviewer or args.request_changes):
@@ -56,7 +66,8 @@ def _run(args):
             raise review.FlowError("--reason goes with --withdraw")
         root, cfg = review.context(args.batch)
         if args.request_changes:
-            out = {"state": review.request_changes(root, args.batch, args.item, by=actor(session))}
+            out = {"state": review.request_changes(root, args.batch, args.item, by=actor(session),
+                                                   category=args.category)}
         elif args.withdraw is not None:
             ev = review.withdraw(root, args.batch, args.withdraw, args.reason,
                                  by=os.environ.get("FOREMIND_ROLE") or "user")

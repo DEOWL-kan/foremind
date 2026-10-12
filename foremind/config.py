@@ -52,6 +52,7 @@ KEY_CLASSES: dict[str, str] = {
     "review.max_rounds": PLAIN,
     "audit.daily_cap": PLAIN,  # m2b.5: L1 auditors started per local day (default 10)
     "land.commands": PLAIN,  # m2c.4: full-suite commands `foremind land` runs after accept_commands
+    "land.auto": AUTHZ,  # m2f REQ-2: no order, user layer only
     "decider.audit_ratio": PLAIN,  # m2b.3: share of decider decisions sampled for audit (default 0.2)
     "stuck.*": PLAIN,
     "delivery.depends_on": PLAIN,
@@ -74,6 +75,7 @@ KEY_CLASSES: dict[str, str] = {
     "gate.rereview_after_update": AUTHZ,
     "quota.reserve_pct": AUTHZ,
     "seat.permission_mode": AUTHZ,
+    "controller.permission_mode": AUTHZ,  # I105: unset → seat.permission_mode
     "authz.preset": AUTHZ,  # §8.1 presets (m2a.2 decide/table.py)
     "authz.hands_off_delegate": AUTHZ,  # no order: user layer only; m2b.3 hands_off categories given to the decider
     "delivery.repo.*.push_pr": AUTHZ,
@@ -103,6 +105,7 @@ AUTHZ_ORDERS: dict[str, list | str] = {
     "quota.oneshot_pause_pct": LOWER_STRICTER,  # the user keeping #23 is stricter
     "authz.preset": ["conservative", "balanced", "hands_off"],
     "seat.permission_mode": ["plan", "dontAsk", "manual", "acceptEdits", "auto", "bypassPermissions"],
+    "controller.permission_mode": ["plan", "dontAsk", "manual", "acceptEdits", "auto", "bypassPermissions"],
 }
 
 

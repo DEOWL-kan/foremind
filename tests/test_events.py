@@ -171,7 +171,7 @@ class SeatAncestorTest(unittest.TestCase):
 
     def test_other_events_are_written_as_before(self):
         with self.chain(self.seat(self.sd)) as ps:
-            e = self.log.append("review_requested", batch="p.1", requested_by="fm-p-1", by="controller")
+            e = self.log.append("review_requested", batch="p.1", requested_by="fm-p-1", by="gate")
         ps.assert_not_called()
         self.assertNotIn("seat_ancestor", e)
 

@@ -102,6 +102,11 @@ class TmuxCarrier(Carrier):
         return SessionState(alive=not dead, idle=time.time() - activity >= self.quiet_s,
                             tail=[x for x in screen.splitlines() if x.strip()][-20:])
 
+    def screen(self, session) -> list[str] | None:
+        """The pane as drawn (capture-pane -p is the rendered screen); None when tmux cannot capture it."""
+        r = self._tmux("capture-pane", "-p", "-t", f"={session}:", sock=self._sock(session), check=False)
+        return None if r.returncode else r.stdout.splitlines()
+
     def wait_idle(self, session, timeout_s):
         deadline = time.monotonic() + timeout_s
         while True:

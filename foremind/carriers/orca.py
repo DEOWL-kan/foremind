@@ -99,6 +99,19 @@ class OrcaCarrier(Carrier):
         return SessionState(alive=alive, idle=self.wait_idle(session, 0.5) if alive else None,
                             tail=[x for x in term.get("tail", []) if x.strip()][-20:])
 
+    def screen(self, session) -> list[str] | None:
+        """The rendered screen's lines (`read --screen`: plain `read` is the accumulated output, escapes stripped);
+        None when Orca answers screen-unavailable, fails, or the session has no record (watch, m2f.6)."""
+        h = self._handle(session)
+        if not h:
+            return None
+        try:
+            res = self._ok(self._orca("read", "--terminal", h, "--screen"), "read")
+        except CarrierError:
+            return None
+        lines = (_dig(res, "terminal") or {}).get("tail")  # seen live: result.terminal.tail (controller-8)
+        return lines if _dig(res, "source") == "screen" and isinstance(lines, list) else None
+
     def wait_idle(self, session, timeout_s):
         h = self._handle(session)
         if not h or h not in self._listed():
