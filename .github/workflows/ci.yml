@@ -14,7 +14,7 @@
         {"uses": "actions/checkout@v4", "with": {"persist-credentials": false}},
         {"uses": "actions/setup-python@v5", "with": {"python-version": "${{ matrix.python }}"}},
         {"name": "Build backend (environment setup; the tests build and install offline)",
-         "run": "python3 -m pip install \"setuptools>=61\"\npython3 --version\npython3 -c \"import ensurepip, setuptools; print(setuptools.__version__)\""},
+         "run": "python3 -m pip install \"setuptools>=61\" \"wheel<0.46\"\npython3 --version\npython3 -c \"import importlib.metadata as m, ensurepip, setuptools; print(setuptools.__version__, m.version('wheel'))\""},
         {"name": "No global git identity",
          "run": "touch \"$RUNNER_TEMP/empty-gitconfig\"\necho \"GIT_CONFIG_GLOBAL=$RUNNER_TEMP/empty-gitconfig\" >> \"$GITHUB_ENV\""},
         {"name": "Full test suite", "run": "python3 -m unittest discover -s tests"},

@@ -89,15 +89,20 @@ def preflight(tmp, src=ROOT) -> tuple[str, str | None]:
     if bs["build-backend"] != "setuptools.build_meta" or len(bs["requires"]) != 1:
         raise ToolMissing("; ".join(why + ["the pip fallback only knows a setuptools-only build-system"]))
     # pip is looked up, not imported: on <=3.11 importing pip loads the stdlib distutils first, and
-    # setuptools' _distutils_hack then fails its assertion, so a working interpreter would read as missing
-    check = ("import importlib.metadata as m, setuptools.build_meta; m.version('pip'); "
-             "print(m.version('setuptools'))")
+    # setuptools' _distutils_hack then fails its assertion, so a working interpreter would read as missing.
+    # `pip wheel` needs a bdist_wheel command: setuptools >=70.1 registers one, below that only wheel <0.46 does
+    # (0.46 dropped it). Looked up before setuptools is imported, which puts its vendored wheel on sys.path
+    check = ("import importlib.metadata as m; "
+             "bw = any(e.name == 'bdist_wheel' for e in m.entry_points(group='distutils.commands')); "
+             "import setuptools.build_meta; m.version('pip'); print(m.version('setuptools'), bw)")
     for py in dict.fromkeys(p for p in (os.environ.get("FOREMIND_BUILD_PYTHON"), shutil.which("python3"),
                                         shutil.which("python3.11")) if p):
         r = _run([py, "-c", check])
-        if r.returncode == 0 and _satisfies(r.stdout.strip(), bs["requires"][0]):
+        st, _, bw = r.stdout.strip().partition(" ")
+        if r.returncode == 0 and _satisfies(st, bs["requires"][0]) and bw == "True":
             return "pip", py
-    raise ToolMissing("; ".join(why + [f"no interpreter with pip and {bs['requires'][0]}"]))
+    raise ToolMissing("; ".join(why + [f"no interpreter with pip, {bs['requires'][0]} and a bdist_wheel command "
+                                       "(setuptools>=70.1, or wheel<0.46)"]))
 
 
 def source_copy(dst, src=ROOT) -> Path:
@@ -227,6 +232,22 @@ class HelperTest(unittest.TestCase):  # no build: runs everywhere
         self.assertTrue(_satisfies("61.0", "setuptools >= 61"))
         self.assertFalse(_satisfies("60.10.1", "setuptools>=61"))
         self.assertFalse(_satisfies("99", "setuptools<70"))  # not understood: never taken as satisfied
+
+    def test_no_bdist_wheel_is_a_missing_tool(self):
+        """Without a registered bdist_wheel (setuptools <70.1 with no wheel, or wheel >=0.46) `pip wheel` cannot
+        build: a missing tool, not a usable interpreter."""
+        def which(name):
+            return None if name == "uv" else f"/bin/{name}"
+        for out, usable in (("65.5.0 False", False), ("65.5.0 True", True), ("79.0.1 True", True),
+                            ("60.0 True", False)):
+            with self.subTest(out=out), tempfile.TemporaryDirectory() as d, \
+                    mock.patch.dict(os.environ, {"FOREMIND_BUILD_PYTHON": ""}), \
+                    mock.patch("shutil.which", which), \
+                    mock.patch(f"{__name__}._run", return_value=subprocess.CompletedProcess([], 0, out + "\n", "")):
+                if usable:
+                    self.assertEqual(preflight(d), ("pip", "/bin/python3"))
+                else:
+                    self.assertRaises(ToolMissing, preflight, d)
 
     def test_a_candidate_that_does_not_build_fails(self):
         """A candidate with the declared backend that does not build is BuildFailed, not ToolMissing (REQ-2)."""

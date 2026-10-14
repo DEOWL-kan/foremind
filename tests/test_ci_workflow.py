@@ -38,7 +38,10 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(self.job["env"]["FOREMIND_REQUIRE_BUILD"], "1")
         self.assertFalse(any("FOREMIND_REQUIRE_BUILD" in s.get("env", {}) for s in self.steps), "set once, for all")
         self.assertIn("GIT_CONFIG_GLOBAL=$RUNNER_TEMP/empty-gitconfig", "\n".join(self.runs))
-        self.assertTrue(any("setuptools>=61" in r for r in self.runs), "the declared backend is provided")
+        # wheel <0.46 (the last with its own bdist_wheel), not a newer setuptools: an image's setuptools <70.1 stays
+        # and the old bdist_wheel path is exercised
+        self.assertTrue(any('pip install "setuptools>=61" "wheel<0.46"' in r for r in self.runs),
+                        "the declared backend, and a bdist_wheel for a setuptools below 70.1")
 
     def test_read_only_and_nothing_outward(self):
         self.assertEqual(self.wf["permissions"], {"contents": "read"})
