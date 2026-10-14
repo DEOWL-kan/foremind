@@ -88,7 +88,9 @@ def preflight(tmp, src=ROOT) -> tuple[str, str | None]:
         why.append("no uv")
     if bs["build-backend"] != "setuptools.build_meta" or len(bs["requires"]) != 1:
         raise ToolMissing("; ".join(why + ["the pip fallback only knows a setuptools-only build-system"]))
-    check = ("import importlib.metadata as m, pip, setuptools.build_meta; "
+    # pip is looked up, not imported: on <=3.11 importing pip loads the stdlib distutils first, and
+    # setuptools' _distutils_hack then fails its assertion, so a working interpreter would read as missing
+    check = ("import importlib.metadata as m, setuptools.build_meta; m.version('pip'); "
              "print(m.version('setuptools'))")
     for py in dict.fromkeys(p for p in (os.environ.get("FOREMIND_BUILD_PYTHON"), shutil.which("python3"),
                                         shutil.which("python3.11")) if p):

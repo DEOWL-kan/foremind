@@ -674,14 +674,21 @@ class ResidualTest(unittest.TestCase):  # m2d.7, REQ-19 [防对抗] forms ①–
 
     def test_wrappers_keep_the_whitelist_and_the_prefix(self):  # ①
         pre = f"PYTHONPATH={self.MAIN} python3 -P -m foremind"
-        for w in ("timeout 5", "timeout -s KILL -k 3 10s", "timeout --signal=TERM --kill-after 1 --foreground 5",
-                  "TIMEOUT -vs9 1.5m", "nice", "nice -n 5", "nice -5", "nice --adjustment=3 -n1", "xargs",
-                  "xargs -0 -n 1 -P4", "xargs --max-args=2 -r", "uv run", "uv -q run --frozen --with x -p 3.11",
-                  "uv --directory d run --env-file=.env", "timeout 5 nice -n 1 xargs -r"):
+        def wrapped(w):
             self.denied(f"{w} foremind plan approve p1", "按角色白名单")
             self.denied(f"{w} python3 -m foremind status", "固定走主检出代码")
             self.assertTrue(hits(f"{w} git push origin fm/b.1"), w)
             self.assertTrue(hits(f"{w} npm install left-pad"), w)
+        for w in ("timeout 5", "timeout -s KILL -k 3 10s", "timeout --signal=TERM --kill-after 1 --foreground 5",
+                  "timeout -vs9 1.5m", "nice", "nice -n 5", "nice -5", "nice --adjustment=3 -n1", "xargs",
+                  "xargs -0 -n 1 -P4", "xargs --max-args=2 -r", "uv run", "uv -q run --frozen --with x -p 3.11",
+                  "uv --directory d run --env-file=.env", "timeout 5 nice -n 1 xargs -r"):
+            wrapped(w)
+        with mock.patch.object(guard.pathmatch, "FOLD", True):  # a case-insensitive volume: TIMEOUT is timeout
+            wrapped("TIMEOUT -vs9 1.5m")
+        with mock.patch.object(guard.pathmatch, "FOLD", False):  # case-sensitive (Linux): TIMEOUT is no wrapper
+            self.assertEqual(ev("TIMEOUT -vs9 1.5m foremind plan approve p1", role="seat").matrix, [])
+            self.assertEqual(hits("TIMEOUT -vs9 1.5m git push origin fm/b.1"), [])
         for w in ("timeout 5", "nice -n 5", "xargs -r", "uv run --frozen"):  # env goes through, uv's PATH does not
             self.assertEqual(ev(f"PYTHONPATH={self.MAIN} {w} python3 -P -m foremind status", role="seat").matrix, [])
             self.assertEqual(ev(f"{w} git status", role="seat").matrix, [], w)
