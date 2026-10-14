@@ -1,6 +1,6 @@
 # Foremind
 
-> Run an AI development team from one seat. Foremind plans work into batches, opens AI coding sessions ("seats") for them, hands work over between sessions, gets every change reviewed by a separate read-only reviewer, and only merges through a mechanical gate. Pure Python standard library, state lives in files and git. **Status: alpha (milestones M1 and M2 m2a–m2f done; next: M3 — installable, upgradable package), macOS + Claude Code first.** Documentation is in Chinese.
+> Run an AI development team from one seat. Foremind plans work into batches, opens AI coding sessions ("seats") for them, hands work over between sessions, gets every change reviewed by a separate read-only reviewer, and only merges through a mechanical gate. Pure Python standard library, state lives in files and git. **Status: alpha (milestones M1 and M2 m2a–m2f done; M3 in progress: m3a — installable, upgradable package), macOS + Claude Code first.** Install, requirements and upgrade are below in English ([中文](README.zh-CN.md)); the rest of the documentation is in Chinese.
 
 Foremind 是一个让**一个人带一支 AI 开发团队**的本地开发系统：把需求拆成互不冲突的批次，为每批开一个 AI 编码会话（席位），会话满了自动交接给新会话，每次改动都由另一个只读的审查者零上下文审查，最后只能经过程序化的门禁合入。
 
@@ -9,6 +9,91 @@ Foremind 是一个让**一个人带一支 AI 开发团队**的本地开发系统
 - 首发平台：macOS + [Claude Code](https://docs.claude.com/en/docs/claude-code)；Codex 目前可作跨厂商审查者。
 
 > **现状：alpha。** 已完成里程碑 M1（核心可用）与 M2 的六段（m2a–m2f，完整治理的主体，由 Foremind 自己开发自己）；下一步 M3（m3a–m3e：能装、能升级、上手即用、可配置的开源包）。接口和文件格式还会变，还没在本项目以外的真实项目上跑过，请勿用于重要项目。
+
+
+## Requirements
+
+- Python 3.11 or newer (standard library only: Foremind has no runtime dependencies), and `git`.
+- [Claude Code](https://docs.claude.com/en/docs/claude-code) installed as `claude` on `PATH` and logged in: seats, planners, reviewers and the other roles are Claude Code sessions, and a real batch spends your quota.
+- A carrier for interactive sessions: `tmux` or Orca (or `manual`, where you start each session yourself). macOS is the first platform.
+- `gh`, logged in (`gh auth login`), when a registered repo has a GitHub remote or any repo leaves pushing and PRs to Foremind (`push_pr = "system"`): `foremind doctor` then requires it, and `init` / `doctor --rescan` read the remote's settings and branch protection through `gh api`. Without either, it is not used.
+- Building a wheel needs the declared build backend, `setuptools>=61`.
+
+Before the first batch, what `foremind doctor` checks has to pass, among them:
+
+- **Gate checks.** When CI is `none`, or pushing and PRs stay with you, the gate only takes local checks: write `[gate] checks = ["<your test command>"]` in `foremind.toml` or `.foremind/config.toml`. An empty list never passes.
+
+`foremind doctor` does not check these; make sure of them yourself (its "all passed" does not cover them):
+
+- **Target branch of a repo without a remote.** With no remote to read a default branch from, name it: `[delivery.repo.<id>] target_branch = "main"` in `foremind.toml` (or `default_branch` in the repo's `[[repos]]` entry); otherwise opening the first seat fails.
+- **Git identity.** Seats commit: `git config user.name` and `user.email` must be set (globally or in the repo).
+- **Trusted directories.** Claude Code asks once per directory whether you trust it. Foremind never answers that dialog (or a permission prompt) for you: it refuses to type into such a screen and tells you; answer it in that session, then retry.
+- **Permission mode.** Seats and planners start with `--permission-mode` from `seat.permission_mode`, which is `acceptEdits` unless you set it; the live controller uses `controller.permission_mode`, else the same value. Foremind does not change these for you.
+
+Also know:
+
+- `foremind land` merges and rolls back the target branch under the project lock with Git hooks disabled for those commands (`core.hooksPath=/dev/null` on the command line; your Git config is not changed). Your `post-merge`, `reference-transaction` and other hooks do **not** run for those moves, on your main checkout either; run them yourself if you rely on them.
+
+The test suite and CI use fake `claude`, `tmux` and `gh`: they prove the install, hooks and prompts, not a real session. A real batch needs the real tools above and a logged-in Claude Code.
+
+## Install
+
+Foremind is not on PyPI. Build a wheel from a checkout and install that file:
+
+```sh
+git clone https://github.com/DEOWL-kan/foremind.git
+cd foremind
+python3 -m pip wheel --no-deps -w dist .          # or: uv build --wheel
+python3 -m venv ~/.venvs/foremind                  # any directory outside the checkout
+~/.venvs/foremind/bin/pip install --no-index dist/foremind-*.whl
+~/.venvs/foremind/bin/foremind version             # put ~/.venvs/foremind/bin on PATH, or call it by path
+```
+
+With uv instead of pip: `uv pip install --offline --python ~/.venvs/foremind/bin/python dist/foremind-*.whl`.
+
+Then in your project:
+
+```sh
+cd /path/to/your/project
+foremind init --carrier tmux        # asks each question; --yes takes the detected values, the strictest otherwise
+foremind doctor                     # every FAIL comes with its fix
+```
+
+`init` writes the hooks and status line into the project's `.claude/settings.local.json` (your own entries stay), `.git/info/exclude`, `.foremind/` in the project and the user layer `~/.config/foremind/`. The hooks run the interpreter of the `foremind` you ran, with `-P`, so a `foremind/` package in a session's working directory (a checkout of Foremind itself, say) cannot stand in for the installed one. `foremind uninstall` removes the hooks, status line, config blocks and registry line that still match what init recorded; an entry changed since is left in place and listed; `.foremind/` data stays.
+
+## Upgrade
+
+**A new wheel of the same version.** pip and uv keep an installed package of the same version, so force it:
+
+```sh
+~/.venvs/foremind/bin/pip install --no-index --force-reinstall dist/foremind-*.whl
+# uv: uv pip install --offline --reinstall --python ~/.venvs/foremind/bin/python dist/foremind-*.whl
+```
+
+An unchanged version number is no evidence that the package was replaced.
+
+**First upgrade from an older package** (the old CLI has no `upgrade` command, and does not know the new upgrade marker):
+
+1. Install the candidate wheel into a separate temporary venv: `python3 -m venv /tmp/fm-candidate && /tmp/fm-candidate/bin/pip install --no-index <new wheel>`.
+2. Check every affected project with the candidate CLI: `cd <project> && /tmp/fm-candidate/bin/foremind upgrade --check --all` (`--all`: every project in the user registry and this one). It writes nothing. It lists what runs (`foremind supervise`, seats, planners, the controller, jobs); for evidence it cannot tell it prints `foremind upgrade --confirm-exit <token>`: run that with the candidate CLI in that project's directory (`cd <project> && /tmp/fm-candidate/bin/foremind upgrade --confirm-exit <token>`; the old `foremind` on `PATH` has no `upgrade`), and only once you have checked that work has exited.
+3. Stop those processes yourself, and what starts them again (a launchd job running `foremind tick`, say). `foremind pause` is not enough: it stops automatic actions, not the processes. Foremind stops nothing itself. Run the check again until it passes.
+4. Force-reinstall your target install with the new wheel (pip or uv, as above).
+5. In each project, with the target CLI: `foremind upgrade` (this project only; no pip, no download, nothing stopped or resumed).
+6. Verify: `foremind upgrade --check` and `foremind doctor` pass.
+7. Start your work again (`foremind supervise`, your sessions, autostart).
+
+**From a source checkout to a wheel, or with two installs.** The `foremind` you run is the target: choose it explicitly (its full path, or the one first on `PATH`). `foremind doctor` reports, per directory, hooks that run another location (the source checkout, another venv, a missing interpreter) even when both import, and prints `foremind upgrade --check` and `foremind upgrade` for the CLI you ran. The upgrade moves only the hook entries the install records still match. The source checkout and the other install are kept: remove them yourself if you no longer want them.
+
+**Backups, interruptions and recovery.** Before it writes, `foremind upgrade` backs up every file it will change (bytes, path, existence, mode, sha256) in `.foremind/upgrade/backups/<transaction>/` (directories 0700, files 0600, ignored by git) and prints that path. After a success the backup is kept for seven days, until the date it prints; then delete it yourself (`rm -rf <backup>`). While an upgrade is unfinished, every Foremind write command, job and session open is refused (diagnostics, `--confirm-exit` and rerunning `foremind upgrade` stay). An interrupted upgrade is finished by running `foremind upgrade` again: it reuses the first backup, and stops without overwriting a file that holds neither its old content nor the upgrade's. If verification keeps failing, `foremind doctor` and `foremind upgrade` print the recovery steps with this project's paths:
+
+1. Stop every Foremind process of the project and what starts them again.
+2. Save any file that holds a third content (`cp -p <file> <backup>/conflict-<n>`).
+3. Restore each file that existed from its `<n>.orig` in the backup (and its mode); remove a file that did not exist before only if it still equals the upgrade's result.
+4. Check each restored file's sha256 (`shasum -a 256 <file>`) against the original value printed.
+5. Once all are restored, move the marker into the backup: `mv .foremind/upgrade/unfinished.json <backup>/unfinished.json`.
+6. Only then, if you go back to the Foremind you ran before, reinstall it offline with `pip install --no-index --force-reinstall <its wheel>` and run `foremind doctor`. Do not start the old package before step 5: it does not know the marker.
+
+Design (in Chinese): [`DESIGN.md`](DESIGN.md).
 
 ## 它解决什么问题
 
@@ -35,7 +120,7 @@ Foremind 的做法是把这些都交给程序检查，而不是靠提示词约�
 - **授权表**：哪些动作归系统、哪些归你；分层配置，下层只能收紧。
 - **改进回路**：出错、返工、被纠正都进日志，归并成规则，再升级成程序检查。
 
-完整设计见 [`DESIGN.md`](DESIGN.md)（唯一设计正文；§20 是实施中定下的细节），实施计划见 [`IMPLEMENTATION-PLAN.md`](IMPLEMENTATION-PLAN.md)。
+完整设计见 [`DESIGN.md`](DESIGN.md)（中文设计参考，唯一设计正文；§20 是实施中定下的细节），实施计划见 [`IMPLEMENTATION-PLAN.md`](IMPLEMENTATION-PLAN.md)。
 
 ## M1 已实现的部分
 
@@ -48,7 +133,7 @@ Foremind 的做法是把这些都交给程序检查，而不是靠提示词约�
 | 钩子与遥测 | SessionStart 注入考纲、Stop 交接提示与阻断、PreToolUse 越界与授权表拦截、PostToolUse 上下文占用、UserPromptSubmit 在场、状态栏串联与额度遥测；任何内部异常都不会把拦截变成放行 |
 | 审查、验收与门禁 | 只读审查者启动与回执组装、验收执行、门禁全部检查、merge/squash/rebase 三种合入的判定、按 head 合入、发布前检查 |
 | 监督进程 | tick / supervise、全局单实例锁、就绪队列、经作业开席与代合、卡住与继任、额度状态机、全阻塞、pause / STOP / run、ntfy 通知（只发送） |
-| 安装 | `init`（单仓/多仓、TOML 带标记块、钩子合并、交付约定的程序检测部分）、`doctor`、`status`、`uninstall`（逐字节还原） |
+| 安装 | `init`（单仓/多仓、TOML 带标记块、钩子合并、交付约定的程序检测部分）、`doctor`、`status`、`uninstall`（只移除仍与安装记录一致的条目） |
 
 ## M2 已实现的部分（m2a–m2f，60 批）
 
@@ -65,7 +150,7 @@ Foremind 的做法是把这些都交给程序检查，而不是靠提示词约�
 | 报表与度量 | `foremind report` 运行报告、按实测复算的建议值（只建议不改配置）、开发精度与效率度量（`report --plan`、`foremind defect` 记漏出缺陷）、每批用量补记 |
 | 自动合入与审查对齐（m2f） | 用户授权（`[land] auto = true`）后监督进程对 done 级、门禁通过、无待决的批次自动 `land`；与冻结目标原文冲突的审查意见自动退回、退回按理由分类；门禁偶发失败自动重跑一次；`foremind watch` 巡查与 `say --direct` 直投；Codex 作为跨厂商审查者（`tiers.review = cross_vendor`） |
 
-尚未实现：从 wheel 安装与升级（M3 第一段）、编目员与上下文组装（ask、L0/L1 预算估算）、间隔抽审与事件轮转、晨报与 ntfy 回复频道、角色提示词定制、Codex 席位（Codex 目前只当审查者）、herdr 承载、多项目统一监督、示例仓库。
+尚未实现：编目员与上下文组装（ask、L0/L1 预算估算）、间隔抽审与事件轮转、晨报与 ntfy 回复频道、角色提示词定制、Codex 席位（Codex 目前只当审查者）、herdr 承载、多项目统一监督、示例仓库。
 
 ## 快速开始（从源码）
 
@@ -82,9 +167,9 @@ PYTHONPATH=/path/to/foremind python3 -P -m foremind init --carrier tmux
 PYTHONPATH=/path/to/foremind python3 -P -m foremind doctor
 ```
 
-打包安装（`uv tool install` / Claude Code 插件）在 M3。注意 `-P`：它让当前目录里的同名包不会遮蔽已安装的 Foremind（在 Foremind 仓库里开发它自己时尤其重要）。
+从 wheel 安装与升级见上文 Install / Upgrade（[中文](README.zh-CN.md)）。注意 `-P`：它让当前目录里的同名包不会遮蔽已安装的 Foremind（在 Foremind 仓库里开发它自己时尤其重要）。
 
-`init` 会写入：项目的 `.claude/settings.local.json`（钩子与状态栏，先备份、不覆盖已有条目）、`.git/info/exclude`、项目下的 `.foremind/`、用户层 `~/.config/foremind/`。`foremind uninstall` 只删自己加的内容，其余文件逐字节还原。
+`init` 会写入：项目的 `.claude/settings.local.json`（钩子与状态栏，不覆盖已有条目）、`.git/info/exclude`、项目下的 `.foremind/`、用户层 `~/.config/foremind/`。`foremind uninstall` 只移除仍与安装记录一致的钩子、状态栏、配置块与登记行，记录之后被改过的条目留在原处并列出，`.foremind/` 数据保留。
 
 常用命令（下文 `foremind` 即 `PYTHONPATH=/path/to/foremind python3 -P -m foremind`）：
 

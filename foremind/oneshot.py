@@ -10,14 +10,11 @@ import json
 import re
 import uuid
 from fnmatch import fnmatchcase
-from pathlib import Path
 
+import foremind
 from foremind.defaults import TABLE
 from foremind.paths import state_dir
 from foremind.review import READ_ONLY_TOOLS
-
-_ROLES = Path(__file__).resolve().parent.parent / "templates" / "roles"
-
 
 def route(cfg, role) -> tuple[str, str]:
     """Model and effort of `role` (routes.<role>.*); exclusions are never bypassed (as review.route, DESIGN §1.5)."""
@@ -33,8 +30,10 @@ def route(cfg, role) -> tuple[str, str]:
 
 
 def prepare(root, role, cfg, materials: dict) -> tuple[str, list, dict]:
-    """(session, argv, env). `materials` {file name: text, or data written as sorted JSON}."""
+    """(session, argv, env). `materials` {file name: text, or data written as sorted JSON}. ValueError when the role
+    is excluded or its packaged card is missing, blank or unreadable."""
     model, effort = route(cfg, role)
+    card = foremind.template(f"roles/{role}.md")  # before any file is written: no card, no role
     session = str(uuid.uuid4())
     mat = state_dir(root) / "oneshots" / session
     mat.mkdir(parents=True)
@@ -43,7 +42,6 @@ def prepare(root, role, cfg, materials: dict) -> tuple[str, list, dict]:
         text = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False, indent=1, sort_keys=True) + "\n"
         (mat / name).write_text(text, encoding="utf-8")
         lines.append(f"- {mat / name}")
-    card = (_ROLES / f"{role}.md").read_text(encoding="utf-8")
     (mat / "prompt.md").write_text(card + "\n\n" + "\n".join(lines) + "\n", encoding="utf-8")
     dynamic_off = cfg.get("oneshot.exclude_dynamic_prompt", TABLE["oneshot.exclude_dynamic_prompt"]) is True
     argv = ["claude", "-p", "--restricted", "--tools", READ_ONLY_TOOLS, "--permission-mode", "plan",

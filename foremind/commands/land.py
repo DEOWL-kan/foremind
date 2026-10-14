@@ -17,12 +17,16 @@ still the merged ones and the gate still passing on them, clean, not checked out
 start (moved), and as the supervisor auto_blockers. In that same hold it moves the targets one by one: `merge
 --ff-only` in the main checkout when it is on the target, else `update-ref` against the old value. A failed move puts
 the repos already moved back (`update-ref <start> <merge>`, or `reset --keep` on a checkout on the target): all or
-nothing.
-In a multi-repo batch, a repo whose batch head is already in its target is checked out and checked like the others
-(REQ-20 asks it of every repo), but not merged or moved.
-Every land (not `--notes`, not one refused in a Foremind session) records exactly one land_result; a merged one also
-writes drafts.md next to the command output (a DESIGN §20 I line, leftovers and config keys from the delivery notes)
-for the controller to confirm and apply: land writes nothing outside .foremind but the target branches.
+nothing. Every move and move back runs with hooks off (m3a REQ-8): a post-merge or reference-transaction hook taking
+the project lock would wait on this hold for ever; the user's own post-merge on the main checkout does not run either.
+A repo whose batch head is already in its target (merged by hand, or by an earlier land) is checked out and checked
+like the others (REQ-20 asks it of every repo), but not merged or moved. When every repo's is (REQ-8), nothing is
+checked out or run after the checks above: the final check alone, then land_result merged with kind already_merged,
+merges each target as checked, and no drafts.
+Every land (not `--notes`, not one refused in a Foremind session) records exactly one land_result; a merged one that
+moved a target also writes drafts.md next to the command output (a DESIGN §20 I line, leftovers and config keys from
+the delivery notes) for the controller to confirm and apply: land writes nothing outside .foremind but the target
+branches.
 The batch state is not written: L0 reconcile records merged, but gate.batch_merged
 compares with review.target_ref, the remote's target when the repo has a remote: land moves only the local branch,
 so such a batch is recorded merged once the user pushes; without a remote, at once.
@@ -247,7 +251,7 @@ def _heads(root, batch_id, cfg) -> dict | None:
 
 
 def _land(root, batch_id, cfg, res) -> dict:
-    """land's work under land.lock; fills res (heads, out_dir, outcome and merges once moved)."""
+    """land's work under land.lock; fills res (heads, out_dir, outcome and merges once moved or found landed)."""
     auto = os.environ.get("FOREMIND_ROLE") == "supervisor"
     if auto and (no := auto_blockers(root, batch_id)):
         raise _refused("auto", "不满足自动合入的条件，目标分支没动：" + "；".join(no))
@@ -282,9 +286,17 @@ def _land(root, batch_id, cfg, res) -> dict:
     # local target only: land moves the local branch and never pushes, so a remote is the user's to sync
     rs = [{"repo": r, "single": len(ids) == 1, "br": review.branch(wt), "target": (t := review.target_branch(r, cfg)),
            "start": review.git(r.path, "rev-parse", "--verify", f"refs/heads/{t}^{{commit}}")} for r, wt in pairs]
-    for x in rs:  # multi-repo only, a repo already in the target (merged by hand, say): checked out as is, never moved
-        x["merged"] = len(ids) > 1 and review.is_ancestor(x["repo"].path, hd[x["repo"].id], x["start"])
+    for x in rs:  # a repo already in the target (merged by hand, say): checked out as is, never moved
+        x["merged"] = review.is_ancestor(x["repo"].path, hd[x["repo"].id], x["start"])
     _ready(rs)
+    if all(x["merged"] for x in rs):  # REQ-8: landed already; nothing to merge, run, move or draft
+        with project_lock(root):
+            _final(root, batch_id, pairs, hd, rs, auto)
+        res.update(outcome="merged", kind="already_merged", merges={x["repo"].id: x["start"] for x in rs})
+        print(f"{batch_id}: already in " + ", ".join(
+            x["target"] + ("" if len(ids) == 1 else f" ({x['repo'].id})") + f" at {x['start']}" for x in rs)
+            + "; nothing merged or moved, no drafts")
+        return res["merges"]
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out_dir = state_dir(root) / "land" / f"{batch_id}-{stamp}"
     worktree.wt_root().mkdir(parents=True, exist_ok=True)
@@ -388,7 +400,7 @@ def _merge(x, tmp, head):
             raise Stop("conflict", _tag(x, f"{br} 合到 {target} 冲突：{conflicts}"), conflicts=conflicts)
         raise review.FlowError(_tag(x, f"git merge {br}: {m.stderr.strip() or m.stdout.strip()}"))
     x["new"] = review.git(tmp, "rev-parse", "HEAD")
-    if review.git(tmp, "rev-parse", "HEAD^2") != head:
+    if review.git(tmp, "rev-parse", "-q", "--verify", "HEAD^2", check=False) != head:  # none: the merge made nothing
         raise _refused("gate", _tag(x, f"{br} 在合并期间移动了（门禁通过的是 {head}）；重跑门禁后再 land"))
 
 
@@ -396,7 +408,8 @@ def _ready(rs, final=False):
     """REQ-1 items 7 (dirty) and 8 (elsewhere), each over every repo; final (after the commands, x["new"] set): then
     every target still at its start (moved). Sets x["on_target"]."""
     for x in rs:
-        if dirty := review.git(x["repo"].path, "status", "--porcelain"):
+        # hooks off: in _final's project-lock hold, a status writing the index back runs post-index-change (REQ-8)
+        if dirty := review.git(x["repo"].path, "-c", "core.hooksPath=/dev/null", "status", "--porcelain"):
             raise _refused("dirty", _tag(x, f"主检出 {x['repo'].path} 有未提交改动，目标分支没动：\n{dirty}"))
     for x in rs:
         repo, target = x["repo"], x["target"]
@@ -434,10 +447,12 @@ def _same(a, b) -> bool:
 
 
 def _move(x):
+    """In the project-lock hold, hooks off (REQ-8), as _undo's moves back."""
     if x["on_target"]:
-        review.git(x["repo"].path, "merge", "-q", "--ff-only", x["new"])
+        review.git(x["repo"].path, "-c", "core.hooksPath=/dev/null", "merge", "-q", "--ff-only", x["new"])
     else:
-        review.git(x["repo"].path, "update-ref", f"refs/heads/{x['target']}", x["new"], x["start"])
+        review.git(x["repo"].path, "-c", "core.hooksPath=/dev/null", "update-ref", f"refs/heads/{x['target']}",
+                   x["new"], x["start"])
 
 
 def _undo(rs, tried, err) -> str:
@@ -457,10 +472,10 @@ def _undo(rs, tried, err) -> str:
             elif x["on_target"]:
                 if review.git(repo.path, "symbolic-ref", "-q", "HEAD", check=False) != ref:
                     raise review.FlowError(f"主检出已不在 {x['target']}")
-                review.git(repo.path, "reset", "-q", "--keep", start)
+                review.git(repo.path, "-c", "core.hooksPath=/dev/null", "reset", "-q", "--keep", start)
                 state = "已退回起点"
             else:
-                review.git(repo.path, "update-ref", ref, start, x["new"])
+                review.git(repo.path, "-c", "core.hooksPath=/dev/null", "update-ref", ref, start, x["new"])
                 state = "已退回起点"
         except review.FlowError as e:
             state = f"退回失败，需手动处理：{e}；起点 {start}"

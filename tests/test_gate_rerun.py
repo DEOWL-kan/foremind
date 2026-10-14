@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 from foremind import acceptance, gate, lock, review
+from foremind.commands import status
 from foremind.events import EventLog
 from foremind.fsutil import sha256_bytes
 
@@ -180,6 +181,154 @@ class HeldTest(Base):
         self.assertTrue(m.startswith("Foremind：门禁未通过：\nFAIL checks"))
         self.tick(90)
         self.assertEqual(len(self.jobs.started), 1)
+
+
+class ExplicitTest(HeldTest):
+    """m3a.9 (REQ-11): after m2f's one automatic rerun, `foremind review` on the same heads asks for a gate rerun
+    (review._gate_rerun), started by tick._explicit at most supervisor.seat_retries times per heads; a gate waiting
+    only on CI is looked at again every gate_retry_min."""
+
+    def setUp(self):
+        super().setUp()
+        self.receipt(1, HD)
+
+    def receipt(self, n, hd):
+        (self.root / ".foremind" / "batches" / f"p.1.review.r{n}.json").write_text(
+            json.dumps({"verdict": "approved", "heads": hd}))
+
+    def gate_fails(self, n, failing=("checks",), out=OUT, pending=(), heads=None):
+        self.log.append("gate_result", batch="p.1", heads=heads or self.cur, verdict="fail", failing=list(failing),
+                        pending=list(pending))
+        if n is not None:
+            self.jobs.finish(n, code=1, stdout=out)
+
+    def ask(self):
+        return review._gate_rerun(self.root, "p.1", {}, dict(self.cur), review.all_events(self.root))
+
+    def phase(self):
+        return status._review_gate(status._reader(self.root), "p.1")
+
+    def auto_rerun_fails(self):
+        self.gate_fails(0)
+        self.tick(60)
+        self.assertEqual(self.phase(), "held")
+        self.tick(90)
+        self.assertEqual(self.phase(), "rerunning")
+        self.gate_fails(1)
+        self.tick(120)
+        self.assertEqual(self.phase(), "failed")
+
+    def test_requested_reruns_up_to_the_cap(self):
+        self.auto_rerun_fails()
+        self.assertEqual(self.ask(), {"gate_rerun": {"used": 0, "limit": 2, "failing": ["checks"]}})
+        self.ask()  # the same failure again: the same request
+        self.assertEqual(len(self.events("gate_rerun_requested")), 1)
+        self.assertEqual(self.phase(), "queued")
+        self.tick(90 + 10 * M - 1)  # gate_retry_min after the last gate start, on the dot
+        self.assertEqual(len(self.jobs.started), 2)
+        self.tick(90 + 10 * M)
+        self.assertEqual(self.jobs.cmds()[2], ["gate", "--rerun", "--no-merge", "p.1"])
+        self.assertEqual(self.phase(), "rerunning")
+        self.tick(90 + 10 * M + 1)  # a repeated pass starts nothing
+        self.assertEqual(len(self.jobs.started), 3)
+        self.gate_fails(2)
+        self.tick(700)
+        self.assertTrue(self.msgs()[-1].startswith("Foremind：requested gate rerun 1 of 2 at these heads still fails"))
+        self.assertIn("    | boom", self.msgs()[-1])
+        # `foremind run` and a new pass (a supervisor restart reads the same log) give nothing back
+        self.log.append("run_requested", batches=["p.1"])
+        self.assertEqual(self.ask()["gate_rerun"]["used"], 1)
+        self.tick(90 + 20 * M)
+        self.assertEqual(len(self.jobs.started), 4)
+        self.jobs.state[self.jobs.started[3]["id"]] = {"state": "lost"}  # no answer: it counts all the same
+        self.tick(90 + 21 * M)
+        with self.assertRaisesRegex(review.FlowError, r"2 of 2 times .* still fails checks"):
+            self.ask()
+        self.receipt(2, HD)  # another receipt on these heads: still spent
+        with self.assertRaisesRegex(review.FlowError, "2 of 2"):
+            self.ask()
+        self.tick(90 + 40 * M)  # receipt r2's own gate run, as for any new receipt: no explicit rerun
+        self.assertEqual((self.jobs.cmds()[4:], review.explicit_reruns(self.events(), "p.1", HD)), ([["gate", "p.1"]], 2))
+        self.cur = {"main": "b" * 40}  # other heads count on their own
+        self.receipt(3, self.cur)
+        self.gate_fails(None)
+        self.assertEqual(self.ask()["gate_rerun"]["used"], 0)
+        self.cur = dict(HD)  # back to the first heads: their count stands
+        self.receipt(4, HD)
+        self.gate_fails(None)
+        with self.assertRaisesRegex(review.FlowError, "2 of 2"):
+            self.ask()
+
+    def test_a_rerun_with_no_answer_is_told_and_asked_again(self):  # r1 must_fix
+        self.auto_rerun_fails()
+        self.ask()
+        self.tick(90 + 10 * M)
+        self.jobs.finish(2, code=2)  # e.g. a manual gate held the batch's gate lock: no gate_result
+        self.tick(90 + 10 * M + 1)
+        self.assertEqual(self.msgs()[-1], "Foremind: requested gate rerun 1 of 2 ended with no gate answer (exit 2); "
+                                          "run `foremind review p.1` to ask again (1 left).")
+        self.assertEqual(self.phase(), "failed")
+        self.assertEqual(self.ask()["gate_rerun"]["used"], 1)
+        self.assertEqual((len(self.events("gate_rerun_requested")), self.phase()), (2, "queued"))
+        self.tick(90 + 20 * M + 1)
+        self.assertEqual(self.jobs.cmds()[3], ["gate", "--rerun", "--no-merge", "p.1"])
+
+    def test_a_local_failure_after_a_ci_wait_goes_out_at_once(self):  # r1 should_fix 1
+        self.gate_fails(0, ("ci:main",), "", pending=("ci:main",))
+        self.tick(60)
+        self.tick(10 * M)
+        self.gate_fails(1)
+        self.tick(10 * M + 1)
+        self.assertTrue(self.msgs()[0].startswith("Foremind：门禁未通过：\nFAIL checks"))
+        self.assertEqual((self.events("gate_held"), self.phase()), ([], "failed"))
+
+    def test_a_stale_request_is_not_run(self):
+        self.auto_rerun_fails()
+        self.ask()
+        self.gate_fails(None, ("receipt",))  # another failure since (say a manual gate run)
+        self.tick(90 + 10 * M)
+        self.assertEqual(len(self.jobs.started), 2)
+        self.assertEqual(self.ask(), {}, "not a local failure: as before, unchanged")
+
+    def test_cap_lowered_after_the_request(self):
+        self.auto_rerun_fails()
+        self.ask()
+        self.user_config('[quota]\nprobe_command = ["/usr/bin/true"]\n[supervisor]\nseat_retries = 1\n')
+        self.log.append("sv_gate", phase="intent", dedupe_id="sv_gate:p.1:old", batch="p.1", round=1, explicit=True,
+                        heads=HD, at=self.now)  # one spent before
+        self.tick(30 * M)
+        self.assertEqual(len(self.jobs.started), 2)
+        self.assertEqual([e["used"] for e in self.events("gate_rerun_refused")], [1])
+        self.assertEqual(self.phase(), "failed")
+        with self.assertRaisesRegex(review.FlowError, r"1 of 1 times .* still fails checks"):  # r2: not queued again
+            self.ask()
+
+    def test_mixed_failure_is_no_ci_wait(self):
+        self.gate_fails(0, ("checks", "ci:main"), pending=("ci:main",))
+        self.tick(60)
+        self.assertTrue(self.msgs()[0].startswith("Foremind：门禁未通过：\nFAIL checks"))
+        self.assertEqual(self.ask(), {})
+        self.tick(30 * M)
+        self.assertEqual(len(self.jobs.started), 1)
+
+    def test_ci_late_green(self):
+        self.gate_fails(0, ("ci:main",), "FAIL ci:main: required: waiting: ['check build']\n", pending=("ci:main",))
+        self.tick(60)
+        self.assertEqual((self.msgs(), self.phase()), ([], "ci_wait"))
+        self.assertEqual(self.ask(), {})
+        self.tick(10 * M - 1)
+        self.assertEqual(len(self.jobs.started), 1)
+        self.tick(10 * M)
+        self.assertEqual(self.jobs.cmds()[1], ["gate", "p.1"], "local results reused: no --rerun, nothing spent")
+        self.gate_fails(1, ("ci:main",), "", pending=("ci:main",))
+        self.tick(20 * M)
+        self.assertEqual(len(self.jobs.started), 3)
+        self.log.append("gate_result", batch="p.1", heads=HD, verdict="pass", failing=[], pending=[])
+        self.set_state("p.1", "approved")
+        self.jobs.finish(2, code=0)
+        self.tick(20 * M + 1)
+        self.assertEqual(self.msgs(), [])
+        self.assertEqual(review.explicit_reruns(self.events(), "p.1", HD), 0)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import foremind
 from foremind import config as cfg_mod
 from foremind import repos as rp
 from foremind import schemas, seat, worktree
@@ -25,7 +26,6 @@ from foremind.plan import validate as v
 from foremind.plan.model import Doc, Plan, PlanError
 from foremind.vendors import get as get_vendor
 
-ROLE_CARD = Path(__file__).resolve().parent.parent / "templates" / "roles" / "planner.md"
 MODEL = "claude-opus-5-5"
 EFFORT = {"S": "high", "M": "xhigh", "L": "xhigh"}  # §3.2
 SUBMITTERS = (None, "planner", "controller")  # FOREMIND_ROLE; unset is the user
@@ -66,7 +66,9 @@ def _next_id(root, slug):
 def kickoff_text(plan_id, requirement, draft, tier, root) -> str:
     d = shlex.quote(str(draft))
     return (f"你是计划 {plan_id} 的规划者（{tier} 档）。下面是你的角色卡，按它走。\n\n"
-            f"{ROLE_CARD.read_text(encoding='utf-8').strip()}\n\n## 需求原文\n\n{requirement}\n\n"
+            f"{foremind.template('roles/planner.md').strip()}\n\n"
+            f"## Batch handoff template\n\nWrite each batches/<id>.handoff.md in this shape:\n\n"
+            f"````markdown\n{foremind.template('handoff.md').strip()}\n````\n\n## 需求原文\n\n{requirement}\n\n"
             f"## 项目\n\n项目根（主检出，只读；工作目录是草稿目录，项目的规则与代码到这里读）：{root}\n\n"
             f"## 草稿\n\n目录：{draft}\n{LAYOUT}\n\n"
             f"提交：`foremind plan submit {plan_id} --dir {d}`。不通过会列出原因且不写任何文件，改完再提交，"
@@ -90,6 +92,7 @@ def open_planner(root, requirement, *, carrier, plan_id=None, tier="M", config=N
         if _approved(root, plan_id):  # plan_dir also checks the id
             raise PlanError(f"{plan_id} is approved; change it with plan amend")
         draft = drafts_dir(slug, plan_id)
+        kickoff = kickoff_text(plan_id, requirement, draft, tier, root)  # a missing card stops it before the launch
         (draft / "batches").mkdir(parents=True, exist_ok=True)
         what = f"plan-{plan_id}"
         session = seat.session_name(slug, what, seat._next_seq(root, seat.session_name(slug, what, "")))
@@ -111,7 +114,7 @@ def open_planner(root, requirement, *, carrier, plan_id=None, tier="M", config=N
             raise
         if seat.wait_heartbeat(root, session, None, t0, timeout) is None:
             raise seat.SeatError(f"no heartbeat from {session} within {timeout} s")
-        carrier.deliver(session, kickoff_text(plan_id, requirement, draft, tier, root))
+        carrier.deliver(session, kickoff)
     except BaseException:
         if launched:
             with contextlib.suppress(Exception):

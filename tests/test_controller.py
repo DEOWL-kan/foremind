@@ -1,12 +1,15 @@
+import argparse
 import contextlib
 import io
 import json
 import os
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from unittest import mock
 
+import foremind
 from foremind import controller as ctl
 from foremind import heartbeat, hooks, sessions
 from foremind.carriers import Carrier, CarrierError
@@ -115,6 +118,17 @@ class StopGateTest(ControllerBase):
         out = hooks.main(event, json.dumps(d))
         return json.loads(out) if out else None
 
+    def test_mid_turn_reminder_reports_an_unusable_template(self):  # REQ-1, as the Stop gate does
+        self.usage(250_000)
+        post = lambda: hooks.main("PostToolUse", json.dumps(self.data("PostToolUse-Bash", cwd=self.root)))
+        with tempfile.TemporaryDirectory() as d, mock.patch("foremind.template_path", lambda n: Path(d, n)):
+            out = post()
+        self.assertIn(f"the controller handoff template (packaged template {Path(d, 'controller-handoff.md')} cannot "
+                      "be read", out)
+        self.assertIn("pip install --force-reinstall", out)
+        self.usage(310_000)
+        self.assertIn(str(ctl.TEMPLATE), post())  # usable: the installed path, as before
+
     def test_soft_once_then_again_after_each_merge(self):
         self.usage(150_000)
         self.assertIsNone(self.stop())
@@ -140,6 +154,13 @@ class StopGateTest(ControllerBase):
         self.assertIn("总控上下文已用 310000 token（程序读数），达到硬线（有效预算 300000）", reason)
         self.assertIn(f"按 {ctl.TEMPLATE} 写 {self.root / ctl.DOC}，然后执行 `foremind controller handoff`", reason)
         at = self.st()["hard_requested_at"]
+        # REQ-1: the packaged template where foremind is installed; unusable, the guidance says so instead
+        self.assertEqual(Path(str(ctl.TEMPLATE)), Path(foremind.__file__).parent / "templates" / "controller-handoff.md")
+        with tempfile.TemporaryDirectory() as d, mock.patch("foremind.template_path", lambda n: Path(d, n)):
+            reason = self.stop()["reason"]
+        self.assertIn(f"按 the controller handoff template (packaged template {Path(d, 'controller-handoff.md')} cannot "
+                      "be read", reason)
+        self.assertIn("pip install --force-reinstall", reason)
         self.assertIsNone(self.stop(active=True))
         self.assertEqual(self.stop()["decision"], "block")
         self.assertEqual(self.st()["hard_requested_at"], at, "the first request's time stays")
@@ -303,6 +324,17 @@ class OpenHandoffTest(ControllerBase):
         self.assertTrue(again["session"].endswith("-controller-2"))
         self.assertEqual(again["effort"], "xhigh")
 
+    def test_open_needs_the_packaged_template(self):  # REQ-1
+        with tempfile.TemporaryDirectory() as d, mock.patch("foremind.template_path", lambda n: Path(d, n)):
+            for data in (None, b" \n", b"\xff"):
+                if data is not None:
+                    Path(d, "controller-handoff.md").write_bytes(data)
+                with self.subTest(data=data):
+                    self.assertRaisesRegex(ctl.ControllerError, "packaged template", ctl.open_controller, self.root,
+                                           carrier=self.carrier, config=self.cfg)
+        self.assertEqual((self.carrier.created, self.carrier.sent), ({}, []))
+        self.assertEqual(self.events("controller_launch"), [])
+
     def test_permission_mode_controller_key_else_seat(self):  # I105
         for extra, want in (({}, "auto"), ({"controller.permission_mode": "bypassPermissions"}, "bypassPermissions")):
             out = ctl.open_controller(self.root, carrier=self.carrier,
@@ -391,6 +423,21 @@ class OpenHandoffTest(ControllerBase):
                 contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(cmd._handoff(None, self.root), 0)
         self.assertIn("写交接时上下文 250000 token", out.getvalue())
+        self.assertIs(self.events("controller_handoff")[0]["keep_predecessor"], False)
+        self.assertNotIn("--keep-predecessor", self.carrier.sent[0][1])
+
+    def test_handoff_keep_predecessor(self):  # REQ-10
+        self.bound()
+        self.write_doc()
+        args = argparse.Namespace(keep_predecessor=True)
+        with mock.patch.object(cmd.carriers, "get", return_value=self.carrier), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cmd._handoff(args, self.root), 0)
+        ev, = self.events("controller_handoff")
+        self.assertIs(ev["keep_predecessor"], True)
+        self.assertEqual(self.events("controller_launch")[-1]["handoff"], ev["id"], "bound to its successor")
+        (_, kickoff), = self.carrier.sent
+        self.assertIn(f"`foremind controller check` will not close {NAME}", kickoff)
 
 
 class CheckSlipTest(ControllerBase):
@@ -421,19 +468,78 @@ class CheckSlipTest(ControllerBase):
         line_ = ctl.takeover_line(items, ev)
         self.assertIn(f"总控 {NAME} 接手 fm-shop-controller-0：核对 5 项，全部 ok；接手时上下文 130000 token、2 次调用", line_)
 
-    def handed_off_by(self, pred):
-        """`pred` launched and opened by Foremind, handed off to NAME."""
+    def handed_off_by(self, pred, **keep):
+        """`pred` launched and opened by Foremind, handed off to NAME (keep: {keep_predecessor: ...}; none: an old
+        event)."""
         self.event("controller_launch", session=pred)
         self.event("controller_opened", session=pred, carrier="fake")
-        self.event("controller_handoff", from_session=pred)
+        ev = self.event("controller_handoff", from_session=pred, **keep)
+        self.event("controller_launch", session=NAME, predecessor=pred, handoff=ev["id"])
         self.event("controller_opened", session=NAME, predecessor=pred, carrier="fake")
+        return ev
 
-    def check_out(self, car):
-        """`foremind controller check`'s output, closing through `car`."""
+    def check_out(self, car, keep=False, code=None):
+        """`foremind controller check [--keep-predecessor]`'s output, closing through `car`."""
         with mock.patch.object(ctl.carriers, "get", return_value=car), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
-            cmd._check(None, self.root)
+            got = cmd._check(argparse.Namespace(keep_predecessor=keep), self.root)
+        if code is not None:
+            self.assertEqual(got, code)
         return out.getvalue()
+
+    KEPT = ctl.KEPT
+
+    def test_the_predecessors_handoff_keeps_it(self):  # REQ-10: handoff --keep-predecessor, plain check
+        pred = "fm-shop-controller-0"
+        car = FakeCarrier(self.root)
+        self.handed_off_by(pred, keep_predecessor=True)
+        self.assertIn(f"前任 {pred}：{self.KEPT}", self.check_out(car, code=0))
+        self.assertIn(f"前任 {pred}：{self.KEPT}", self.check_out(car, code=0), "the same choice on every check")
+        self.assertEqual((car.closed, self.events("controller_closed")), ([], []))
+        self.assertEqual([e["keep_predecessor"] for e in self.events("controller_takeover")], [True, True])
+        (self.root / "stray.txt").write_text("x")  # a mismatch still says so, with the real exit code
+        self.assertIn(f"前任 {pred}：核对有不符，前任保留；{self.KEPT}", self.check_out(car, code=1))
+        self.assertEqual(car.closed, [])
+
+    def test_a_retry_during_the_first_launch_does_not_override_its_choice(self):  # REQ-10, review r1
+        pred = "fm-shop-controller-0"
+        self.event("controller_launch", session=pred)
+        self.event("controller_opened", session=pred, carrier="fake")
+        first = self.event("controller_handoff", from_session=pred, keep_predecessor=True)
+        self.event("controller_launch", session=NAME, predecessor=pred, handoff=first["id"])  # still starting
+        retry = self.event("controller_handoff", from_session=pred, keep_predecessor=False)  # a plain retry, fails
+        self.event("controller_launch", session="fm-shop-controller-2", predecessor=pred, handoff=retry["id"])
+        self.event("controller_opened", session=NAME, predecessor=pred, carrier="fake")
+        car = FakeCarrier(self.root)
+        self.assertIn(f"前任 {pred}：{self.KEPT}", self.check_out(car, code=0))
+        self.assertEqual(car.closed, [])
+
+    def test_keep_on_the_command_line_and_which_handoff_counts(self):  # REQ-10
+        pred = "fm-shop-controller-0"
+        car = FakeCarrier(self.root)
+        self.event("controller_handoff", from_session="fm-shop-controller-9", keep_predecessor=True)  # someone else's
+        self.event("controller_handoff", from_session=pred, keep_predecessor=True)  # before a carrier failure
+        self.handed_off_by(pred, keep_predecessor=False)  # the one that launched NAME
+        self.event("controller_handoff", from_session=NAME, keep_predecessor=True)  # NAME's own, later
+        self.assertFalse(ctl.kept_by_handoff(self.root, NAME, pred))
+        self.assertIn(f"前任 {pred}：{self.KEPT}", self.check_out(car, keep=True, code=0))
+        self.assertEqual(car.closed, [])
+        car.evidence = "absent"
+        self.assertIn(f"前任 {pred}：已关闭（absent）", self.check_out(car, code=0))
+        self.assertIn(f"前任 {pred}：前任已关闭（此前的 check）", self.check_out(car, keep=True, code=0),
+                      "closed stays closed, not reported kept")
+        self.assertEqual(car.closed, [pred])
+
+    def test_keep_without_a_predecessor_or_from_an_old_event(self):  # REQ-10
+        self.event("controller_launch", session=NAME)  # opened by `controller open`: no predecessor
+        _, ev, closed = ctl.check(self.root, keep_predecessor=True)
+        self.assertEqual((ev["predecessor"], closed), (None, None))
+        pred = "fm-shop-controller-0"
+        self.event("controller_launch", session=NAME, predecessor=pred)
+        self.handed_off_by(pred)  # no keep_predecessor field: False, closed as before
+        car = FakeCarrier(self.root)
+        car.evidence = "absent"
+        self.assertIn(f"前任 {pred}：已关闭（absent）", self.check_out(car, code=0))
 
     def test_all_ok_closes_the_predecessor(self):
         pred = "fm-shop-controller-0"

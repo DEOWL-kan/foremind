@@ -4,10 +4,11 @@ import re
 import sys
 from pathlib import Path
 
+import foremind
 from foremind import batchlog, schemas
 from foremind.paths import ProjectNotFound, find_project_root
 
-FORMAT = ("D/F 记录格式（templates/PROTOCOL.md 第 10 条）：\n"
+FORMAT = ("D/F record format (rule 10 of the Foremind protocol, {p}):\n"
           "  {b}.D<n> · 选了什么 · 没选什么 · 为什么 · #k · 证据指针\n"
           "  {b}.F<n> · 做法 → 现象 → 原因判断 → 证据指针")
 NOTES = re.compile(r"^## 交付说明.*$", re.M)
@@ -62,7 +63,7 @@ def _run(args):
             raise ValueError("empty text")
         if bad := bad_records(text, args.batch_id):
             raise ValueError("格式不对，未追加：\n" + "\n".join(f"  {x}" for x in bad) + "\n"
-                             + FORMAT.format(b=args.batch_id))
+                             + FORMAT.format(b=args.batch_id, p=foremind.template_path("PROTOCOL.md")))
         if bad := [e for _, errs in delivery_notes(text) for e in errs]:
             raise ValueError("交付说明不合格（schema delivery_notes），未追加：\n" + "\n".join(f"  {x}" for x in bad))
         print(batchlog.append(find_project_root(), args.batch_id, text, author=args.author))

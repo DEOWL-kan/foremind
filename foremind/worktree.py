@@ -97,21 +97,25 @@ def create(project, batch, repo, *, branch, start_point) -> tuple[Path, str]:
             git(repo.path, "worktree", "add", str(path), branch)
         else:
             start = start_point() if callable(start_point) else start_point
-            git(repo.path, "worktree", "add", "--no-track", "-b", branch, str(path), start)
+            try:
+                git(repo.path, "worktree", "add", "--no-track", "-b", branch, str(path), start)
+            except WorktreeError:  # git keeps the new branch when the checkout fails (a corrupt object, REQ-7):
+                git(repo.path, "branch", "-D", branch, check=False)  # a retry would take it as an existing branch
+                raise
     return path, git(path, "rev-parse", "HEAD")
 
 
 def create_readonly(project, batch, upstream, repo, ref) -> tuple[Path, str]:
-    """Ensure a detached worktree of `repo` at `ref` for an upstream batch; moves it if the ref moved (§1.8), but
-    never over local changes (N-6)."""
+    """Ensure a detached worktree of `repo` at `ref` for an upstream batch; moves it if the ref moved (§1.8). An
+    existing one with local changes (untracked files included) is refused, moved or not (N-6, REQ-7)."""
     path = batch_dir(project, batch) / "_ro" / upstream / repo.id
     sha = git(repo.path, "rev-parse", "--verify", f"{ref}^{{commit}}")
     if not _ensure_registration(repo.path, path):
         path.parent.mkdir(parents=True, exist_ok=True)
         git(repo.path, "worktree", "add", "--detach", str(path), sha)
+    elif changed := dirty(path):
+        raise WorktreeError(f"{path}: read-only upstream worktree has local changes {changed[:5]}; not using it")
     elif git(path, "rev-parse", "HEAD") != sha:
-        if changed := dirty(path):
-            raise WorktreeError(f"{path}: read-only upstream worktree has local changes {changed[:5]}; not moving it")
         git(path, "checkout", "--detach", sha)
     return path, sha
 

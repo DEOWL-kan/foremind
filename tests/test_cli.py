@@ -46,7 +46,9 @@ class CliTest(unittest.TestCase):
             "def register(sub):\n    sub.add_parser('zz-probe').set_defaults(func=lambda a: print('probed'))\n")
         (self.tmp / "_private.py").write_text("raise RuntimeError('must not be imported')\n")
         self.addCleanup(sys.modules.pop, "foremind.commands.zz_probe", None)
-        with mock.patch.object(commands, "__path__", [*commands.__path__, str(self.tmp)]):
+        # a command not known to read takes admission (m3a.8): in no project here, so it just runs
+        with mock.patch.object(commands, "__path__", [*commands.__path__, str(self.tmp)]), \
+                mock.patch.dict(os.environ, {"FOREMIND_PROJECT": str(self.tmp)}):
             self.assertEqual(run(["zz-probe"]), (0, "probed\n", ""))
 
     def test_a_broken_command_module_does_not_take_the_hook_down(self):  # m2b.2 item 10 (M1-5-r2 N-d)

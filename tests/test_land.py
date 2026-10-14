@@ -191,12 +191,6 @@ class LandTest(Base):
             land.land(self.p.root, "shop.1", self.p.cfg)
         self.assertEqual((self.tip(), self.leftovers()), (self.start, []))
 
-    def test_branch_already_in_target_as_before(self):  # single-repo: no "already merged" shortcut
-        sh(self.repo, "git", "merge", "-q", "--ff-only", "fm/shop.1")
-        self.gate()
-        with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(review.FlowError, "HEAD\\^2"):
-            land.land(self.p.root, "shop.1", self.p.cfg)
-
     def test_refusals(self):
         self.refused("没有通过的门禁结果")
         self.gate(verdict="fail")
@@ -336,8 +330,8 @@ class ChecksTest(Base):
             self.assertIsNotNone(self.attempt())
         self.assertEqual((self.outcome(), self.results()[-1]["reason"]), (("move_failed", None), "boom"))
         self.assertEqual(self.tip(), self.start)
-        with mock.patch.dict(os.environ, {"FOREMIND_ROLE": "controller", "FOREMIND_JOB": "j1"}):
-            sh(self.repo, "git", "merge", "-q", "--ff-only", "fm/shop.1")  # single-repo: HEAD^2 fails
+        with mock.patch.dict(os.environ, {"FOREMIND_ROLE": "controller", "FOREMIND_JOB": "j1"}), \
+                mock.patch.object(land, "_merge", side_effect=review.FlowError("boom")):
             self.attempt()
         r = self.results()[-1]
         self.assertEqual((r["outcome"], r["by"], r["job"]), ("error", "controller", "j1"))

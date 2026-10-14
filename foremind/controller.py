@@ -5,7 +5,8 @@ FOREMIND_SESSION: guard, inbox, heartbeat, L1 and stuck detection treat it as an
 the hooks' controller branches look at MARKER: SessionStart binds (bind), Stop gates on the context the program reads
 from the transcript (stop). State per agent session: `.foremind/controller/<agent_session_id>.json` (STATE_KEYS).
 
-Events: controller_launch (session, model, effort, predecessor: written under the project lock, it takes the name),
+Events: controller_launch (session, model, effort, predecessor, handoff: the id of the controller_handoff that launched
+it; written under the project lock, it takes the name),
 controller_opened, controller_handoff, controller_takeover, controller_closed (m2d.1: the predecessor closed after a
 takeover check with every item ok), controller_slip.
 """
@@ -19,6 +20,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import foremind
 from foremind import config as cfg_mod
 from foremind import header as hdr
 from foremind import carriers, heartbeat, seat, sessions, telemetry
@@ -38,7 +40,7 @@ SOFT, HARD = 200_000, 300_000  # 2026-09-28 measured
 DEFAULTS = {"window_tokens": 1_000_000, "hard_pct": 30, "soft_pct": 20, "abs_cap_tokens": float("inf")}
 MODEL, EFFORT = "claude-opus-5-5[1m]", "high"  # routes.controller_live.model / effort
 DOC = "HANDOFF-controller.md"  # in the project root
-TEMPLATE = Path(__file__).resolve().parent.parent / "templates" / "controller-handoff.md"
+TEMPLATE = foremind.template_path("controller-handoff.md")  # where the package is installed (REQ-1)
 SECTIONS = ("1. 目标与核对", "2. 当前状态", "3. 流程与工具", "4. 决定与教训", "5. 未完成义务", "6. 指针")
 SLIPS = ("ruling_withdrawn", "missed_event", "wrong_fact", "other")
 # `batch <glob>` besides these; `test` is optional and the only one that runs a command
@@ -53,6 +55,15 @@ _CHECK_BLOCK = re.compile(r"^```foremind-check[ \t]*\n(.*?)^```", re.S | re.M)
 
 class ControllerError(Exception):
     pass
+
+
+def _template() -> str:
+    """What the handoff guidance points to: the packaged template, or why it cannot be used (REQ-1)."""
+    try:
+        foremind.template("controller-handoff.md")
+    except ValueError as e:
+        return f"the controller handoff template ({e})"
+    return str(TEMPLATE)
 
 
 def _now() -> str:
@@ -233,7 +244,7 @@ def stop(root, data, name, error) -> dict | None:
                 f"硬线（有效预算 {int(hard)}）已在 {asked} 要求交接，压缩或清空上下文不解除")
         return {"decision": "block", "reason": (
             f"Foremind：总控上下文已用 {used} token（程序读数），{line}。停下手上的工作，"
-            f"按 {TEMPLATE} 写 {Path(root) / DOC}，然后执行 `foremind controller handoff`（{_cmd('handoff')}）。")}
+            f"按 {_template()} 写 {Path(root) / DOC}，然后执行 `foremind controller handoff`（{_cmd('handoff')}）。")}
     if used < soft:
         return None
     merged = _last_merged(root)
@@ -244,7 +255,7 @@ def stop(root, data, name, error) -> dict | None:
     update(root, sid, soft_prompted=True, merged_seen=mid)
     return {"decision": "block", "reason": (
         f"Foremind：{again}总控上下文已用 {used} token（程序读数），过了软线 {int(soft)}（硬线 {int(hard)}）。"
-        f"到下一个自然断点（合入一批之后）按 {TEMPLATE} 写 {Path(root) / DOC}，再执行 `foremind controller handoff`。")}
+        f"到下一个自然断点（合入一批之后）按 {_template()} 写 {Path(root) / DOC}，再执行 `foremind controller handoff`。")}
 
 
 # --- handoff document ---------------------------------------------------------------
@@ -274,7 +285,7 @@ def parse_checks(text) -> list[tuple[str, str]]:
 def check_doc(text) -> list[tuple[str, str]]:
     missing = [s for s in SECTIONS if not re.search(rf"^## {re.escape(s)}", text, re.M)]
     if missing:
-        raise ControllerError(f"{DOC}: sections missing: {', '.join(missing)} (see {TEMPLATE})")
+        raise ControllerError(f"{DOC}: sections missing: {', '.join(missing)} (see {_template()})")
     return parse_checks(text)
 
 
@@ -289,12 +300,15 @@ def with_reading(text, used, hard) -> str:
 
 # --- open / handoff -------------------------------------------------------------------
 
-def kickoff_text(root, predecessor) -> str:
+def kickoff_text(root, predecessor, keep_predecessor=False) -> str:
     who = f"接替 {predecessor}" if predecessor else "由 `foremind controller open` 开出"
     out = f"你是 Foremind 项目 {root} 的常驻总控（{who}）。上下文由程序按实际读数把关：到软线提醒，到硬线阻断并要求交接。"
     if predecessor:
         out += (f"\n\n先执行 `foremind controller check`（{_cmd('check')}），逐项看核对结果；"
                 f"再读 {Path(root) / DOC}，按它接手。有不符先查明再动手。")
+        if keep_predecessor:
+            out += (f"\n\nThe predecessor asked to stay open (`--keep-predecessor`): it is still handling other work "
+                    f"for the user, so `foremind controller check` will not close {predecessor}; leave it running.")
     return out
 
 
@@ -311,17 +325,22 @@ def wait_bound(root, name, since, timeout_s) -> dict | None:
         time.sleep(0.25)
 
 
-def open_controller(root, *, carrier, config=None, predecessor=None) -> dict:
+def open_controller(root, *, carrier, config=None, predecessor=None, handoff=None, keep_predecessor=False) -> dict:
     """Launch a controller session, wait for its SessionStart, deliver its kickoff (planner.open_planner's steps)."""
     root = Path(root).resolve()
     cfg = config if config is not None else cfg_mod.load(root)
     model = cfg.get("routes.controller_live.model", MODEL)
     effort = cfg.get("routes.controller_live.effort", EFFORT)
     seat._check_model(cfg, model)
+    try:  # its handoff guidance needs the template: no launch without it
+        foremind.template("controller-handoff.md")
+    except ValueError as e:
+        raise ControllerError(str(e)) from None
     slug = seat.project_slug(root, cfg)
     with project_lock(root):  # the launch record takes the name (_next_seq reads events)
         name = seat.session_name(slug, "controller", seat._next_seq(root, seat.session_name(slug, "controller", "")))
-        _events(root).append("controller_launch", session=name, model=model, effort=effort, predecessor=predecessor)
+        _events(root).append("controller_launch", session=name, model=model, effort=effort, predecessor=predecessor,
+                             **({"handoff": handoff} if handoff else {}))
     # no --settings: the project's installed hooks already run in its root, a second copy would fire twice
     spec = get_vendor(seat._vendor(model)).launch(
         session=name, batch="", role="controller", project_root=root, cwd=root, settings_path=None,
@@ -340,7 +359,7 @@ def open_controller(root, *, carrier, config=None, predecessor=None) -> dict:
         if wait_bound(root, name, t0, timeout) is None:
             raise ControllerError(f"no SessionStart from {name} within {timeout} s (are foremind's hooks installed "
                                   f"in {root}/.claude/settings.local.json?)")
-        carrier.deliver(name, kickoff_text(root, predecessor))
+        carrier.deliver(name, kickoff_text(root, predecessor, keep_predecessor))
     except BaseException:
         if launched:
             with contextlib.suppress(Exception):
@@ -351,9 +370,10 @@ def open_controller(root, *, carrier, config=None, predecessor=None) -> dict:
     return out
 
 
-def handoff(root, *, carrier, config=None) -> dict:
-    """Check HANDOFF-controller.md, write the reading into it, record controller_handoff, open the successor. A
-    carrier failure leaves the document and the event: run it again."""
+def handoff(root, *, carrier, config=None, keep_predecessor=False) -> dict:
+    """Check HANDOFF-controller.md, write the reading into it, record controller_handoff (with keep_predecessor: the
+    successor's check leaves this controller open), open the successor. A carrier failure leaves the document and the
+    event: run it again."""
     root = Path(root).resolve()
     cfg = config if config is not None else cfg_mod.load(root)
     st = current(root)
@@ -367,7 +387,7 @@ def handoff(root, *, carrier, config=None) -> dict:
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        raise ControllerError(f"{path}: missing; write it from {TEMPLATE}") from None
+        raise ControllerError(f"{path}: missing; write it from {_template()}") from None
     check_doc(text)
     sts = _states(root, name)
     asked = min((s["hard_requested_at"] for s in sts if s.get("hard_requested_at")), default=None)
@@ -380,8 +400,10 @@ def handoff(root, *, carrier, config=None) -> dict:
     text = with_reading(text, u and u["context_tokens"], hard)
     atomic_write(path, text)
     ev = _events(root).append("controller_handoff", from_session=name, agent_session_id=st.get("agent_session_id"),
-                              sha256=sha256_bytes(text.encode("utf-8")), budget=int(hard), **_split(u))
-    out = open_controller(root, carrier=carrier, config=cfg, predecessor=name)
+                              sha256=sha256_bytes(text.encode("utf-8")), budget=int(hard),
+                              keep_predecessor=bool(keep_predecessor), **_split(u))
+    out = open_controller(root, carrier=carrier, config=cfg, predecessor=name, handoff=ev["id"],
+                          keep_predecessor=keep_predecessor)
     return {**out, "handoff": ev["id"], "context_tokens": ev["context_tokens"]}
 
 
@@ -438,10 +460,21 @@ def _run_test(root):
                                       timeout=TEST_TIMEOUT_S)
 
 
-def check(root, *, run=None, carrier=None) -> tuple[list[dict], dict, dict | None]:
+KEPT = "kept open as asked (--keep-predecessor); close it yourself when its work is done"
+
+
+def kept_by_handoff(root, name, pred) -> bool:
+    """keep_predecessor of the controller_handoff from `pred` whose id `name`'s controller_launch carries (a retry of
+    the same handoff launches another successor with its own); an old launch or event without it: False."""
+    hid = _launch(root, name).get("handoff")
+    return bool(hid) and any(e["type"] == "controller_handoff" and e.get("id") == hid and e.get("from_session") == pred
+                             and e.get("keep_predecessor") is True for e in history(root))
+
+
+def check(root, *, run=None, carrier=None, keep_predecessor=False) -> tuple[list[dict], dict, dict | None]:
     """Every item of the document's check block against the project now; records controller_takeover; with every item
-    ok, closes the predecessor (close_predecessor; `carrier` stands in for the one it was opened on), with a mismatch
-    keeps it. Returns (items: {key, want, ok, got}, the event, the predecessor's outcome: close_predecessor's answer,
+    ok, closes the predecessor (close_predecessor; `carrier` stands in for the one it was opened on), with a mismatch,
+    keep_predecessor or the predecessor's handoff asking for it (kept_by_handoff) keeps it. Returns (items: {key, want, ok, got}, the event, the predecessor's outcome: close_predecessor's answer,
     {predecessor, kept} on a mismatch, None without a predecessor)."""
     root = Path(root).resolve()
     try:
@@ -458,15 +491,18 @@ def check(root, *, run=None, carrier=None) -> tuple[list[dict], dict, dict | Non
     st = current(root) or {}
     name = st.get("controller")
     pred = _launch(root, name).get("predecessor") if name else None
+    keep = bool(keep_predecessor) or bool(pred) and kept_by_handoff(root, name, pred)
     bad = [f"{i['key']}: 应 {i['want']}，实际 {i['got']}" for i in items if not i["ok"]]
     ev = _events(root).append("controller_takeover", session=name, predecessor=pred, ok=not bad, mismatches=bad,
-                              **_split(usage(st.get("transcript_path"))))
+                              keep_predecessor=keep, **_split(usage(st.get("transcript_path"))))
     if not pred:
         return items, ev, None
-    if bad:  # m2d.1 r2: a predecessor an earlier check closed stays closed
+    if bad or keep:  # m2d.1 r2: a predecessor an earlier check closed stays closed
         closed = any(e["type"] == "controller_closed" and e.get("predecessor") == pred and e.get("confirmed")
                      for e in history(root))
-        return items, ev, {"predecessor": pred, "kept": "前任已关闭（此前的 check）" if closed else "核对有不符，前任保留"}
+        why = "前任已关闭（此前的 check）" if closed else "；".join(
+            ["核对有不符，前任保留"] * bool(bad) + [KEPT] * keep)
+        return items, ev, {"predecessor": pred, "kept": why}
     return items, ev, close_predecessor(root, name, carrier=carrier)
 
 

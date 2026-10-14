@@ -70,6 +70,55 @@ class StatusTest(unittest.TestCase):
         self.assertNotIn("fm-shop-p_1-1", out)
         self.assertNotIn("fm-shop-p_1-2", out)
 
+    def test_cached_starts_of_unfinished_batches(self):  # REQ-7
+        root = project(self.env, "shop", [("p.1", "running"), ("p.2", "merged")])
+        log = EventLog(root / ".foremind" / "events.jsonl")
+        base = {"repo": "api", "remote": "origin", "ref": "refs/remotes/origin/main"}
+        log.append("seat_cached_start", batch="p.1", sha="a" * 40, error="old", **base)
+        log.append("seat_cached_start", batch="p.1", sha="b" * 40,
+                   error="git fetch --quiet origin in /x: fatal: Authentication failed\nfor 'https://h/api.git'", **base)
+        log.append("seat_cached_start", batch="p.1", sha="c" * 40, error="no answer within 120 s", upstream="p.0",
+                   **{**base, "repo": "app"})
+        log.append("seat_cached_start", batch="p.2", sha="d" * 40, error="gone", **base)  # merged: not shown
+        rc, out = self.env.run("status", project=root)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("Unverified remote starts (fetch failed, cached commit used):", out)
+        self.assertIn(f"  p.1 api: origin refs/remotes/origin/main at cached {'b' * 40}, not verified against the "
+                      "remote (fetch failed ", out)
+        self.assertIn("fatal: Authentication failed for 'https://h/api.git')", out)  # one line, git's words
+        self.assertIn(f"  p.1 app (read-only upstream p.0): origin refs/remotes/origin/main at cached {'c' * 40}", out)
+        self.assertNotIn("a" * 40, out)
+        self.assertNotIn("d" * 40, out)
+        long_notes = ("git fetch --quiet origin in /x: remote: Support for password authentication was removed on "
+                      "August 13, 2021.\nremote: Please see https://docs.github.com/en/get-started/getting-started-with-"
+                      "git/about-remote-repositories#cloning-with-https-urls for information on currently recommended "
+                      "modes of authentication.\nfatal: Authentication failed for 'https://github.com/o/api.git/'")
+        log.append("seat_cached_start", batch="p.1", sha="e" * 40, error=long_notes, **{**base, "repo": "web"})
+        rc, out = self.env.run("status", project=root)
+        self.assertIn("(fetch failed ", out)
+        self.assertIn("fatal: Authentication failed for 'https://github.com/o/api.git/')", out)  # kept past the notes
+        root2 = project(self.env, "quiet", [("q.1", "running")])
+        self.assertNotIn("Unverified", self.env.run("status", project=root2)[1])
+
+    def test_last_failed_seat_opening_of_unfinished_batches(self):  # REQ-7: not only on the job's stdout
+        root = project(self.env, "shop", [("p.1", "ready"), ("p.2", "running"), ("p.3", "ready")])
+        log = EventLog(root / ".foremind" / "events.jsonl")
+        refused = ("api: fetching origin failed and refs/remotes/origin/main has no usable cached commit to start "
+                   "from: git fetch --quiet origin in /x: remote: Repository not found.\nfatal: repository "
+                   "'https://github.com/o/api.git/' not found")
+        log.append("seat_open", dedupe_id="seat_open:s1", batch="p.1", session="s1", ok=False, error=refused)
+        log.append("seat_open", dedupe_id="seat_open:s2", batch="p.2", session="s2", ok=False, error="old trouble")
+        log.append("seat_open", dedupe_id="seat_open:s3", batch="p.2", session="s3", ok=True)  # opened since
+        log.append("seat_open", dedupe_id="seat_open:s4", batch="p.3", session="s4", ok=False, problems=["x"])
+        rc, out = self.env.run("status", project=root)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("Last seat opening failed:\n  p.1 ", out)
+        self.assertIn(": api: fetching origin failed and refs/remotes/origin/main has no usable cached commit to "
+                      "start from: git fetch --quiet origin in /x: remote: Repository not found. fatal: repository "
+                      "'https://github.com/o/api.git/' not found", out)
+        self.assertNotIn("old trouble", out)
+        self.assertNotIn("  p.3 ", out.split("Last seat opening failed:")[1].split("\n等待")[0])
+
     def test_all_reads_the_registry(self):
         a, b = project(self.env, "a", [("x.1", "ready")]), project(self.env, "b", [])
         for r in (a, b):
@@ -226,8 +275,9 @@ class ExplainTest(Base):
         self.assertIn("在等：监督进程；原因：开继任中", self.line("p.2", out))
         self.assertIn("在等：门禁", self.line("p.3", out))
         self.log.append("sv_gate", phase="intent", dedupe_id="sv_gate:p.3:r1:t1", batch="p.3", round=1)
+        self.log.append("gate_result", batch="p.3", heads={}, verdict="fail", failing=["receipt"], pending=[])
         self.log.append("sv_gate", phase="result", dedupe_id="sv_gate:p.3:r1:t1", batch="p.3", ok=False, exit_code=1)
-        self.assertIn("原因：门禁未通过，改完再 foremind review", self.line("p.3"))  # r2: no gate runs now
+        self.assertIn("原因：gate failed (receipt): fix it, commit, foremind review", self.line("p.3"))  # r2: no gate runs
         self.log.append("review_started", phase="intent", dedupe_id="review:p.3:2", batch="p.3")
         self.assertIn("在等：审查者；原因：在审", self.line("p.3"))  # the next round, r2 not written yet
         self.assertIn("在等：决策者；原因：Q-2 决策中", self.line("p.4", out))

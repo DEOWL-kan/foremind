@@ -1,11 +1,15 @@
 import json
+import os
 import re
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import foremind
 from foremind.schemas import KINDS, SPECS
 
-TEMPLATES = Path(__file__).resolve().parent.parent / "templates"
+TEMPLATES = Path(__file__).resolve().parent.parent / "foremind" / "templates"  # the only source (REQ-1)
 ROLES = ("planner", "controller", "seat", "reviewer", "auditor", "decider", "cataloger")
 VOLATILE = {
     "date": r"\d{4}-\d{2}-\d{2}",
@@ -86,6 +90,41 @@ class TemplateTest(unittest.TestCase):
         section = json.loads(block)
         self.assertEqual(set(section), set(SPECS["handoff_section"]["fields"]))
         self.assertEqual(set(section["state"]), set(SPECS["handoff_section"]["fields"]["state"]["fields"]))
+
+
+class PackagedTemplateTest(unittest.TestCase):
+    """REQ-1: the ten templates are package resources read through importlib.resources, and a missing, blank or
+    unreadable one is an error, never a shorter prompt."""
+
+    def test_the_ten_are_the_source_files(self):
+        on_disk = {p.relative_to(TEMPLATES).as_posix() for p in TEMPLATES.rglob("*.md")}
+        self.assertEqual(set(foremind.TEMPLATES), on_disk)
+        self.assertEqual(len(foremind.TEMPLATES), 10)
+        self.assertEqual({f"roles/{r}.md" for r in ROLES}, {n for n in on_disk if n.startswith("roles/")})
+        for name in foremind.TEMPLATES:
+            with self.subTest(name=name):
+                self.assertEqual(foremind.template(name), (TEMPLATES / name).read_text(encoding="utf-8"))
+                self.assertEqual(Path(str(foremind.template_path(name))), (TEMPLATES / name).resolve())
+        self.assertFalse((TEMPLATES.parent.parent / "templates").exists(), "a second copy outside the package")
+
+    def test_missing_blank_unreadable(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch("foremind.template_path", lambda n: Path(d) / n):
+            self.assertRaisesRegex(ValueError, "cannot be read.*force-reinstall", foremind.template, "PROTOCOL.md")
+            (Path(d) / "PROTOCOL.md").write_text(" \n\t\n", encoding="utf-8")
+            self.assertRaisesRegex(ValueError, "is blank.*force-reinstall", foremind.template, "PROTOCOL.md")
+            (Path(d) / "PROTOCOL.md").write_bytes(b"\xff\xfe not utf-8")
+            self.assertRaisesRegex(ValueError, "cannot be read", foremind.template, "PROTOCOL.md")
+            if os.geteuid():  # root reads it anyway
+                (Path(d) / "PROTOCOL.md").write_text("x", encoding="utf-8")
+                os.chmod(Path(d) / "PROTOCOL.md", 0)
+                self.assertRaisesRegex(ValueError, "cannot be read", foremind.template, "PROTOCOL.md")
+
+    def test_no_reference_to_the_old_location(self):
+        """Installed users have no source checkout: role cards point at the packaged text, not templates/…"""
+        for name in foremind.TEMPLATES:
+            with self.subTest(name=name):
+                self.assertNotIn("`templates/", foremind.template(name))
+        self.assertIn('"Batch handoff template"', foremind.template("roles/planner.md"))
 
 
 if __name__ == "__main__":

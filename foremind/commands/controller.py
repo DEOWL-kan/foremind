@@ -11,10 +11,14 @@ def register(sub):
     p = sub.add_parser("controller", help="open, hand off and check the interactive controller; record its slips")
     ps = p.add_subparsers(dest="controller_command", required=True, metavar="<subcommand>")
     ps.add_parser("open", help="open a controller session").set_defaults(func=_guard(_open))
-    ps.add_parser("handoff", help=f"check {ctl.DOC}, record the handoff, open the successor").set_defaults(
-        func=_guard(_handoff))
-    ps.add_parser("check", help=f"check the project against {ctl.DOC}'s foremind-check block; all ok: close the "
-                  "predecessor").set_defaults(func=_guard(_check))
+    h = ps.add_parser("handoff", help=f"check {ctl.DOC}, record the handoff, open the successor")
+    h.add_argument("--keep-predecessor", action="store_true",
+                   help="the successor's check leaves this controller open (it still has work for the user)")
+    h.set_defaults(func=_guard(_handoff))
+    c = ps.add_parser("check", help=f"check the project against {ctl.DOC}'s foremind-check block; all ok: close the "
+                      "predecessor")
+    c.add_argument("--keep-predecessor", action="store_true", help="do not close the predecessor")
+    c.set_defaults(func=_guard(_check))
     s = ps.add_parser("slip", help="record a controller slip with the program's context reading")
     s.add_argument("--kind", required=True, choices=ctl.SLIPS)
     s.add_argument("--note", required=True)
@@ -45,14 +49,15 @@ def _open(args, root):
 
 def _handoff(args, root):
     config = cfg.load(root)
-    out = ctl.handoff(root, carrier=_carrier(root, config), config=config)
+    out = ctl.handoff(root, carrier=_carrier(root, config), config=config,
+                      keep_predecessor=getattr(args, "keep_predecessor", False))
     print(f"已交接：写交接时上下文 {out['context_tokens']} token（程序读数）；继任 {out['session']}"
           f"（{out['model']} / {out['effort']}）已开出并收到接手指令")
     return 0
 
 
 def _check(args, root):
-    items, ev, closed = ctl.check(root)
+    items, ev, closed = ctl.check(root, keep_predecessor=getattr(args, "keep_predecessor", False))
     for i in items:
         print(f"{'ok  ' if i['ok'] else '不符'} {i['key']}: {i['want']}" + ("" if i["ok"] else f" → 实际 {i['got']}")
               + (f"（{i['got']}）" if i["ok"] else ""))

@@ -10,7 +10,6 @@ What init writes, all removable by uninstall:
 - hooks and status line in `.claude/settings.local.json` of the project root and every repo (install.settings).
 - the project's line in the user-level `projects` registry (one absolute path per line).
 """
-import json
 import subprocess
 import tomllib
 from pathlib import Path
@@ -197,25 +196,26 @@ def write_excludes(root, dirs) -> None:
         tomlblock.add(exclude_file(top), EXCLUDE_BLOCK, "\n".join(dict.fromkeys(pats)), check=False)
 
 
-def installed_dirs(root) -> list[Path]:
-    """Directories whose settings.local.json we changed (the manifests in .foremind/install/)."""
-    out = []
-    for m in sorted((state_dir(root) / "install").glob("settings-*.json")):
-        try:
-            out.append(Path(json.loads(m.read_text(encoding="utf-8"))["path"]).parent.parent)
-        except (OSError, ValueError, KeyError, TypeError):
-            continue
-    return out
-
-
 def uninstall(root) -> list[str]:
-    """Also the registered repos without a manifest (lost): their entries that look like ours are only reported."""
+    """Also the directories of every manifest (registered or not) and the registered repos without one (lost): their
+    entries that look like ours are only reported. A manifest of a newer or illegal format_version stops it before
+    anything changed (REQ-6); a broken one leaves the file it was written for as it is."""
     root = Path(root).resolve()
     try:
         repos = project_repos(root)
     except (InstallError, ConfigError):
         repos = []
-    dirs = list(dict.fromkeys([*settings_dirs(root, repos), *installed_dirs(root)]))
+    found = settings.scan(root)
+    for _, r in found:
+        if isinstance(r, settings.ManifestError) and r.kind != "broken":
+            raise InstallError(f"{r}; nothing was removed: " + (
+                "uninstall with the Foremind that wrote it" if r.kind == "future" else
+                "fix its format_version, or delete it and remove the entries it recorded yourself"))
+    dirs = list(dict.fromkeys([*settings_dirs(root, repos), *(Path(r[1]["path"]).parent.parent for _, r in found
+                                                              if not isinstance(r, settings.ManifestError))]))
+    mine = {settings.manifest_path(root, d) for d in dirs}
+    notes = [f"{r}: left as it is, and so is the settings file it was written for" for m, r in found
+             if isinstance(r, settings.ManifestError) and m not in mine]
     tops = dict.fromkeys(t for d in dirs if (t := toplevel(d)) is not None)
     excludes = [exclude_file(t) for t in tops]
     for d in dirs:  # an unreadable file stops us before anything changed; a manifest's is settings.uninstall's
@@ -225,7 +225,6 @@ def uninstall(root) -> list[str]:
     tomlblock.remove(project_config(root), PROJECT_BLOCK, template=PROJECT_TEMPLATE, dry_run=True)
     settings.wrapped()
     registered()
-    notes = []
     for d in dirs:
         notes += settings.uninstall(root, d)
     for p in excludes:

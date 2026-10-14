@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from fnmatch import fnmatchcase
 from pathlib import Path
 
+import foremind
 from foremind import config, defaults, header, inbox, job, lock, repos, schemas, seat, state, worktree
 from foremind.events import EventLog
 from foremind.fsutil import atomic_write, project_lock, sha256_bytes
@@ -34,7 +35,6 @@ from foremind.plan import model
 from foremind.supervisor import quota
 from foremind.vendors import codex
 
-_ROLE_CARD = Path(__file__).resolve().parent.parent / "templates" / "roles" / "reviewer.md"
 READ_ONLY_TOOLS = "Read,Grep,Glob"
 PROMPT = "Read ./prompt.md and follow it. Output only the JSON object it asks for."
 LAST_MESSAGE = "last-message.json"  # Codex's -o, in the materials directory (m2f REQ-13)
@@ -424,7 +424,7 @@ def request(root, batch_id, cfg, *, session=None) -> dict:
     if cur in ("in_review", *approved) and last and last.get("heads") == hd:
         if cur != "in_review":
             raise FlowError(f"{batch_id} is {cur} at these heads; nothing new to review")
-        return {"state": cur, "heads": hd, "prs": {}, "unchanged": True}
+        return {"state": cur, "heads": hd, "prs": {}, "unchanged": True, **_gate_rerun(root, batch_id, cfg, hd, evs)}
     # N9 (REQ-19): asking again on the same heads would only swap the reviewer until one approves. Same heads = same
     # trees, so an empty or message-only commit is no change (m2b.7 r3)
     now = trees(pairs, hd)
@@ -451,6 +451,72 @@ def request(root, batch_id, cfg, *, session=None) -> dict:
     events(root).append("review_requested", batch=batch_id, heads=hd, bases=bs, requested_by=session or "user",
                         prs=prs)
     return {"state": "review_ready", "heads": hd, "prs": prs}
+
+
+LOCAL = {"acceptance", "checks"}  # the gate checks a rerun runs again
+
+
+def rerun_cap(cfg) -> int:
+    """m3a.9 (REQ-11): explicit gate reruns per batch and heads, supervisor.seat_retries read as tick.setting does."""
+    v = cfg.get("supervisor.seat_retries")
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 else \
+        defaults.TABLE["supervisor.seat_retries"]
+
+
+def explicit_reruns(evs, batch_id, hd) -> int:
+    """Explicit gate reruns started for the batch at heads `hd`: each start intent counts, whatever came of it, and
+    nothing (restart, `foremind run`, a new receipt or failure) gives one back."""
+    return sum(e["type"] == "sv_gate" and e["phase"] == "intent" and bool(e.get("explicit"))
+               and e.get("batch") == batch_id and e.get("heads") == hd for e in evs)
+
+
+def last_gate(evs, batch_id) -> dict | None:
+    return next((e for e in reversed(evs) if e["type"] == "gate_result" and e.get("batch") == batch_id), None)
+
+
+def ci_wait(g) -> bool:
+    """gate_result `g` fails only on checks still pending (CI not reported yet): nothing to fix, only to wait for."""
+    return bool(g and g.get("failing") and set(g["failing"]) <= set(g.get("pending") or ()))
+
+
+def _gate_rerun(root, batch_id, cfg, hd, evs) -> dict:
+    """m3a.9 (REQ-11): `foremind review` again on in_review heads whose latest receipt approved them and whose latest
+    gate failed acceptance / checks only asks for no new model review: it records gate_rerun_requested, bound to the
+    round, the heads and that gate_result (asked again for the same failure: the same request), for the supervisor
+    to start `gate --rerun --no-merge` (tick._explicit). At rerun_cap reruns on these heads it is refused."""
+    rs = receipts(root, batch_id)
+    try:
+        r = json.loads(rs[-1][1].read_text(encoding="utf-8")) if rs else {}
+    except ValueError as e:
+        raise FlowError(f"{batch_id}: unreadable receipt: {e}") from None
+    g = last_gate(evs, batch_id)
+    if not isinstance(r, dict) or r.get("verdict") != "approved" or r.get("heads") != hd or not g \
+            or g.get("heads") != hd or not g.get("failing") or not set(g["failing"]) <= LOCAL:
+        return {}
+    # r1: the cap is the project's and the user's (supervisor.* as tick.setting(self.cfg) reads it), never the batch
+    # header's task layer; `cfg` stays the caller's for the rest
+    used, cap = explicit_reruns(evs, batch_id, hd), rerun_cap(config.load(root))
+    # r1: a request for this failure not started yet, or its rerun still running, is answered as it stands (the rerun
+    # may pass); one that ended with no gate answer (exit 2, timed out, lost) leaves the failure as it was: a new
+    # request (its id counts the reruns so far), while any are left. r2: one the supervisor refused (the cap lowered
+    # since, tick._explicit) is closed too: it falls to the cap below
+    reqs = [e for e in evs if e["type"] == "gate_rerun_requested" and e.get("batch") == batch_id
+            and e.get("gate") == g["id"]]
+    runs = {e.get("request"): e for e in evs if e["type"] == "sv_gate" and e["phase"] == "intent" and e.get("explicit")}
+    closed = {e["dedupe_id"] for e in evs if e["type"] == "sv_gate" and e["phase"] == "result"}
+    refused = {e.get("request") for e in evs if e["type"] == "gate_rerun_refused"}
+    if reqs and reqs[-1]["id"] not in refused \
+            and (reqs[-1]["id"] not in runs or runs[reqs[-1]["id"]]["dedupe_id"] not in closed):
+        return {"gate_rerun": {"used": used, "limit": cap, "failing": g["failing"],
+                               **({"running": True} if reqs[-1]["id"] in runs else {})}}
+    if used >= cap:
+        raise FlowError(f"{batch_id}: the gate was rerun on request {used} of {cap} times at these heads and still "
+                        f"fails {', '.join(g['failing'])} (see {g.get('path')}); no further rerun: fix the code and "
+                        "commit, or have the user change supervisor.seat_retries through the config")
+    events(root).append("gate_rerun_requested", dedupe_id=f"gate_rerun_requested:{batch_id}:{g['id']}:{used}",
+                        batch=batch_id, round=rs[-1][0], heads=hd, gate=g["id"], failing=g["failing"],
+                        path=g.get("path"))
+    return {"gate_rerun": {"used": used, "limit": cap, "failing": g["failing"]}}
 
 
 # --- supervisor: start and harvest the reviewer --------------------------------------
@@ -624,7 +690,11 @@ def _materials(root, h, pairs, hd, cfg, mat, n, scope, prev=None, evs=(), at=Non
     """The full diff per repo, or for an incremental round (`prev` = the receipt it goes on from) the diff since
     prev's heads, the batch's changed files and the log since prev's review started (REQ-6). `at` (REQ-14) = a full
     receipt whose materials are rebuilt: the receipt before it, the log up to its start, the merge-bases recorded
-    with its heads."""
+    with its heads. FlowError, before anything is written, when the packaged reviewer card cannot be used."""
+    try:
+        card = foremind.template("roles/reviewer.md")
+    except ValueError as e:
+        raise FlowError(str(e)) from None
     mat.mkdir(parents=True)
     checkout(pairs, hd, mat)  # §20 I50: mat/<repo>, removed by harvest()
     bdir = state_dir(root) / "batches"
@@ -673,7 +743,6 @@ def _materials(root, h, pairs, hd, cfg, mat, n, scope, prev=None, evs=(), at=Non
         diff = git(wt, *_RAW_PATHS, "diff", "--no-ext-diff", "--no-color", "--no-textconv", base, hd[r.id])
         (mat / f"{r.id}.diff").write_text(diff + "\n", encoding="utf-8")
         lines.append(f"- ./{r.id}.diff：仓库 {r.id} 的完整 diff（base {base} → head {hd[r.id]}），已审 head 的干净检出在 ./{r.id}/")
-    card = _ROLE_CARD.read_text(encoding="utf-8") if _ROLE_CARD.is_file() else "你是零上下文、只读的审查者。"
     top = (f"本轮是增量重审，前一轮 heads 为 {json.dumps(prev['heads'])}；按角色卡「增量轮」一节审。\n\n"
            if prev else "")
     (mat / "prompt.md").write_text(top + card + "\n\n" + "\n".join(lines) + "\n\n" + _SCREENING + "\n",

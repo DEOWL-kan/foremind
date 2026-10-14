@@ -298,7 +298,7 @@ class ReexecTest(Base):
         with mock.patch.object(supervise.subprocess, "run", wraps=subprocess.run) as run, \
                 contextlib.redirect_stderr(io.StringIO()), self.assertRaises(KeyboardInterrupt):
             supervise._reexec(self.root, sv.fm("supervise"), env, 1, 2)
-        self.assertEqual(run.call_args.args[0], sv.fm("supervise", "--help"))
+        self.assertEqual(run.call_args.args[0], sv.fm(*supervise.TRY))
         self.assertTrue(self.execve.called, "the real try run exits 0")
 
     def test_a_skipped_supervise_module_is_the_error(self):  # not argparse's "invalid choice" after it

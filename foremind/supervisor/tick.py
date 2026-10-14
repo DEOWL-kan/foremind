@@ -1068,6 +1068,8 @@ class Tick:
         """门禁未通过 to the holder, each FAIL line with the output lines under it (m2f REQ-9); a held failure
         (_held, recorded as gate_held so later passes do not judge it again) waits for the next pass (_rerun)."""
         bid = it["batch"]
+        if it.get("explicit") and not ok and st.get("exit_code") != 1:  # r1: no gate answer, the request is spent
+            self._rerun_lost(it, st)
         if ok or st.get("exit_code") != 1 or not jid:
             return
         try:
@@ -1077,12 +1079,17 @@ class Tick:
                 self.emit("gate_held", dedupe_id=f"gate_held:{it['dedupe_id']}", batch=bid, round=it.get("round"),
                           job=jid, heads=g["heads"], failing=g["failing"])
                 return
+            if review.ci_wait(self._gate_result(it)):
+                return  # m3a.9: CI not reported yet, nothing for the seat to fix; _gate looks again
             fails = self._gate_fails(jid)
         except (OSError, seat.SeatError):
             return
         s = lock.holder(self.root, bid)
         if fails and s and s != lock.USER:
             note = "已自动重跑一次，仍未通过；" if it.get("rerun") else ""
+            if it.get("explicit"):
+                note = (f"requested gate rerun {review.explicit_reruns(self.evs, bid, it.get('heads'))} of "
+                        f"{review.rerun_cap(self.cfg)} at these heads still fails; ")
             self.say(s, GATE_TEXT.format(note=note, fails="\n".join(fails)), f"gate_failed:{jid}")
 
     def _gate_fails(self, jid) -> list[str]:
@@ -1096,13 +1103,21 @@ class Tick:
 
     def _held(self, it) -> dict | None:
         """m2f REQ-9: the gate_result of in_review gate run `it` (ended exit 1) when its 门禁未通过 waits a pass: not a
-        rerun, and failing only acceptance and checks. In_review starts no other gate of the round once one answered,
-        so this is the round's first such failure."""
-        if it.get("rerun") or it.get("state") != "in_review":
+        rerun, failing only acceptance and checks, and the round's first gate to answer (r1: after a CI wait the
+        round runs again, and a later local failure goes out at once)."""
+        if it.get("rerun") or it.get("explicit") or it.get("state") != "in_review":
             return None
-        g = next((e for e in reversed(self.evs[self.evs.index(it) + 1:])  # at harvest: no result yet
-                  if e["type"] == "gate_result" and e.get("batch") == it["batch"]), None)
-        return g if g and g.get("failing") and set(g["failing"]) <= {"acceptance", "checks"} else None
+        if any(e["type"] == "sv_gate" and e["phase"] == "intent" and e.get("batch") == it["batch"]
+               and e.get("round") == it.get("round") and (self.result(e["dedupe_id"]) or {}).get("exit_code") in (0, 1)
+               for e in self.evs[:self.evs.index(it)]):
+            return None
+        g = self._gate_result(it)
+        return g if g and g.get("failing") and set(g["failing"]) <= review.LOCAL else None
+
+    def _gate_result(self, it) -> dict | None:
+        """The latest gate_result of the batch after gate run `it` (at harvest: before its result)."""
+        return next((e for e in reversed(self.evs[self.evs.index(it) + 1:])
+                     if e["type"] == "gate_result" and e.get("batch") == it["batch"]), None)
 
     def _after_probe(self, it, ok, st, jid):
         tel = quota.read_account_telemetry(self.root) if ok else None
@@ -1365,7 +1380,8 @@ class Tick:
         """After an approved receipt the gate runs once (as the supervisor, so a merge_dev batch can merge); an
         approved batch waiting on CI, or a delivered one whose merge did not happen (merge_dev, SF-7) or whose gate
         after the pre-delivery audit failed (unposted), is retried every supervisor.gate_retry_min, the latter until
-        gave_up. changes_requested -> the must-fix list goes to the
+        gave_up; so is an in_review one whose gate waits on CI only (m3a.9), and a seat's request to rerun a local
+        failure goes to _explicit. changes_requested -> the must-fix list goes to the
         holder's inbox once per round, and the batch is running again (SF-1: stuck.py watches the session while it
         fixes)."""
         reviewing = {e.get("batch") for e in self.open_intents("review_started")}
@@ -1411,9 +1427,14 @@ class Tick:
                 and (retry or e.get("round") == n)]
         done = [e for e in runs if e["phase"] == "intent" and (res := self.result(e["dedupe_id"]))
                 and res.get("exit_code") in (0, 1)]
-        if st == "in_review" and done:
-            if len(done) == 1 and (held := self.result(f"gate_held:{done[0]['dedupe_id']}")):
+        # m3a.9: a gate failing only on CI still pending has not answered: it is looked at again as below, its local
+        # results reused (plain `gate`, no --rerun) and no explicit rerun spent; a real failure with it is an answer
+        if st == "in_review" and done and not review.ci_wait(review.last_gate(self.evs, bid)):
+            held = self.result(f"gate_held:{done[0]['dedupe_id']}")  # only the round's first answer is held
+            if held and not any(e.get("rerun") for e in done):  # its rerun answered: _after_gate's
                 self._rerun(bid, n, held, runs)
+            if not held or any(e["phase"] == "intent" and e.get("rerun") for e in runs):  # m2f's rerun first
+                self._explicit(bid, n, r)
             return
         last = max((e["at"] for e in runs if e["phase"] == "intent"), default=None)
         if last is None or self.now - last >= setting(self.cfg, "supervisor.gate_retry_min") * 60:
@@ -1444,6 +1465,46 @@ class Tick:
         s = self.holders.get(bid)
         if s and s != lock.USER and (fails := self._gate_fails(jid)):
             self.say(s, GATE_TEXT.format(note=note, fails="\n".join(fails)), key)
+
+    def _explicit(self, bid, n, r):
+        """m3a.9 (REQ-11): the latest gate_rerun_requested (review._gate_rerun) of round n starts `gate --rerun
+        --no-merge` once, while it still holds: receipt n approved, the batch's latest gate_result the one it names,
+        the heads its own, no gate job running; supervisor.gate_retry_min after the last gate start (on the dot
+        too); at most review.rerun_cap explicit starts per heads (gate_rerun_refused past it)."""
+        req = next((e for e in reversed(self.evs) if e["type"] == "gate_rerun_requested" and e.get("batch") == bid),
+                   None)
+        did = req and f"sv_gate:{bid}:r{n}:x{req['id']}"
+        if req is None or did in self.intents or self.in_flight(bid, ("gate",)) or req.get("round") != n \
+                or r.get("verdict") != "approved" or (review.last_gate(self.evs, bid) or {}).get("id") != req.get("gate"):
+            return  # served, or stale: a new failure, receipt or job asks for a request of its own
+        if (cfg := self.bcfg(bid)) is None or (hd := review.heads(review.batch_repos(self.root, self.headers[bid], cfg))) \
+                != req.get("heads"):
+            return
+        if (used := review.explicit_reruns(self.evs, bid, hd)) >= (cap := review.rerun_cap(self.cfg)):
+            self.emit("gate_rerun_refused", dedupe_id=f"gate_rerun_refused:{req['id']}", batch=bid, request=req["id"],
+                      used=used, limit=cap)
+            return
+        last = max((e["at"] for e in self.evs if e["type"] == "sv_gate" and e["phase"] == "intent"
+                    and e.get("batch") == bid), default=None)
+        if last is None or self.now - last >= setting(self.cfg, "supervisor.gate_retry_min") * 60:
+            self.start_job("gate", did.removeprefix("sv_gate:"), fm("gate", "--rerun", "--no-merge", bid),
+                           env={"FOREMIND_ROLE": "supervisor"}, timeout_s=self.job_timeout(bid, "gate"), batch=bid,
+                           round=n, state="in_review", explicit=True, heads=hd, request=req["id"])
+            if did in self.intents and self.result(did):  # r1: start_job could not start it (OSError): spent too
+                self._rerun_lost(self.intents[did], {"state": "not started"})
+
+    def _rerun_lost(self, it, st):
+        """r1: a requested rerun that ended with no gate answer (exit 2, e.g. the gate lock taken; timed out; lost)
+        is told to the holder, with what is left: `foremind review` asks again for the same failure."""
+        bid, hd = it["batch"], it.get("heads")
+        used, cap = review.explicit_reruns(self.evs, bid, hd), review.rerun_cap(self.cfg)
+        why = "timed out" if st.get("timed_out") else f"exit {st['exit_code']}" if st.get("exit_code") is not None \
+            else st.get("state") or "not started"
+        left = (f"run `foremind review {bid}` to ask again ({cap - used} left)" if used < cap else
+                "no rerun left: fix the code and commit, or have the user change supervisor.seat_retries")
+        if (s := self.holders.get(bid)) and s != lock.USER:
+            self.say(s, f"Foremind: requested gate rerun {used} of {cap} ended with no gate answer ({why}); {left}.",
+                     f"gate_rerun_lost:{it['dedupe_id']}")
 
     def start_reviews(self):
         cap = setting(self.cfg, "supervisor.max_oneshot")  # Codex and Claude reviewers together

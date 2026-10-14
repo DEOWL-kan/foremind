@@ -6,7 +6,8 @@ open_seat, in order:
             ready (anything started gets a successor, r2 SF-C) and its owns_paths are disjoint from every started batch (by state, or holding a lock) with no
             depends_on path to or from it (I43), then take the batch lock. Intent `seat_open` (dedupe = session),
             closed by a result whatever happens
-  worktrees one per repo under wt/<slug>/<batch>/, a new branch starting from the fetched <remote>/<target> (I46);
+  worktrees one per repo under wt/<slug>/<batch>/, a new branch starting from the fetched <remote>/<target> (I46),
+            or, the fetch failing, from that ref's commit as cached before it (REQ-7, event `seat_cached_start`);
             read-only ones for cross-repo upstreams, their refs recorded in `seat_opened`
   verify    branch, full SHA, open PR head (GitHub remotes, via gh), uncommitted files, command exit codes against
             the record: a fresh batch expects a clean worktree and its start commands' `expect` (default 0); a
@@ -27,6 +28,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -185,16 +187,40 @@ def _batch_repos(root, cfg, h):
     return [by_id[r] for r in h["repos"]], by_id
 
 
-def _target(cfg, repo):
+def _remote_commit(path, remote, ref) -> str | None:
+    """Full SHA of the commit `ref` names, read locally; None when it is missing, not a commit, unreadable, or a
+    symbolic ref leading out of refs/remotes/<remote>/ (another remote's ref is not this remote's)."""
+    to = worktree.git(path, "symbolic-ref", "-q", ref, check=False)
+    if to and not to.startswith(f"refs/remotes/{remote}/"):
+        return None
+    sha = worktree.git(path, "rev-parse", "--verify", "--quiet", ref, check=False)
+    return sha if sha and worktree.git(path, "cat-file", "-t", sha, check=False) == "commit" else None
+
+
+def _target(cfg, repo, cached):
     """Where new work in `repo` starts (I46, SF-6): with a remote, fetch it and take <remote>/<target branch>, or
-    <remote>/HEAD when no target is configured; without one, the local target branch. Never the user's checkout."""
+    <remote>/HEAD when no target is configured; without one, the local target branch. Never the user's checkout.
+    REQ-7: the remote ref's commit is pinned before the fetch; if the fetch fails, that commit is the start (never
+    the ref again: a failed fetch may have moved it) and {repo, remote, ref, sha, error} goes to `cached`. A
+    configured remote the repo lacks (remote_name took another) gets no cache: never another remote's."""
     target = cfg.get(f"delivery.repo.{repo.id}.target_branch") or repo.default_branch
     remote = worktree.remote_name(repo.path, repo.remote)
     if remote:
-        worktree.fetch(repo.path, remote)
         ref = f"refs/remotes/{remote}/{target or 'HEAD'}"
-        if worktree.git(repo.path, "rev-parse", "--verify", "--quiet", ref, check=False):
-            return ref
+        pinned = _remote_commit(repo.path, remote, ref)
+        try:
+            worktree.fetch(repo.path, remote)
+        except worktree.WorktreeError as e:
+            if repo.remote and remote != repo.remote:
+                raise SeatError(f"{repo.id}: fetching {remote} failed, and the configured remote {repo.remote} is "
+                                f"not in the repo: another remote's cache is not used: {e}") from None
+            if pinned is None:
+                raise SeatError(f"{repo.id}: fetching {remote} failed and {ref} has no usable cached commit to "
+                                f"start from: {e}") from None
+            cached.append({"repo": repo.id, "remote": remote, "ref": ref, "sha": pinned, "error": str(e)})
+            return pinned
+        if sha := _remote_commit(repo.path, remote, ref):
+            return sha
         if target:
             raise SeatError(f"{repo.id}: {remote} has no branch {target}")
     elif target:
@@ -217,12 +243,12 @@ def approved_heads(root, batch) -> dict | None:
     return None
 
 
-def _start_ref(root, cfg, up, repo):
-    """Start point in `repo` (§1.8, §4.2 5f): no upstream, `merged` mode, or an upstream already merged -> the target;
-    `approved` -> the upstream's approved head."""
+def _start_ref(root, cfg, up, repo, cached):
+    """Start point in `repo` (§1.8, §4.2 5f): no upstream, `merged` mode, or an upstream already merged -> the target
+    (a cached one noted in `cached`, _target); `approved` -> the upstream's approved head (no fetch)."""
     if (up is None or setting(cfg, "delivery.depends_on") == "merged"
             or read_header(root, up).get("state") in ("merged", "cataloged")):
-        return _target(cfg, repo)
+        return _target(cfg, repo, cached)
     heads = approved_heads(root, up) or {}
     if repo.id not in heads:
         raise SeatError(f"upstream {up} has no approved head for repo {repo.id}")
@@ -235,27 +261,47 @@ def _starts(wts) -> dict:
     return {rid: head for rid, (_, head) in wts.items()}
 
 
+def cached_text(c) -> str:
+    """REQ-7: what the user (stderr) and the seat (kickoff) are told about a worktree set up on a cached commit."""
+    what = f"{c['repo']} (read-only upstream {c['upstream']})" if c.get("upstream") else c["repo"]
+    return (f"Warning: {what}: fetching {c['remote']} failed: {c['error'].rstrip('.')}. Continuing from the cached commit "
+            f"{c['sha']} of {c['ref']}. The remote's latest state is not verified: it may have moved on.")
+
+
 def prepare_worktrees(root, cfg, h, slug):
-    """Returns ({repo id: (path, head)}, [{upstream, repo, sha, path}] of the read-only upstream worktrees)."""
+    """Returns ({repo id: (path, head)}, [{upstream, repo, sha, path}] of the read-only upstream worktrees,
+    [{repo, remote, ref, sha, error[, upstream]}] of those set up on a cached remote commit). Each of the last
+    (REQ-7) gets `seat_cached_start` once its worktree exists (status shows it) and a warning on stderr."""
     bid = h["id"]
     mine, by_id = _batch_repos(root, cfg, h)
     ups = {u: read_header(root, u) for u in h.get("depends_on", [])}
-    wts = {}
+    wts, cached, used = {}, [], []
+
+    def note(**upstream):
+        for c in cached:
+            _events(root).append("seat_cached_start", batch=bid, **c, **upstream)
+            used.append({**c, **upstream})
+            print(cached_text(used[-1]), file=sys.stderr)
+        cached.clear()
+
     for repo in mine:
         stacked = [u for u, uh in ups.items() if repo.id in uh.get("repos", [])]
         if len(stacked) > 1 and setting(cfg, "delivery.depends_on") == "approved":
             raise SeatError(f"{bid}: cannot stack on several upstreams in repo {repo.id}: {stacked}")
-        start = functools.partial(_start_ref, root, cfg, stacked[0] if stacked else None, repo)  # only if new
+        start = functools.partial(_start_ref, root, cfg, stacked[0] if stacked else None, repo, cached)  # if new
         wts[repo.id] = worktree.create(slug, bid, repo, branch=f"fm/{bid}", start_point=start)
+        note()
     ro = []
     for u, uh in ups.items():
         for rid in uh.get("repos", []):
             if rid not in wts:
                 if rid not in by_id:
                     raise SeatError(f"upstream {u} repo {rid} is not registered in [[repos]]")
-                path, sha = worktree.create_readonly(slug, bid, u, by_id[rid], _start_ref(root, cfg, u, by_id[rid]))
+                path, sha = worktree.create_readonly(slug, bid, u, by_id[rid],
+                                                     _start_ref(root, cfg, u, by_id[rid], cached))
                 ro.append({"upstream": u, "repo": rid, "sha": sha, "path": str(path)})
-    return wts, ro
+                note(upstream=u)
+    return wts, ro, used
 
 
 # --- mechanical verification -------------------------------------------------
@@ -532,8 +578,9 @@ def open_seat(root, bid, *, carrier, successor=False) -> dict:
         ev.append("seat_open", dedupe_id=f"seat_open:{session}", batch=bid, session=session, ok=ok, **fields)
 
     try:
-        wts, ro = prepare_worktrees(root, cfg, h, slug)
+        wts, ro, cached = prepare_worktrees(root, cfg, h, slug)
         out["worktrees"] = {rid: str(p) for rid, (p, _) in wts.items()}
+        out["cached"] = cached
         expect = expectations(root, h, wts, successor=successor)
         problems = verify(root, h, wts, expect, timeout_s=setting(cfg, "seat.verify_timeout_s"))
         spec = None if problems else _launch(root, cfg, h, session, wts, ro)
@@ -584,7 +631,8 @@ def open_seat(root, bid, *, carrier, successor=False) -> dict:
             if now != "running":
                 set_state(root, bid, "running", held=True)
                 moved = True
-        carrier.deliver(session, kickoff_text(bid, wts, successor=successor, record=expect[2] is not None))
+        carrier.deliver(session, "\n".join([kickoff_text(bid, wts, successor=successor, record=expect[2] is not None),
+                                             *map(cached_text, cached)]))
     except BaseException as e:
         ev.append("seat_launch", dedupe_id=launch_id, batch=bid, session=session, ok=False, error=str(e))  # deduped
         evidence, released = _abandon(root, carrier, bid, session, claimed=claimed, launched=launched)
@@ -609,7 +657,7 @@ def claim_for_user(root, bid) -> dict:
         _claim(root, bid, lock.USER, reclaim=True)
         if read_header(root, bid).get("state", "planned") != "running":
             set_state(root, bid, "running", held=True)
-    wts, ro = prepare_worktrees(root, cfg, h, project_slug(root, cfg))
+    wts, ro, _ = prepare_worktrees(root, cfg, h, project_slug(root, cfg))  # the warning went to stderr
     paths = {rid: str(p) for rid, (p, _) in wts.items()}
     _events(root).append("seat_user", batch=bid, worktrees=paths, starts=_starts(wts),
                          readonly=[{k: r[k] for k in ("upstream", "repo", "sha")} for r in ro])
@@ -659,8 +707,9 @@ def continue_seat(root, session, frm, to, *, remaining_budget, carrier) -> dict:
         ev.append("seat_continue", dedupe_id=did, batch=to, session=session, ok=ok, **fields)
 
     try:
-        wts, ro = prepare_worktrees(root, cfg, h, project_slug(root, cfg))
+        wts, ro, cached = prepare_worktrees(root, cfg, h, project_slug(root, cfg))
         out["worktrees"] = {rid: str(p) for rid, (p, _) in wts.items()}
+        out["cached"] = cached
         problems = verify(root, h, wts, expectations(root, h, wts, successor=False),
                           timeout_s=setting(cfg, "seat.verify_timeout_s"))
     except BaseException as e:
@@ -682,7 +731,8 @@ def continue_seat(root, session, frm, to, *, remaining_budget, carrier) -> dict:
         for p in [*out["worktrees"].values(), *(r["path"] for r in ro)]:
             carrier.deliver(session, f"/add-dir {p}")  # I44【待实测】: the new worktrees join the session
         carrier.deliver(session, kickoff_text(to, wts, successor=False)
-                        + f" 考纲不会自动注入：先读 {state_dir(root) / 'batches' / f'{to}.handoff.md'}，并切到上面的 worktree。")
+                        + f" 考纲不会自动注入：先读 {state_dir(root) / 'batches' / f'{to}.handoff.md'}，并切到上面的 worktree。"
+                        + "".join("\n" + cached_text(c) for c in cached))
     except BaseException as e:
         evidence, released = _abandon(root, carrier, to, session, claimed=True, launched=sending)
         result(False, error=str(e), closed=evidence is not None, released=released)

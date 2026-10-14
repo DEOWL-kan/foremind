@@ -8,15 +8,17 @@ Presence is read with `list-panes`, which fails when the target is missing. Only
 "no server running" (or no socket file at all) count as absent; any other failure raises, it is never exit
 evidence (MF-1). Empty output from a successful call is read as absent too.
 Text goes in as a bracketed paste (load-buffer + paste-buffer -p) and then Enter, so multi-line messages are not
-submitted line by line; tmux cannot confirm delivery, so send() returns None. Idle is a rough read: no window
-activity for quiet_s seconds (§10.3). close() watches the pane processes, then the session's own process
-(Carrier._settled): a claude under a pane shell may outlive the pane.
+submitted line by line; tmux cannot confirm delivery, so send() returns None. Right before the paste the pane must show
+Claude Code ready for input (carriers/ready.py, REQ-9), and before Enter no dialog that came up meanwhile. Idle is a
+rough read: no window activity for quiet_s seconds (§10.3). close() watches the pane processes, then the session's own
+process (Carrier._settled): a claude under a pane shell may outlive the pane.
 """
+import functools
 import os
 import shlex
 import time
 
-from foremind.carriers import Carrier, CarrierError, SessionExists, SessionState, run
+from foremind.carriers import Carrier, CarrierError, SessionExists, SessionState, ready, run
 from foremind.handoff import history
 from foremind.lock import ExitEvidence
 
@@ -42,6 +44,7 @@ class TmuxCarrier(Carrier):
             raise CarrierError(f"carrier.tmux.socket must be an absolute path, not {sock!r}")
         self.socket = sock
         self._opened_on = {}
+        self._fresh = set()  # created by this instance, not sent to yet: the one start-up wait (REQ-9)
 
     def _sock(self, session):
         """The socket `session` was opened on (its `seat_launch` intent), else this carrier's own."""
@@ -56,16 +59,16 @@ class TmuxCarrier(Carrier):
             self._opened_on[session] = rec
         return self._opened_on[session]
 
-    def _tmux(self, *args, sock=None, input=None, check=True):
-        r = run(["tmux", "-S", sock or self.socket, *args], input=input)
+    def _tmux(self, *args, sock=None, input=None, check=True, timeout=60):
+        r = run(["tmux", "-S", sock or self.socket, *args], input=input, timeout=timeout)
         if check and r.returncode:
             raise CarrierError(f"tmux {args[0]}: {r.stderr.strip()}")
         return r
 
-    def _panes(self, session):
+    def _panes(self, session, timeout=60):
         """[(dead, window_activity, pid)] of the session's window; [] when tmux says the session is not there."""
         r = self._tmux("list-panes", "-t", f"={session}:", "-F", "#{pane_dead} #{window_activity} #{pane_pid}",
-                       sock=self._sock(session), check=False)
+                       sock=self._sock(session), check=False, timeout=timeout)
         if r.returncode:
             if _absent(r.stderr):
                 return []
@@ -84,14 +87,29 @@ class TmuxCarrier(Carrier):
             if "duplicate session" in r.stderr:
                 raise SessionExists(f"tmux: session {session} already exists on socket {self.socket}")
             raise CarrierError(f"tmux new-session: {r.stderr.strip()}")
+        self._fresh.add(session)
 
     def send(self, session, text):
         pane, buf, sock = f"={session}:", f"fm-{session}", self._sock(session)
+        probe = functools.partial(self._probe, session)
+        first = session in self._fresh
+        self._fresh.discard(session)
+        ready.wait(session, probe, ready.FIRST_WAIT_S if first else 0)
         self._tmux("load-buffer", "-b", buf, "-", sock=sock, input=text)
         self._tmux("paste-buffer", "-p", "-d", "-b", buf, "-t", pane, sock=sock)
         time.sleep(_PASTE_SETTLE_S)
+        ready.no_dialog(session, probe)
         self._tmux("send-keys", "-t", pane, "Enter", sock=sock)
         return None
+
+    def _probe(self, session):
+        """(alive, the rendered pane or None) for carriers.ready, each tmux call on a short timeout."""
+        panes = self._panes(session, timeout=ready.IO_TIMEOUT_S)
+        if not panes or panes[0][0]:
+            return False, None
+        r = self._tmux("capture-pane", "-p", "-t", f"={session}:", sock=self._sock(session), check=False,
+                       timeout=ready.IO_TIMEOUT_S)
+        return True, None if r.returncode else r.stdout.splitlines()
 
     def read_state(self, session):
         panes = self._panes(session)

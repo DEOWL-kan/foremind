@@ -176,8 +176,9 @@ def _run(args):
             raise install.InstallError(
                 f"{', '.join(map(str, tracked))} 已被 git 跟踪：钩子里有本机的解释器路径，写进去会被提交给别人。"
                 "先 git rm --cached 它并提交（本地文件留着），再重跑 init")
-        for d in dirs:  # an unreadable file stops us before anything is written
-            settings.installed_commands(d)
+        # an unreadable settings file, a manifest this Foremind cannot read (also one of a directory no longer
+        # registered) or a recorded entry changed since stops us before anything is written (REQ-6, L385)
+        settings.preflight(root, dirs)
         settings.wrapped()
         install.registered()
 

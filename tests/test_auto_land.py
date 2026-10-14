@@ -29,7 +29,7 @@ class AutoLandTest(Base):
         super().setUp()
         self.user_config(USER + "[land]\nauto = true\n")
         self.plan("p", {"state": "delivered"})
-        (self.root / "foremind.toml").write_text('[[repos]]\nid = "main"\npath = "main"\n')
+        (self.root / "foremind.toml").write_text('[[repos]]\nid = "main"\npath = "main"\ndefault_branch = "main"\n')
         self.repo = self.root / "main"
         self.repo.mkdir()
         git(self.repo, "init", "-q", "-b", "main")
@@ -53,7 +53,9 @@ class AutoLandTest(Base):
         return [c for c, _ in self.started()]
 
     def ended(self, n, outcome, kind=None, code=1, **fields):
-        """Job n wrote its land_result and exited."""
+        """Job n wrote its land_result and exited; merged, it moved the target (REQ-8: git bears the record out)."""
+        if outcome == "merged":
+            git(self.repo, "merge", "-q", "--ff-only", "fm/p.1")
         self.log.append("land_result", batch="p.1", heads=self.hd, outcome=outcome, kind=kind,
                         job=self.jobs.started[n]["id"],
                         **{"reason": f"why {outcome}", "failed": None, "out_dir": None, **fields})

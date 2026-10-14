@@ -1,8 +1,10 @@
 import json
 import os
+import tempfile
 from pathlib import Path
 from unittest import mock
 
+import foremind
 from foremind import config as cfg_mod
 from foremind import header as hdr
 from foremind import planner, seat
@@ -109,7 +111,7 @@ class SubmitTest(PlannerCase):
         code, _, err = run(["plan", "submit", "p-1", "--dir", str(d)])
         self.assertEqual(code, 1)
         self.assertIn("p-1.2", err)
-        self.assertEqual(sorted(p.name for p in self.state.iterdir()), [])
+        self.assertEqual(sorted(p.name for p in self.state.iterdir()), ["admission.lock"])  # the entry's (m3a.8)
         (d / "batches" / "p-1.2.handoff.md").unlink()
         self.assertRaisesRegex(PlanError, "handoff.md: missing", planner.submit, self.root, "p-1", d)
 
@@ -121,7 +123,7 @@ class SubmitTest(PlannerCase):
         self.assertEqual(code, 1)
         self.assertIn("owns_paths", err)
         self.assertNotIn("Traceback", err)
-        self.assertEqual(sorted(p.name for p in self.state.iterdir()), [])
+        self.assertEqual(sorted(p.name for p in self.state.iterdir()), ["admission.lock"])  # the entry's (m3a.8)
 
     def test_batch_of_another_plan_is_refused(self):
         d = self.draft([header("p-1.1", ["main:a.py"])])
@@ -168,7 +170,11 @@ class NewTest(PlannerCase):
         self.assertIn("做一个登录页", text)
         self.assertIn(f"foremind plan submit p-1 --dir {draft}", text)
         self.assertIn(f"项目根（主检出，只读；工作目录是草稿目录，项目的规则与代码到这里读）：{self.root.resolve()}", text)
-        self.assertIn("## 会话内怎么做", text)  # the role card, in full
+        self.assertIn(foremind.template("roles/planner.md").strip(), text)  # the packaged role card, in full (REQ-1)
+        # the batch handoff format as text, not a path an installed user has no checkout for
+        self.assertIn(f"## Batch handoff template\n\nWrite each batches/<id>.handoff.md in this shape:\n\n````markdown\n"
+                      f"{foremind.template('handoff.md').strip()}\n````", text)
+        self.assertNotIn("templates/handoff.md", text)
         self.assertEqual(self.events("planner_opened")[0]["session"], session)
         # the next plan gets the next id and xhigh on M
         out = planner.open_planner(self.root, "另一件", carrier=carrier,
@@ -182,6 +188,23 @@ class NewTest(PlannerCase):
                                carrier=carrier, config=cfg)
         self.assertEqual(carrier.closed, list(carrier.created))
         self.assertEqual(carrier.sent, [])
+
+    def test_unusable_card_stops_before_launch(self):
+        """REQ-1: a missing, blank or unreadable planner card or handoff template is an error, with no session."""
+        carrier = FakeCarrier(self.root)
+        with tempfile.TemporaryDirectory() as d:
+            for name, data in (("roles/planner.md", None), ("roles/planner.md", b"  \n"), ("handoff.md", b"\xff")):
+                fake = Path(d, name.replace("/", "_"))
+                fake.unlink(missing_ok=True)
+                if data is not None:
+                    fake.write_bytes(data)
+                real = foremind.template_path
+                with self.subTest(name=name, data=data), \
+                        mock.patch("foremind.template_path", lambda n, f=fake, m=name: f if n == m else real(n)):
+                    self.assertRaisesRegex(ValueError, "packaged template", planner.open_planner, self.root, "x",
+                                           carrier=carrier, config={})
+        self.assertEqual((carrier.created, carrier.sent), ({}, []))
+        self.assertFalse((self.root / "share" / "drafts").exists())
 
     def test_excluded_model(self):
         carrier = FakeCarrier(self.root)

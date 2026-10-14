@@ -101,6 +101,28 @@ class WorktreeTest(unittest.TestCase):
             worktree.create_readonly("proj", "p.2", "p.1", self.api, "main")
         self.assertEqual((path / "contract.md").read_text(), "edited where nobody should write")
 
+    def test_readonly_upstream_on_the_same_ref_with_local_changes_is_refused(self):  # REQ-7
+        path, sha = worktree.create_readonly("proj", "p.2", "p.1", self.api, "main")
+        (path / "notes.txt").write_text("untracked")
+        with self.assertRaises(worktree.WorktreeError) as cm:
+            worktree.create_readonly("proj", "p.2", "p.1", self.api, "main")
+        self.assertIn("notes.txt", str(cm.exception))
+        (path / "notes.txt").unlink()
+        (path / "README").write_text("uncommitted")
+        with self.assertRaises(worktree.WorktreeError):
+            worktree.create_readonly("proj", "p.2", "p.1", self.api, "main")
+        git(path, "checkout", "--", "README")
+        self.assertEqual(worktree.create_readonly("proj", "p.2", "p.1", self.api, "main"), (path, sha))
+
+    def test_failed_checkout_leaves_no_branch(self):  # REQ-7: git keeps it; a retry must not take it as existing
+        blob = git(self.api.path, "rev-parse", "main:README")
+        obj = self.api.path / ".git" / "objects" / blob[:2] / blob[2:]
+        obj.chmod(0o644)
+        obj.write_bytes(b"corrupt")
+        with self.assertRaises(worktree.WorktreeError):
+            worktree.create("proj", "p.1", self.api, branch="fm/p.1", start_point="main")
+        self.assertEqual(git(self.api.path, "branch", "--list", "fm/p.1"), "")
+
     def test_remove(self):
         for r in (self.api, self.app):
             worktree.create("proj", "p.2", r, branch="fm/p.2", start_point="main")

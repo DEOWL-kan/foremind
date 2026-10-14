@@ -8,6 +8,12 @@ its spec was written never started and is "lost".
 Caveats: env values are passed through str(), so None becomes the string "None". On timeout the group gets SIGTERM,
 then SIGKILL after the grace period; if the group leader exits on SIGTERM first, grandchildren that ignore it are
 SIGKILLed at once and get no grace period.
+REQ-5: a job whose directory is in a Foremind project's state dir starts inside the project's shared admission
+(upgrade.admitted), taken before the spec is written: Refused (an OSError, as an unwritable spec) when the project is
+blocked. The runner gets that lock's descriptor (ADMISSION_FD) and takes it over before it writes its pid, so the lock
+is held without a gap until the runner wrote the result; a runner started without one takes its own (the spec's
+starting window covers the gap, upgrade checks again after its marker). The command itself does not inherit it.
+A job elsewhere (no project) runs as before.
 """
 import contextlib
 import json
@@ -27,35 +33,60 @@ from foremind.fsutil import atomic_write
 _PKG_PARENT = Path(__file__).resolve().parent.parent
 _KILL_GRACE_S = 5
 _START_S = 60
+ADMISSION_FD = "FOREMIND_ADMISSION_FD"  # the runner's inherited admission lock (REQ-5); supervise's re-exec too
+
+
+class Refused(OSError):
+    """The project may not start a job now (upgrade.Blocked)."""
 
 
 def _now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def project_of(job_dir) -> Path | None:
+    """The project whose state dir (`.foremind/`, paths.state_dir) holds `job_dir`; None outside every project."""
+    p = Path(job_dir).resolve()
+    return next((d.parent for d in (p, *p.parents) if d.name == ".foremind"), None)
+
+
+def _admitted(root, fd=None):
+    if root is None:
+        return contextlib.nullcontext()
+    from foremind import upgrade  # lazy: it imports this module
+    return upgrade.admitted(root, fd)
+
+
 def start(job_dir: Path, argv: list[str], *, cwd: Path, env: dict | None = None, timeout_s: int | None = None,
           job_id: str | None = None) -> str:
     """env overlays the inherited environment; only the overlay is written to spec.json. job_id: chosen by a caller
     that records it before the job exists (tick.start_job's intent); a new one otherwise."""
+    from foremind.upgrade import Blocked
     job_id = job_id or uuid.uuid4().hex
     d = Path(job_dir).resolve() / job_id
     spec = d / "spec.json"
     env = {**{str(k): str(v) for k, v in (env or {}).items()}, "FOREMIND_JOB": job_id}
-    atomic_write(spec, json.dumps({"argv": list(argv), "cwd": str(Path(cwd).resolve()), "env": env,
-                                   "timeout_s": timeout_s}, ensure_ascii=False))
-    # cwd = package parent so `-m foremind` resolves to this code even from a source checkout
     try:
-        p = subprocess.Popen([sys.executable, "-m", "foremind", "_job", "run", str(spec)],
-                             cwd=_PKG_PARENT, start_new_session=True, stdin=subprocess.DEVNULL,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except BaseException:
-        shutil.rmtree(d, ignore_errors=True)  # no runner: leave no half-made job behind
-        raise
-    # m2e.3: a thread holds and reaps the runner, so dropping p warns of no running subprocess and leaves no zombie;
-    # _alive's waitpid may reap it first (the thread's wait then reads ChildProcessError as done)
-    threading.Thread(target=p.wait, daemon=True).start()
-    with contextlib.suppress(OSError):  # the job runs: the runner writes its pid as well (status: no pid -> lost)
-        atomic_write(d / "pid", str(p.pid))
+        with _admitted(project_of(d)) as fd:
+            atomic_write(spec, json.dumps({"argv": list(argv), "cwd": str(Path(cwd).resolve()), "env": env,
+                                           "timeout_s": timeout_s}, ensure_ascii=False))
+            # cwd = package parent so `-m foremind` resolves to this code even from a source checkout
+            try:
+                p = subprocess.Popen([sys.executable, "-m", "foremind", "_job", "run", str(spec)],
+                                     cwd=_PKG_PARENT, start_new_session=True, stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                     pass_fds=() if fd is None else (fd,),
+                                     env=None if fd is None else {**os.environ, ADMISSION_FD: str(fd)})
+            except BaseException:
+                shutil.rmtree(d, ignore_errors=True)  # no runner: leave no half-made job behind
+                raise
+            # m2e.3: a thread holds and reaps the runner, so dropping p warns of no running subprocess and leaves no
+            # zombie; _alive's waitpid may reap it first (the thread's wait then reads ChildProcessError as done)
+            threading.Thread(target=p.wait, daemon=True).start()
+            with contextlib.suppress(OSError):  # the job runs: the runner writes its pid as well (no pid -> lost)
+                atomic_write(d / "pid", str(p.pid))
+    except Blocked as e:
+        raise Refused(f"{d}: not started: {e}") from None
     return job_id
 
 
@@ -72,8 +103,20 @@ def _kill_group(p):
 
 
 def run(spec_path) -> int:
+    from foremind.upgrade import Blocked
     spec_path = Path(spec_path)
     d = spec_path.parent
+    fd = os.environ.pop(ADMISSION_FD, None)  # not passed on to the command; closed when this process ends
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(_admitted(project_of(d), None if fd is None else int(fd)))
+        except (Blocked, OSError, ValueError) as e:
+            print(f"foremind _job: {d} not run: {e}", file=sys.stderr)
+            return 1
+        return _run(d, spec_path)
+
+
+def _run(d, spec_path) -> int:
     atomic_write(d / "pid", str(os.getpid()))
     spec = json.loads(spec_path.read_text(encoding="utf-8"))
     started, timed_out = _now(), False

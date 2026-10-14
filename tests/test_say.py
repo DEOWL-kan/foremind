@@ -2,17 +2,21 @@
 seat hook's three kinds of prompt (program, controller, external)."""
 import contextlib
 import io
+import json
 import os
+import sys
 import tempfile
 import unittest
 from datetime import timedelta
 from pathlib import Path
 from unittest import mock
 
+from test_carrier_ready import S2 as IDLE, S4 as APPROVAL
+from test_carriers import FAKE_TMUX
 from test_hooks import SESSION, HookBase
 
 from foremind import carriers, cli, header, heartbeat, hooks, inbox, lock
-from foremind.carriers import Carrier
+from foremind.carriers import Carrier, ready
 from foremind.commands import say
 from foremind.events import EventLog
 from foremind.schemas import EXAMPLES
@@ -170,6 +174,30 @@ class DirectTest(unittest.TestCase):
         self.assertNotIn("请把下面的消息粘贴", out)
         r = self.deliveries("result")[-1]
         self.assertEqual((r["ok"], "manual" in r["error"]), (False, True))
+
+    def test_the_screen_check_of_a_real_carrier(self):
+        """REQ-9: --direct goes through the carrier's own check, one look: S4 (a permission dialog) gets nothing."""
+        tmp = self.root.parent
+        (tmp / "bin").mkdir()
+        (tmp / "bin" / "tmux").write_text(f"#!{sys.executable}\n{FAKE_TMUX}")
+        (tmp / "bin" / "tmux").chmod(0o755)
+        log, scr = tmp / "tmux.log", tmp / "screens.json"
+        self.enterContext(mock.patch.dict(os.environ, {"PATH": f"{tmp / 'bin'}{os.pathsep}{os.environ['PATH']}",
+                                                       "FAKE_TMUX_LOG": str(log), "FAKE_TMUX_PID": "1",
+                                                       "FAKE_TMUX_SCREENS": str(scr)}))
+        self.enterContext(mock.patch.object(ready, "time", mock.Mock(monotonic=lambda: 0.0,
+                                                                     sleep=mock.Mock(side_effect=AssertionError))))
+        self.get.return_value = GET("tmux", self.root, {"carrier.tmux": {"socket": str(tmp / "s.sock")}})
+        scr.write_text(json.dumps([APPROVAL, IDLE]))
+        code, out = self.say()
+        self.assertEqual(code, 1)
+        for needle in (SESSION, ready.DIALOG, "Do you want to proceed?"):
+            self.assertIn(needle, out)
+        self.assertEqual(self.deliveries("result")[-1]["ok"], False)
+        self.assertNotIn("paste-buffer", log.read_text())
+        self.assertNotIn("send-keys", log.read_text())
+        self.assertEqual(self.say(), (0, f"-> {SESSION}（已发送，未确认）\n"))  # IDLE: ready
+        self.assertIn("send-keys", log.read_text())
 
     def test_without_direct_nothing_changes(self):
         self.assertEqual(self.say("hi", direct=False), (0, f"-> {SESSION}\n"))

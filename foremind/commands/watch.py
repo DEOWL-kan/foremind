@@ -14,14 +14,11 @@ import time
 from datetime import datetime
 
 from foremind import carriers, config, heartbeat, lock, review
+from foremind.carriers.ready import CHOICE_MARKERS  # one definition with the carriers' send check (REQ-9)
 from foremind.defaults import TABLE
 from foremind.paths import ProjectNotFound, find_project_root, state_dir
 from foremind.plan import model
 from foremind.supervisor import ready
-
-# what a Claude Code question (AskUserQuestion) and a confirmation dialog show on screen; measured by controller-8
-# (2026-10-10, v2.1.280, m2f.6 handoff). "Esc to cancel" alone would match too much.
-CHOICE_MARKERS = ("Enter to select", "Enter to confirm")
 KEY_TYPES = {"pending_created", "pending_needed", "review_receipt", "gate_result", "l0_hard_failure", "job_failed",
              "stuck", "reconciled", "review_not_converging", "sv_successor", "bounds_violation", "bounds_error",
              "session_leak", "session_closed", "session_close_unverified", "session_unknown", "controller_closed",

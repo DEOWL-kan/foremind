@@ -5,18 +5,20 @@ the handle Orca returns in `.foremind/carriers/orca/<session>.json`, every later
 presence is the handle showing up in `list`. A restarted supervisor maps listed handles back to session names
 through these records. Without a record the program never created the session: close() cannot confirm anything
 and returns None. A record is kept after close, so the name is never created twice.
-send() is confirmed when Orca reports `turn_started`; `wait --for tui-idle` only works for a recognised agent TUI
-(a plain shell times out); closing an already exited terminal answers `terminal_handle_stale`; close reports
-ptyKilled:false even when the process exits, so exit is confirmed by the handle leaving `list`. close() always asks
-Orca to close first: a handle missing from a `list` alone is never exit evidence (M1-4 r2 MF-A). Nor is Orca's word
-alone (m2d.1.D1): after an Orca restart a running seat's pty lives on without its tab (`orphaned`), its handle answered
-stale or left `list` for a while, and the claude in it kept running; so evidence also waits for the process
-(Carrier._settled).
+send() first checks the rendered screen (`read --screen`, carriers/ready.py, REQ-9): `--text … --enter` would answer a
+trust or permission dialog. It is confirmed when Orca reports `turn_started`; `wait --for tui-idle` only works for a
+recognised agent TUI (a plain shell times out); closing an already exited terminal answers `terminal_handle_stale`;
+close reports ptyKilled:false even when the process exits, so exit is confirmed by the handle leaving `list`. close()
+always asks Orca to close first: a handle missing from a `list` alone is never exit evidence (M1-4 r2 MF-A). Nor is
+Orca's word alone (m2d.1.D1): after an Orca restart a running seat's pty lives on without its tab (`orphaned`), its
+handle answered stale or left `list` for a while, and the claude in it kept running; so evidence also waits for the
+process (Carrier._settled).
 """
+import functools
 import json
 import time
 
-from foremind.carriers import Carrier, CarrierError, SessionExists, SessionState, run
+from foremind.carriers import Carrier, CarrierError, SessionExists, SessionState, ready, run
 from foremind.fsutil import atomic_write
 from foremind.lock import ExitEvidence
 from foremind.paths import state_dir
@@ -38,6 +40,10 @@ def _dig(obj, key):
 class OrcaCarrier(Carrier):
     name = "orca"
 
+    def __init__(self, root, cfg=None):
+        super().__init__(root, cfg)
+        self._fresh = set()  # created by this instance, not sent to yet: the one start-up wait (REQ-9)
+
     def _orca(self, *args, timeout=60):
         r = run(["orca", "terminal", *args, "--json"], timeout=timeout)
         try:
@@ -50,10 +56,10 @@ class OrcaCarrier(Carrier):
             raise CarrierError(f"orca terminal {what}: {j.get('error')}")
         return {} if j.get("result") is None else j["result"]
 
-    def _listed(self) -> set:
+    def _listed(self, timeout=60) -> set:
         """Listed handles: only a bare list or {"terminals": [...]} (seen live: result.terminals), each entry with a
         string handle. Anything else raises, so an unreadable list never reads as "gone" (MF-A)."""
-        res = self._ok(self._orca("list"), "list")
+        res = self._ok(self._orca("list", timeout=timeout), "list")
         terms = res if isinstance(res, list) else res.get("terminals") if isinstance(res, dict) else None
         if not isinstance(terms, list) or not all(isinstance(t, dict) and isinstance(t.get("handle"), str)
                                                   for t in terms):
@@ -80,11 +86,15 @@ class OrcaCarrier(Carrier):
         if not isinstance(h, str) or not h:
             raise CarrierError(f"orca terminal create: no terminal handle in {res}")
         atomic_write(self._dir() / f"{session}.json", json.dumps({"session": session, "handle": h}) + "\n")
+        self._fresh.add(session)
 
     def send(self, session, text):
         h = self._handle(session)
         if not h:
             raise CarrierError(f"orca: no terminal recorded for {session!r}")
+        first = session in self._fresh
+        self._fresh.discard(session)
+        ready.wait(session, functools.partial(self._probe, h), ready.FIRST_WAIT_S if first else 0)
         res = self._ok(self._orca("send", "--terminal", h, "--text", text, "--enter", "--wait-submit", "10"), "send")
         return True if "turn_started" in (_dig(res, "stages") or ()) else None
 
@@ -106,11 +116,23 @@ class OrcaCarrier(Carrier):
         if not h:
             return None
         try:
-            res = self._ok(self._orca("read", "--terminal", h, "--screen"), "read")
+            return self._read_screen(h)[1]
         except CarrierError:
             return None
-        lines = (_dig(res, "terminal") or {}).get("tail")  # seen live: result.terminal.tail (controller-8)
-        return lines if _dig(res, "source") == "screen" and isinstance(lines, list) else None
+
+    def _read_screen(self, h, timeout=60):
+        """(terminal status, rendered lines or None when Orca gave no rendered screen)."""
+        res = self._ok(self._orca("read", "--terminal", h, "--screen", timeout=timeout), "read")
+        term = _dig(res, "terminal") or {}  # seen live: result.terminal.{status,tail,source} (controller-8, m3a.4)
+        lines = term.get("tail")
+        return term.get("status"), lines if _dig(res, "source") == "screen" and isinstance(lines, list) else None
+
+    def _probe(self, h):
+        """(alive, rendered lines or None) for carriers.ready: listed and running, each call on a short timeout."""
+        if h not in self._listed(timeout=ready.IO_TIMEOUT_S):
+            return False, None
+        status, lines = self._read_screen(h, timeout=ready.IO_TIMEOUT_S)
+        return status == "running", lines
 
     def wait_idle(self, session, timeout_s):
         h = self._handle(session)

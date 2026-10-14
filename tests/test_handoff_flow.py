@@ -305,7 +305,9 @@ class LogFormatTest(unittest.TestCase):
         self.assertEqual(log_cmd.bad_records("\n".join(good + bad), b), bad)
 
     def test_cli_rejects_and_shows_the_format(self):
+        # no project: a seat's own (FOREMIND_PROJECT) could refuse first, when it needs foremind upgrade (m3a.8)
         with mock.patch("sys.stdin", io.StringIO("m2a.7.D1 · 缺段\n")), \
+                mock.patch.dict(os.environ, {"FOREMIND_PROJECT": os.devnull}), \
                 contextlib.redirect_stderr(io.StringIO()) as err, mock.patch.object(batchlog, "append") as app:
             self.assertEqual(cli.main(["log", "m2a.7"]), 1)
         app.assert_not_called()

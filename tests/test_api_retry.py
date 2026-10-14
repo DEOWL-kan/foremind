@@ -101,6 +101,9 @@ class LastApiErrorTest(Base):
 class ApiRetryTest(Base):
     def setUp(self):
         super().setUp()
+        # m3a.9: a whole second, so z() and iso() are exact. time.time() within 0.5 µs under a millisecond made z()
+        # round the error past self.now, and a retry due on the dot at 2 min came a pass late (1 run in ~2000)
+        self.now = float(int(self.now))
         self.plan("p")
         self.tp = self.tmp / "t.jsonl"
         self.write(reply("a1", self.now - 60), user("u0", self.now - 30), api_error("e1", self.now))

@@ -1,9 +1,13 @@
+import contextlib
+import io
+import re
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from foremind import batchlog
+from foremind.cli import main
 from foremind.events import EventLog
 from foremind.fsutil import sha256_file
 
@@ -59,6 +63,24 @@ class BatchLogTest(unittest.TestCase):
         for bad in ("", "../x", ".hidden", "a/b"):
             with self.assertRaises(ValueError):
                 batchlog.append(self.root, bad, "t", author="a")
+
+
+
+class FormatHintTest(unittest.TestCase):
+    def test_bad_record_points_at_the_packaged_protocol(self):  # REQ-1: no source checkout needed
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d, "log.md")
+            f.write_text("m1.1.D1 · only two · fields\n", encoding="utf-8")
+            err = io.StringIO()
+            # no project: a seat's own (FOREMIND_PROJECT) could refuse first, when it needs foremind upgrade (m3a.8)
+            with contextlib.redirect_stderr(err), mock.patch.dict("os.environ", {"FOREMIND_PROJECT": d}):
+                self.assertEqual(main(["log", "m1.1", "--file", str(f)]), 1)
+        hint = re.search(r"D/F record format \(rule 10 of the Foremind protocol, (.+)\):", err.getvalue())
+        self.assertIsNotNone(hint, err.getvalue())
+        rule = Path(hint[1]).read_text(encoding="utf-8")
+        self.assertIn("10. **边做边写 D/F 记录**", rule)
+        self.assertNotIn("templates/PROTOCOL.md", err.getvalue().replace(hint[1], ""))
+        self.assertIn("m1.1.D<n> · 选了什么", err.getvalue())
 
 
 if __name__ == "__main__":

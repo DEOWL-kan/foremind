@@ -3,21 +3,28 @@ green, else 1. `--rescan` first redoes the delivery proposal (§7.5) and asks be
 `--rescan --yes` keeps what delivery.toml has (saying where the detection now differs) and takes the proposal for the
 rest. A WARN line is told, not counted.
 
-The hook interpreter and its package path come first: a hook whose python is gone or cannot import foremind fails
-silently in Claude Code. They are probed with the installed command line itself (`version` for the subcommand), in
-the directory the hooks run in. `[project].name` against running batches (§20 I39): their locks and worktrees carry
-the slug, so a changed name is an error to fix by hand, never rewritten here. Checks only: nothing is created."""
+The packaged templates (REQ-1), the install manifests and the hooks' interpreter and package come first (REQ-6): a
+hook whose python is gone or cannot import foremind fails silently in Claude Code. Each interpreter, PYTHONPATH and -P
+of our command lines is probed with a fixed argv in the directory the hooks run in (settings.locate), never the line
+itself, and compared with this CLI's; a working install elsewhere is reported too, with the upgrade commands of this
+CLI, and the other install is left alone. A manifest is never rewritten here, an older format nor a newer one; the
+hooks of a directory whose manifest a newer Foremind wrote are that one's, not checked here.
+`[project].name` against running batches (§20 I39): their locks and worktrees carry the slug, so a changed name is an
+error to fix by hand, never rewritten here. Checks only: nothing is created.
+REQ-5: an unfinished or broken upgrade, and a project that still needs one (a manifest of format 0, hooks recorded for
+another Foremind), are told with the exact commands to finish or undo it; while one is, no fix offers `foremind init`
+(init is refused then, and would go round the upgrade)."""
 import json
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
 import tomllib
 from pathlib import Path
 
-from foremind import config, gate, install, lock, review, seat, worktree
+import foremind
+from foremind import config, gate, install, lock, review, seat, upgrade, worktree
 from foremind import header as hdr
 from foremind import repos as repos_mod
 from foremind.defaults import TABLE
@@ -25,6 +32,7 @@ from foremind.install import detect, settings
 from foremind.paths import ProjectNotFound, find_project_root, state_dir, user_config_dir
 from foremind.schemas import BATCH_ID
 from foremind.supervisor.tick import supervisor_state
+from foremind.vendors import claude
 
 
 def register(sub):
@@ -35,49 +43,90 @@ def register(sub):
     p.set_defaults(func=_run)
 
 
-def _py(cmd) -> tuple[str, dict]:
-    """(interpreter, extra env) of one of our hook command lines: `PYTHONPATH=<dir> <python> -m foremind …`."""
-    words, env = shlex.split(cmd), {}
-    while words and "=" in words[0] and not words[0].startswith("/"):
-        k, _, v = words.pop(0).partition("=")
-        env[k] = v
-    return (words[0] if words else ""), env
+def _check_templates(add):
+    """REQ-1: the ten packaged templates there and not blank."""
+    bad = []
+    for name in foremind.TEMPLATES:
+        try:
+            foremind.template(name)
+        except ValueError as e:
+            bad.append(str(e))
+    add("packaged templates", not bad, "; ".join(bad) or f"{len(foremind.TEMPLATES)} readable",
+        "reinstall Foremind from a complete wheel: pip install --no-index --force-reinstall <wheel>")
 
 
-def _probe(cmd, **kw) -> tuple[bool, str]:
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL, **kw)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        return False, str(e)
-    return p.returncode == 0, (p.stdout + p.stderr).strip()
-
-
-def _check_interpreters(add, dirs):
-    runs = {}  # our command line with `version` for its subcommand -> a directory it runs in
+def _check_manifests(add, root, dirs) -> set[Path]:
+    """REQ-6: every install manifest readable as one this Foremind knows (read only: never rewritten here), and what
+    each records still in place. Returns the manifests a newer Foremind wrote."""
+    found, bad, future = settings.scan(root), 0, set()
+    for m, r in found:
+        if isinstance(r, settings.ManifestError):
+            bad += 1
+            if r.kind == "future":
+                future.add(m)
+            add(f"install manifest {m.name}", False, str(r),
+                "use the Foremind that wrote it, or upgrade this one; this one leaves the manifest as it is"
+                if r.kind == "future" else
+                "fix it, or remove Foremind's hooks and status line from the settings file it is for yourself and "
+                "delete it; then foremind init --yes")
     for d in dirs:
-        for c in _quiet(settings.installed_commands, d):
-            runs.setdefault(settings.OURS.sub(" -m foremind version", c), d)
-    pys = {}
-    for run, d in sorted(runs.items()):
-        py, env = _py(run)
-        if py not in pys:
-            pys[py] = _probe([py, "-c", "import sys; print(sys.version.split()[0]); sys.exit(sys.version_info < (3, 11))"])
-            add(f"钩子解释器 {py}", pys[py][0], pys[py][1] or "不存在",
-                "foremind init --yes（用 3.11+ 的解释器运行 foremind 重装钩子）")
-        if pys[py][0]:
-            ok, out = _probe(run, shell=True, cwd=d)
-            add(f"钩子能导入 foremind（{env.get('PYTHONPATH', '无 PYTHONPATH')}）", ok,
-                "" if ok else (out.splitlines() or [""])[-1][-300:],
-                "foremind init --yes（包路径变了，或钩子没带 -P 被当前目录的 foremind/ 遮蔽：从现在的安装位置重装钩子）")
-    if not runs:
+        try:
+            gone = settings.conflicts(root, d)
+        except (settings.SettingsError, OSError):
+            continue  # an unreadable manifest above, an unreadable settings file in the hooks check
+        if gone:
+            bad += 1
+            add(f"install record matches {settings.path(d)}", False, "; ".join(gone),
+                f"put them back as recorded, or remove Foremind's remaining entries from {settings.path(d)} yourself "
+                f"and delete {settings.manifest_path(root, d)}; then foremind init --yes")
+    if not bad:
+        vs = [r[0] for _, r in found]
+        add("install manifests", True, f"{len(vs)} readable" + (
+            f" (format_version {', '.join(f'{v}: {vs.count(v)}' for v in sorted(set(vs)))}; 0 = none)" if vs else ""))
+    return future
+
+
+def _check_hooks(add, root, dirs, newer):
+    """REQ-6: which Foremind the hooks of each directory run, against this CLI's interpreter, PYTHONPATH and package.
+    `newer`: a newer Foremind's manifest is there (its hooks are its own: none found is not this one's to say)."""
+    py, pkg, pp = settings.expected()
+    this = f"{py}, PYTHONPATH {pp}, package {pkg}"
+    move = (f"{claude.foremind_command('upgrade', '--check')}, then {claude.foremind_command('upgrade')}: moves the "
+            "recorded hooks to this CLI; the other installation is left as it is")
+    found = False
+    for d in dirs:
+        try:
+            if not (cmds := settings.installed_commands(d)):
+                continue
+        except (settings.SettingsError, OSError):
+            continue  # the hooks check says why
+        found, probs = True, settings.locate(d)
+        unrecorded = not settings.manifest_path(root, d).exists() or any(settings.target(c) is None for c in cmds)
+        add(f"hooks in {settings.path(d)} run this Foremind", not probs,
+            "; ".join(probs) + f" (this CLI: {this})" if probs else this,
+            "no install record covers these lines (or one is not in a shape Foremind writes): check them and remove "
+            "them yourself; then foremind init --yes" if unrecorded else move)
+    if not found and not newer:
         add("钩子命令", False, "没有找到已装的 foremind 钩子", "foremind init --yes")
 
 
-def _quiet(fn, *a):
-    try:
-        return fn(*a)
-    except (settings.SettingsError, OSError):
-        return []
+def _check_upgrade(add, root) -> bool:
+    """REQ-5: the upgrade state of the project; True when it blocks every write."""
+    run, check = claude.foremind_command("upgrade"), claude.foremind_command("upgrade", "--check")
+    mk, need = upgrade.marker(root), upgrade.pending(root)
+    if mk and mk["broken"]:
+        add("upgrade marker readable", False, f"{mk['path']}: {mk['broken']}; every write is refused until it is "
+            "resolved", "\n       ".join(upgrade.recovery(root)))
+    elif mk:
+        add("no unfinished upgrade", False, f"{mk['path']} (transaction {mk['transaction']}, backup {mk['backup']}); "
+            "every write is refused until it is finished", f"{run} (it finishes the upgrade, or says what stops it; "
+            f"{check} lists it first); or undo it by hand:\n       " + "\n       ".join(upgrade.recovery(root)))
+    if need:
+        add("project up to date with this Foremind", False, "; ".join(need) + "; every write is refused until it is "
+            "upgraded", f"{check}, then {run} (it stops nothing: stop what --check lists yourself)")
+    elif not mk:
+        add("project up to date with this Foremind", True)
+    return bool(mk or need)
 
 
 def _started(root) -> list[tuple[str, dict]]:
@@ -143,7 +192,11 @@ def checks(root) -> list[tuple[str, bool | None, str, str]]:
             add("仓库登记", False, str(e), "改 [[repos]]")
     dirs = install.settings_dirs(root, repos)
 
-    _check_interpreters(add, dirs)
+    _check_templates(add)
+    future = _check_manifests(add, root, dirs)
+    live = [d for d in dirs if settings.manifest_path(root, d) not in future]  # a newer Foremind's are its own
+    _check_hooks(add, root, live, bool(future))
+    held = _check_upgrade(add, root)
     add("git", bool(shutil.which("git")), shutil.which("git") or "PATH 里没有", "安装 git")
     github = any("github.com" in (install.git(r.path, "remote", "get-url", r.remote or "origin") or "") for r in repos)
     if github or cfg and any(v == "system" for k, v in cfg.items() if k.endswith(".push_pr")):
@@ -210,10 +263,15 @@ def checks(root) -> list[tuple[str, bool | None, str, str]]:
             "交互运行 foremind doctor --rescan 选 merge_method；或在 foremind.toml 的 [delivery.repo.<id>] 写 "
             "merge_command")
 
-    for d in dirs:
+    for d in live:
         probs = settings.check(d)
-        add(f"钩子已装 {settings.path(d)}", not probs, "; ".join(probs),
-            "foremind init --yes（状态栏来自项目或本地 settings 时：交互运行 foremind init 并同意串联）")
+        add(f"钩子已装 {settings.path(d)}", not probs, "; ".join(probs), "foremind init --yes" + (
+            "; the status line of the project's .claude/settings.json is wrapped only with your consent: run "
+            "foremind init interactively" if settings.wrap_asks(d) else ""))
+        if (local := settings.local_statusline(d)) is not None:  # L384: kept as the user chose, never wrapped
+            add(f"local status line in {settings.path(d)}", None,
+                f"{local!r} stays; sessions in this directory report no quota telemetry",
+                "nothing to do: Foremind leaves a local status line as it is")
     tracked = install.tracked_settings(dirs)
     add("settings.local.json 未被 git 跟踪", not tracked, ", ".join(map(str, tracked)),
         "git rm --cached <文件> 并提交（钩子里有本机路径，不该共享；本地文件留着）")
@@ -243,6 +301,9 @@ def checks(root) -> list[tuple[str, bool | None, str, str]]:
             add("已登记到 projects", False, str(install.registry_path()), "foremind init --yes")
     except (install.InstallError, OSError) as e:
         add("已登记到 projects", False, str(e), f"修好或移走 {install.registry_path()} 后 foremind init --yes")
+    if held:  # init is refused while the upgrade blocks the project: never offer it as a way round
+        out = [(n, ok, d, "finish the upgrade first (see above); then rerun foremind doctor" if "foremind init" in f
+                else f) for n, ok, d, f in out]
     return out
 
 

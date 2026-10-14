@@ -6,7 +6,8 @@ A batch is taken (items 1-10) when auto() finds items 1-8 (commands.land.auto_bl
 state looked at first so no other batch costs a git call) and 10 (no `auto_land_stopped` on its current heads since
 its latest `foremind run`), and no job of this phase runs in the project (item 9). Each ended job is settled once
 (`auto_land_outcome`, the land_result it wrote, or the gate rerun's gate_result), by its outcome:
-- merged: nothing more; L0 reconcile records merged.
+- merged (already_merged too): nothing more; L0 reconcile records merged. A merged land_result git does not bear out
+  (some target branch without its head) is no success: an error.
 - tests: the first on these heads -> `foremind gate --rerun --no-merge <batch>`; a pass -> land once more; tests again,
   or the rerun not passing -> failed (reason auto_land_failed, `## 状态` with the land's failed commands and output
   directory, and the rerun's failing checks; the report phase's one failed notice tells it), and stopped on these
@@ -18,6 +19,9 @@ its latest `foremind run`), and no job of this phase runs in the project (item 9
 - error (also a job timed out, lost, or with no land_result): retried as above; supervisor.seat_retries of them on
   these heads stop it, with one P1.
 Every count and stop is since the batch's latest `foremind run` (run_requested): that run starts it over.
+A merged land_result on the current heads, by hand or by a job, whatever `foremind run` since, keeps the batch from
+being taken while git bears it out (m3a REQ-8, L393); old heads' never holds back new ones, and a merged outcome git no
+longer bears out is retried as above.
 Tick.announce and Tick.waits leave out a batch auto() takes: no 等你合入 for it.
 """
 from foremind import review
@@ -41,6 +45,18 @@ def _since(t, bid) -> int:
 def _mine(t, bid, hd) -> list:
     """The batch's events on heads hd since its latest `foremind run`."""
     return [e for e in t.evs[_since(t, bid):] if e.get("batch") == bid and e.get("heads") == hd]
+
+
+def _held(t, bid, hd) -> bool:
+    """Git's word on a merged record: every local target branch of the batch holds its head in hd (the automatic land
+    takes no batch with a remote, item 5; main checkouts, so a removed worktree does not matter); False when that
+    cannot be read."""
+    try:
+        cfg = t.bcfg(bid) or t.cfg
+        return all(review.is_ancestor(r.path, hd[r.id], f"refs/heads/{review.target_branch(r, cfg)}")
+                   for r, _ in review.batch_repos(t.root, t.headers[bid], cfg, main=True))
+    except ERRORS:
+        return False
 
 
 def auto(t, bid) -> dict | None:
@@ -73,6 +89,9 @@ def _start(t, bid, hd) -> bool:
     rides on the intents (m2f.4 r2): a gate rerun carries the failed commands and output directory of the tests it
     reruns, a land after a passing rerun (or retrying one) `rerun`; a `foremind run` while a job of it runs does
     not cut it."""
+    if any(e["type"] == "land_result" and e.get("batch") == bid and e.get("heads") == hd
+           and e.get("outcome") == "merged" for e in t.evs) and _held(t, bid, hd):
+        return False  # landed, by hand or by a job, before a `foremind run` too: waits for reconcile
     last = next((e for e in reversed(_mine(t, bid, hd)) if e["type"] == "auto_land_outcome"), None)
     action, more = "land", {}
     if last is None:
@@ -81,13 +100,12 @@ def _start(t, bid, hd) -> bool:
         if last["outcome"] != "pass":
             return False  # a rerun not passing has failed the batch
         more = {"rerun": True}
-    elif last["outcome"] == "merged":
-        return False  # waits for reconcile
     elif _class(last["outcome"], last["kind"]) == "tests":
         if last.get("rerun"):
             return False  # tests again after the rerun: the batch has failed
         action, more = "gate", {"failed": last.get("failed"), "out_dir": last.get("out_dir")}
-    else:  # retry, auto, error (a stop keeps auto() off); the attempt may predate the latest `foremind run`
+    else:  # retry, auto, error, merged git no longer bears out (a stop keeps auto() off); the attempt may predate the
+        # latest `foremind run`
         at = max(e["at"] for e in t.intents.values() if e["type"] == f"sv_{KIND}" and e.get("batch") == bid
                  and e.get("heads") == hd)
         if t.now - at < setting(t.cfg, "supervisor.gate_retry_min") * 60:
@@ -110,7 +128,8 @@ def _start(t, bid, hd) -> bool:
 
 def _outcome(t, it, st, jid) -> dict:
     """What the ended job came to: a land job's land_result (its own by job id, else the batch's last one after the
-    intent; error when timed out, lost or none), a gate rerun's pass or fail on the intent's heads."""
+    intent; error when timed out, lost, none, or merged where git says otherwise), a gate rerun's pass or fail on the
+    intent's heads."""
     bid, hd = it["batch"], it["heads"]
     after = t.evs[t.evs.index(it) + 1:]
     if it.get("action") == "gate":
@@ -129,7 +148,11 @@ def _outcome(t, it, st, jid) -> dict:
         why = "超时" if st.get("timed_out") else "丢失" if st["state"] == "lost" else "没写 land_result"
         return {"outcome": "error", "kind": None, "failed": None, "out_dir": None,
                 "reason": f"合入作业{why}（{st.get('exit_code', st['state'])}）", "land_result": None}
-    return {**{k: r.get(k) for k in ("outcome", "kind", "failed", "out_dir", "reason")}, "land_result": r["id"]}
+    out = {**{k: r.get(k) for k in ("outcome", "kind", "failed", "out_dir", "reason")}, "land_result": r["id"]}
+    if out["outcome"] == "merged" and not _held(t, bid, r.get("heads") or hd):  # the heads it merged
+        out.update(outcome="error", kind=None, reason="land_result merged, but the target branches do not hold "
+                                                      "these heads")
+    return out
 
 
 def _class(o, k) -> str:

@@ -11,6 +11,11 @@ A Foremind session has FOREMIND_SESSION (plus FOREMIND_BATCH, FOREMIND_ROLE, FOR
 only the `.foremind/` guard, presence records and `user_config_edit` records of their #22 edits (I51), and one with
 FOREMIND_CONTROLLER (opened by `controller open`) foremind.controller's SessionStart bind and Stop context gate.
 Outside every Foremind project the hooks do nothing (I41).
+REQ-5: while an upgrade blocks the project (upgrade.blocked: one running or unfinished, a broken marker, or the project
+still needs one; read without a lock), main() decides before any handler and keeps no books at all (no event,
+heartbeat, telemetry or inbox): a Foremind session (FOREMIND_SESSION, or the controller's FOREMIND_CONTROLLER) gets
+every tool call denied, the user's own session goes on as usual, only the `.foremind/` guard still deciding its edits.
+That branch never runs through main()'s catch-all, which lets the call go through.
 
 Events: session_bound; pending_needed (hard-block hit without an exemption; decide.pending.from_hit then opens a
 Q-n for it, pushed by a detached job and never from the hook, or reuses the unresolved one of the same key; none when
@@ -103,6 +108,13 @@ def main(event: str, raw: str, emit=None) -> str | None:
         if root is None or handler is None:
             return None
         session = os.environ.get("FOREMIND_SESSION") or None
+        why = _migration(root)
+    except Exception as e:  # noqa: BLE001 — a hook failure must never turn into a block
+        _error(root or _root(None), event, session, e)
+        return None
+    if why:
+        return _held(event, data, root, session, why, emit)
+    try:
         with contextlib.ExitStack() as stack:
             ctx = Ctx(event, data, root, session, _batch(root, event, session), os.environ.get("FOREMIND_ROLE") or None,
                       stack)
@@ -115,6 +127,38 @@ def main(event: str, raw: str, emit=None) -> str | None:
         return text
     except Exception as e:  # noqa: BLE001 — a hook failure must never turn into a block
         _error(root or _root(None), event, session, e)
+        return None
+
+
+def _migration(root) -> str | None:
+    """Why an upgrade blocks `root` now (REQ-5), else None. A check that fails counts as one: a Foremind session
+    is held rather than let through unchecked, the user's own session only keeps no books."""
+    try:
+        from foremind import upgrade  # lazy: it imports much of the package
+        return upgrade.blocked(root)
+    except Exception as e:  # noqa: BLE001
+        return f"{root}: cannot tell whether an upgrade blocks it ({type(e).__name__}: {e})"
+
+
+def _held(event, data, root, session, why, emit) -> str | None:
+    """main()'s answer while an upgrade blocks the project (REQ-5): no bookkeeping; a failure is told on stderr only."""
+    out = None
+    try:
+        if event == "PreToolUse" and (session or os.environ.get("FOREMIND_CONTROLLER")):
+            out = f"Foremind: {why}. Stop working in this project: only the user runs foremind upgrade there " \
+                  "(foremind doctor shows what is wrong and how to recover)"
+        elif event == "PreToolUse":
+            ti = data.get("tool_input")
+            v = guard.evaluate(str(data.get("tool_name") or ""), ti if isinstance(ti, dict) else {}, data.get("cwd"),
+                               root=root)
+            out = v.matrix and "Foremind 拦截：" + "；".join(v.matrix)
+        text = out and json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                                          "permissionDecisionReason": out}})
+        if text and emit:
+            emit(text)
+        return text or None
+    except Exception as e:  # noqa: BLE001 — the user's guard slipped, or stdout failed: told, no event written
+        print(f"foremind hook {event}: {type(e).__name__}: {e}"[:500], file=sys.stderr)
         return None
 
 
@@ -512,7 +556,7 @@ def _controller_line(ctx, name):
     when = "停下手上的工作，现在" if level == 2 else "到下一个自然断点（合入一批之后）"
     return _added(f"Foremind（回合中途提醒）：总控上下文已用 {used} token（程序读数），"
                   f"{'达到硬线' if level == 2 else '过了软线'}（软线 {int(soft)}，硬线 {int(hard)}）。"
-                  f"{when}按 {controller.TEMPLATE} 写 {Path(ctx.root) / controller.DOC}，"
+                  f"{when}按 {controller._template()} 写 {Path(ctx.root) / controller.DOC}，"
                   f"再执行 `foremind controller handoff`（{controller._cmd('handoff')}）。")
 
 

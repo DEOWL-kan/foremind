@@ -1,0 +1,25 @@
+{
+  "name": "CI",
+  "on": {"push": {"branches": ["main"]}, "pull_request": {}},
+  "permissions": {"contents": "read"},
+  "jobs": {
+    "test": {
+      "strategy": {
+        "fail-fast": false,
+        "matrix": {"os": ["ubuntu-latest", "macos-latest"], "python": ["3.11", "3.13"]}
+      },
+      "runs-on": "${{ matrix.os }}",
+      "env": {"FOREMIND_REQUIRE_BUILD": "1", "GIT_CONFIG_NOSYSTEM": "1", "PIP_DISABLE_PIP_VERSION_CHECK": "1"},
+      "steps": [
+        {"uses": "actions/checkout@v4", "with": {"persist-credentials": false}},
+        {"uses": "actions/setup-python@v5", "with": {"python-version": "${{ matrix.python }}"}},
+        {"name": "Build backend (environment setup; the tests build and install offline)",
+         "run": "python3 -m pip install \"setuptools>=61\"\npython3 --version\npython3 -c \"import ensurepip, setuptools; print(setuptools.__version__)\""},
+        {"name": "No global git identity",
+         "run": "touch \"$RUNNER_TEMP/empty-gitconfig\"\necho \"GIT_CONFIG_GLOBAL=$RUNNER_TEMP/empty-gitconfig\" >> \"$GITHUB_ENV\""},
+        {"name": "Full test suite", "run": "python3 -m unittest discover -s tests"},
+        {"name": "Install smoke", "run": "python3 -m unittest discover -s tests -p 'test_install_smoke.py' -v"}
+      ]
+    }
+  }
+}

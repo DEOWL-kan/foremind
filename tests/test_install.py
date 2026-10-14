@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import os
 import shutil
 import tomllib
 import unittest
@@ -163,7 +164,10 @@ class InitUninstallTest(unittest.TestCase):
         self.assertEqual(cfg["delivery.repo.main.level"], "done")
         self.assertEqual(cfg["delivery.repo.main.push_pr"], "user")
         self.assertTrue((root / ".foremind" / "delivery.proposal.json").is_file())
-        self.assertEqual(self.fails(root), [f"钩子已装 {root / '.claude' / 'settings.local.json'}"])  # the status line
+        rc, out = self.env.run("doctor", project=root)
+        self.assertEqual(rc, 0, out)  # a local status line is told (L384), not counted, and never wrapped
+        self.assertIn(f"WARN local status line in {settings.path(root)}", out)
+        self.assertNotIn("串联", out)
 
         rc, out = self.env.run("uninstall", project=root)
         self.assertEqual(rc, 0, out)
@@ -406,7 +410,7 @@ class InitUninstallTest(unittest.TestCase):
         rc, out = self.env.run("init", "--yes", "--root", str(root))  # init stops on it rather than guess
         self.assertEqual(rc, 1, out)
         self.assertIn("broken install manifest", out)
-        self.assertIn("只删清单会被当成丢失", out)
+        self.assertIn("deleting only the manifest makes init add a second set", out)
         self.assertEqual(settings.path(root).read_bytes(), installed)
 
     def test_a_foremind_looking_hook_of_the_users(self):
@@ -530,7 +534,7 @@ class InitUninstallTest(unittest.TestCase):
         p.write_text(json.dumps(s))
         rc, out = self.env.run("uninstall", project=root)
         self.assertEqual(rc, 0, out)
-        self.assertIn("hooks.Stop 里没有与安装记录相同的钩子组", out)
+        self.assertIn("hooks.Stop has no group equal to the recorded", out)
         want = json.loads(USER_SETTINGS)
         want["env"] = {"A": "1"}
         want["hooks"]["Stop"] += s["hooks"]["Stop"][1:]
@@ -545,7 +549,8 @@ class InitUninstallTest(unittest.TestCase):
         (m,) = (root / ".foremind" / "install").glob("settings-*.json")
         man = json.loads(m.read_text())
         self.assertNotIn("sk-secret", m.read_text())
-        self.assertEqual(set(man), {"path", "created", "hooks_created", "hooks", "statusLine"})
+        self.assertEqual(set(man), {"format_version", "path", "created", "hooks_created", "hooks", "statusLine"})
+        self.assertIs(man["format_version"], 1)
         self.assertEqual((man["created"], man["hooks_created"]), (False, False))
         self.assertFalse(man["hooks"]["Stop"]["created"])
         self.assertTrue(man["hooks"]["PreToolUse"]["created"])
@@ -565,7 +570,7 @@ class InitUninstallTest(unittest.TestCase):
         self.assertEqual(self.env.run("uninstall", project=root)[0], 0)
         self.assertFalse((root / ".claude").exists())
 
-    def test_an_older_manifest_is_rewritten(self):  # REQ-11
+    def test_an_older_manifest_is_read_in_memory(self):  # REQ-11; m3a.6 REQ-6: never rewritten as it is read
         root = self.env.repo(self.env.tmp / "shop")
         p = settings.path(root)
         p.parent.mkdir()
@@ -582,8 +587,21 @@ class InitUninstallTest(unittest.TestCase):
         self.assertEqual(m.read_bytes(), old)
         (self.env.config / "projects").write_text(f"{root}\n")
         rc, out = self.env.run("uninstall", project=root)
+        self.assertEqual(rc, 1, out)  # m3a.8 REQ-5: one of format 0 goes through the user's foremind upgrade first
+        self.assertIn("needs foremind upgrade", out)
+        self.assertEqual(m.read_bytes(), old)
+
+        def upgrade():
+            with mock.patch.dict(os.environ):
+                for k in ("FOREMIND_CONTROLLER", "FOREMIND_JOB"):  # upgrade refuses them; a land runs tests in a job
+                    os.environ.pop(k, None)
+                rc, out = self.env.run("upgrade", project=root)
+            self.assertEqual(rc, 0, out)
+            return out
+        out = upgrade()
+        self.assertEqual(out.count("安装前这里的本地状态栏是 'my-status --short'"), 1)  # said as it is rewritten
+        rc, out = self.env.run("uninstall", project=root)
         self.assertEqual(rc, 0, out)
-        self.assertEqual(out.count("安装前这里的本地状态栏是 'my-status --short'"), 1)
         want = json.loads(USER_SETTINGS)
         del want["statusLine"]  # ours went; theirs is not put back
         self.assertEqual(json.loads(p.read_text()), want)
@@ -591,14 +609,17 @@ class InitUninstallTest(unittest.TestCase):
                                              (5, False, True), ('{"hooks": {}}', False, False)):
             p.write_text(json.dumps({"hooks": {"Stop": claude.settings()["hooks"]["Stop"]}}))
             m.write_text(json.dumps({"path": str(p), "original": orig}))
+            old = m.read_bytes()
             with contextlib.redirect_stdout(io.StringIO()) as said:
-                man = settings.manifest(root, root)
-            self.assertNotIn("original", json.loads(m.read_text()), orig)
-            self.assertEqual((man["created"], man["hooks_created"], said.getvalue()), (created, hooks_created, ""), orig)
+                man, notes = settings.load(root, root)
+            self.assertEqual(m.read_bytes(), old, orig)
+            self.assertEqual((man["created"], man["hooks_created"], notes, said.getvalue()),
+                             (created, hooks_created, [], ""), orig)
             self.assertEqual(man["hooks"], {"Stop": {"created": True, "groups": claude.settings()["hooks"]["Stop"]}})
         p.write_text(json.dumps({"hooks": {"Stop": []}}))  # an older install's key, its group deleted by the user
         m.write_text(json.dumps({"path": str(p), "original": None}))
-        self.assertEqual(settings.manifest(root, root)["hooks"], {"Stop": {"created": True, "groups": []}})
+        self.assertEqual(settings.load(root, root)[0]["hooks"], {"Stop": {"created": True, "groups": []}})
+        upgrade()
         self.assertEqual(self.env.run("uninstall", project=root)[0], 0)
         self.assertFalse(p.exists())
 

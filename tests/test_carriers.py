@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from foremind import carriers, config, sessions
+from foremind.carriers import ready
 from foremind.carriers.manual import ManualCarrier
 from foremind.events import EventLog
 from foremind.fsutil import sha256_bytes
@@ -18,9 +19,12 @@ from foremind.lock import ExitEvidence
 from foremind.vendors import Launch
 
 # fake `orca terminal <verb> ... --json`, answering in the envelope M1-0 recorded; state in $FAKE_ORCA_STATE.
-# Like Claude Code, the program in a new terminal rewrites its title at once.
+# Like Claude Code, the program in a new terminal rewrites its title at once. `read --screen` answers the screens in the
+# JSON list at $FAKE_ORCA_SCREENS one per call, the last one for good (a list of lines; null: screen-unavailable;
+# "exited": the terminal's process ended); unset, an idle Claude Code input box.
 FAKE_ORCA = r'''
 import json, os, sys
+READY = ["", "─" * 40, "❯ ", "─" * 40, "  ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents"]
 state_path, events = os.environ["FAKE_ORCA_STATE"], os.environ["FAKE_EVENTS"]
 st = json.load(open(state_path)) if os.path.exists(state_path) else {"n": 0, "terms": [], "log": []}
 args = sys.argv[2:]
@@ -48,6 +52,15 @@ if verb == "send":
     n = sum("program_delivery" in line for line in open(events)) if os.path.exists(events) else 0
     term.setdefault("sent", []).append({"text": opt["--text"], "events_before": n})
     out(True, {"send": {"prompt": {"stages": ["input_accepted"] if shell else ["input_accepted", "turn_started"]}}})
+if verb == "read" and "--screen" in args:
+    screens, scr = os.environ.get("FAKE_ORCA_SCREENS"), READY
+    if screens:
+        seq = json.load(open(screens))
+        scr = seq.pop(0) if len(seq) > 1 else seq[0]
+        json.dump(seq, open(screens, "w"))
+    out(True, {"terminal": {"handle": term["handle"], "status": "exited" if scr == "exited" else "running",
+                            "tail": scr if isinstance(scr, list) else [],
+                            "source": "screen" if isinstance(scr, list) else "screen-unavailable"}})
 if verb == "read":
     out(True, {"terminal": {"status": "running", "tail": ["", "> ready"], "nextCursor": 2}})
 if verb == "wait":
@@ -57,9 +70,11 @@ if verb == "close":
     out(False, code="terminal_handle_stale") if term.get("stale") else out(True, {"closeMode": "tab", "ptyKilled": False})
 '''
 
-# fake `tmux -S <socket> <verb> ...`: $FAKE_TMUX picks the answer, every call is logged to $FAKE_TMUX_LOG
+# fake `tmux -S <socket> <verb> ...`: $FAKE_TMUX picks the answer, every call is logged to $FAKE_TMUX_LOG.
+# capture-pane prints the screens in the JSON list at $FAKE_TMUX_SCREENS one per call, the last one for good (null:
+# capture-pane fails); unset, nothing
 FAKE_TMUX = r'''
-import os, signal, sys, time
+import json, os, signal, sys, time
 open(os.environ["FAKE_TMUX_LOG"], "a").write(" ".join(sys.argv[1:]) + "\n")
 mode, verb = os.environ.get("FAKE_TMUX", "alive"), sys.argv[3]
 if mode == "empty":  # exit 0, no output: read as absent
@@ -74,6 +89,13 @@ if mode == "duplicate" and verb == "new-session":
     sys.exit(sys.stderr.write("duplicate session: fm-x\n") and 1)
 if verb == "list-panes":
     print(f"0 {int(time.time()) - 100} {os.environ['FAKE_TMUX_PID']}")
+if verb == "capture-pane" and os.environ.get("FAKE_TMUX_SCREENS"):
+    seq = json.load(open(os.environ["FAKE_TMUX_SCREENS"]))
+    scr = seq.pop(0) if len(seq) > 1 else seq[0]
+    json.dump(seq, open(os.environ["FAKE_TMUX_SCREENS"], "w"))
+    if scr is None:
+        sys.exit(sys.stderr.write("can't capture\n") and 1)
+    print("\n".join(scr))
 if verb == "kill-session" and mode == "alive":
     os.kill(int(os.environ["FAKE_TMUX_PID"]), signal.SIGTERM)
 '''
@@ -348,8 +370,12 @@ class TmuxCarrierIT(unittest.TestCase):
     def test_lifecycle(self):
         self.assertEqual(self.c.close(self.name).how, "absent")  # no server on the socket yet
         self.assertEqual(self.c.list_sessions(), [])
-        script = 'echo "$FOREMIND_SESSION" > env.txt; while read l; do echo "got:$l" >> out.txt; done'
-        launch = Launch(["sh", "-c", script], {"FOREMIND_SESSION": self.name}, self.tmp)
+        # REQ-9: sends only to an idle Claude Code input box (S2 of handoff/m3a4-screens-2026-10-13.md), drawn again
+        # after every line read
+        script = ('echo "$FOREMIND_SESSION" > env.txt; draw() { printf "\\033[2J\\033[H%s\\n❯ \\n%s\\n  %s\\n" '
+                  '"$RULE" "$RULE" "⏵⏵ accept edits on (shift+tab to cycle) · ← for agents"; }; '
+                  'draw; while read l; do echo "got:$l" >> out.txt; draw; done')
+        launch = Launch(["sh", "-c", script], {"FOREMIND_SESSION": self.name, "RULE": "─" * 80}, self.tmp)
         self.c.create(self.name, launch)
         with self.assertRaises(carriers.SessionExists):
             self.c.create(self.name, launch)
@@ -358,6 +384,8 @@ class TmuxCarrierIT(unittest.TestCase):
         self.assertIn(self.name, self.c.list_sessions())
         self.assertTrue(self.c.read_state(self.name).alive)
         self.assertIsNone(self.c.deliver(self.name, "hello world"))  # tmux cannot confirm
+        self.wait_for(lambda: (self.tmp / "out.txt").exists())  # drawn again: ready for the next one
+        self.wait_for(lambda: ready.classify(self.c.screen(self.name) or []) == "ready")
         self.c.deliver(self.name, "line a\nline b")
         out = self.tmp / "out.txt"
         self.wait_for(lambda: out.exists() and out.read_text().count("got:") == 3)
@@ -367,6 +395,20 @@ class TmuxCarrierIT(unittest.TestCase):
         self.assertNotIn(self.name, self.c.list_sessions())
         self.assertFalse(self.c.read_state(self.name).alive)
         self.assertEqual(self.c.close(self.name).how, "absent")
+
+    def test_dialog_gets_nothing(self):
+        # S1's trust dialog: Enter would pick "No, exit"
+        script = ('printf " Quick safety check: Is this a project you created or one you trust?\\n\\n ❯ No, exit\\n'
+                  '   Yes, I trust this folder\\n\\n Enter to confirm · Esc to cancel\\n"; '
+                  'read l; echo "got:$l" > out.txt; sleep 30')
+        self.c.create(self.name, Launch(["sh", "-c", script], {}, self.tmp))
+        self.wait_for(lambda: "No, exit" in "\n".join(self.c.screen(self.name) or []))
+        with self.assertRaises(ready.NotReady) as e:
+            self.c.deliver(self.name, "go")
+        self.assertIn("trust or permission dialog", str(e.exception))
+        time.sleep(0.5)
+        self.assertFalse((self.tmp / "out.txt").exists())
+        self.assertNotIn("go", "\n".join(self.c.screen(self.name)))
 
 
 if __name__ == "__main__":

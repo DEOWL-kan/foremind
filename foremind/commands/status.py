@@ -56,6 +56,7 @@ def report(root) -> str:
     for bid, h in batches:
         extra = f"（{h['blocked_reason']}）" if h.get("blocked_reason") else ""
         out.append(f"  {bid:<16} {h.get('state', 'planned')}{extra}  {h.get('title', '')}".rstrip())
+    out += _cached_starts(root, batches)
     st, rec = supervisor_state(root)
     out += _explain(root, st)
     beats = [hb for p in sorted((sd / "heartbeats").glob("*.json")) if (hb := _json(p))]
@@ -86,6 +87,41 @@ def report(root) -> str:
     out.append({"stopped": "监督进程未运行", "stale": f"监督进程代码旧于当前包（pid {rec.get('pid')}）",
                 "current": f"监督进程运行中（pid {rec.get('pid')}）"}[st])
     return "\n".join(out)
+
+
+def _reason(err) -> str:
+    """An error with git's words in it, on one line: its first line (what failed) and git's fatal: / error: lines when
+    it has them (a host's long `remote:` notes come before those), else all of it; the tail when still over 300
+    characters."""
+    lines = str(err).splitlines() or [""]
+    key = [ln for ln in lines[1:] if re.search(r"\b(fatal|error):", ln)]
+    text = " ".join(" ".join(lines[:1] + key if key else lines).split())
+    return text if len(text) <= 300 else "…" + text[-299:]
+
+
+def _cached_starts(root, batches) -> list[str]:
+    """REQ-7: worktrees of unfinished batches set up on a cached remote commit because the fetch failed
+    (seat_cached_start), the latest per batch, repo and upstream, with git's own error; and an unfinished batch whose
+    latest seat opening failed with an error (a fetch refused for want of a cache, say), with it. ponytail: a
+    read-only one a later fetch moved on stays listed (successful fetches are not recorded); record them if that
+    misleads."""
+    open_ = {bid for bid, h in batches if h.get("state", "planned") not in ready.FINISHED}
+    try:
+        evs = [e for e in handoff.history(root) if e.get("batch") in open_ and (
+            e["type"] in ("seat_cached_start", "seat_user") or e["type"] == "seat_open" and e["phase"] == "result")]
+    except (OSError, ValueError) as e:
+        return [f"Unverified remote starts: unknown (event log unreadable: {e})"]
+    latest = {(e["batch"], e.get("repo"), e.get("upstream")): e for e in evs if e["type"] == "seat_cached_start"}
+    rows = []
+    for (bid, rid, up), e in latest.items():
+        what = f"{rid} (read-only upstream {up})" if up else rid
+        rows.append(f"  {bid} {what}: {e.get('remote')} {e.get('ref')} at cached {e.get('sha')}, not verified "
+                    f"against the remote (fetch failed {e['ts']}: {_reason(e.get('error'))})")
+    out = ["Unverified remote starts (fetch failed, cached commit used):"] + rows if rows else []
+    last = {e["batch"]: e for e in evs if e["type"] != "seat_cached_start"}
+    failed = [f"  {bid} {e['ts']}: {_reason(e['error'])}" for bid, e in last.items()
+              if e["type"] == "seat_open" and not e.get("ok") and e.get("error")]
+    return out + (["Last seat opening failed:"] + failed if failed else [])
 
 
 def _processes(root) -> list[str]:
@@ -252,9 +288,27 @@ def _review_gate(t, bid) -> str | None:
             return None
     except (OSError, ValueError, AttributeError):
         return None
-    codes = {(t.result(e["dedupe_id"]) or {}).get("exit_code") for e in t.evs if e["type"] == "sv_gate"
-             and e["phase"] == "intent" and e.get("batch") == bid and e.get("round") == n}
-    return "failed" if 1 in codes else None if 0 in codes else "run"
+    runs = [e for e in t.evs if e["type"] == "sv_gate" and e["phase"] == "intent" and e.get("batch") == bid
+            and e.get("round") == n]
+    codes = {(t.result(e["dedupe_id"]) or {}).get("exit_code") for e in runs}
+    # m3a.9 (REQ-11): what tick._gate is at, in its order
+    if t.in_flight(bid, ("gate",)):
+        return "rerunning" if any(e.get("rerun") or e.get("explicit") for e in t.open_intents("sv_gate", batch=bid)) \
+            else "run"
+    if review.ci_wait(review.last_gate(t.evs, bid)):
+        return "ci_wait"
+    if 0 in codes or 1 not in codes:
+        return None if 0 in codes else "run"
+    held = [e for e in runs if t.result(f"gate_held:{e['dedupe_id']}")]
+    if held and not any(e.get("rerun") for e in runs) and \
+            not t.result(f"sv_say:gate_failed_late:{t.result('gate_held:' + held[0]['dedupe_id'])['job']}"):
+        return "held"
+    req = next((e for e in reversed(t.evs) if e["type"] == "gate_rerun_requested" and e.get("batch") == bid), None)
+    if req and req.get("round") == n and (review.last_gate(t.evs, bid) or {}).get("id") == req.get("gate") \
+            and not t.result(f"gate_rerun_refused:{req['id']}") \
+            and not any(e.get("request") == req["id"] for e in t.evs if e["type"] == "sv_gate"):  # r1: not started yet
+        return "queued"
+    return "failed"
 
 
 def _started(t, bid, st) -> tuple[str, str, str]:
@@ -282,8 +336,19 @@ def _started(t, bid, st) -> tuple[str, str, str]:
             return "监督进程", "开继任中", NONE
         return "监督进程", f"卡住，关闭 {x} 中", NONE
     if st == "in_review" and (g := _review_gate(t, bid)):
+        mins, last = tick.setting(t.cfg, "supervisor.gate_retry_min"), review.last_gate(t.evs, bid) or {}
+        failing = ", ".join(last.get("failing") or []) or "?"
         if g == "failed":
-            return f"席位 {s}" if s else "席位", "门禁未通过，改完再 foremind review", NONE
+            used = review.explicit_reruns(t.evs, bid, last.get("heads"))
+            spent = f"; requested reruns used {used} of {review.rerun_cap(t.cfg)}" if used else ""
+            return f"席位 {s}" if s else "席位", f"gate failed ({failing}){spent}: fix it, commit, foremind review", NONE
+        if g != "run":
+            return {"held": ("门禁", f"gate failed ({failing}); notice held, the automatic rerun goes first"),
+                    "queued": ("监督进程", f"gate rerun requested ({failing}); starts within {mins} min of the last "
+                                         "gate run"),
+                    "rerunning": ("门禁", "gate rerun running"),
+                    "ci_wait": ("CI", f"only waiting for CI ({failing}); the gate looks again every {mins} min")}[g] \
+                + (NONE,)
         st = "approved"
     if st == "blocked" and (qs := ready.blocking(bid, t.decisions)):  # all deciding, else waits() had them
         return "决策者", f"{'、'.join(qs)} 决策中", NONE

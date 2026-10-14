@@ -2,8 +2,12 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
+import foremind
 from foremind.install import tomlblock
 from foremind.supervisor import tick
 from foremind.vendors import claude
@@ -46,10 +50,33 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("全部通过", out)
 
+    def hooks_line(self, *words, fix=None):
+        """doctor fails on where the hooks run (REQ-6), naming `words`, with this CLI's upgrade commands (or `fix`)."""
+        rc, out = self.doctor()
+        self.assertEqual(rc, 1, out)
+        line = next((x for x in out.splitlines() if x.startswith(f"FAIL hooks in {self.settings} run this Foremind")),
+                    None)
+        self.assertIsNotNone(line, out)
+        for w in (*words, f"this CLI: {sys.executable}"):
+            self.assertIn(w, line)
+        got = out.split(line, 1)[1].splitlines()[1]
+        if fix:
+            self.assertIn(fix, got)
+        else:
+            self.assertIn(claude.foremind_command("upgrade", "--check"), got)
+            self.assertNotIn("init", got)
+        return out
+
+    def fix_of(self, check) -> str:
+        rc, out = self.doctor()
+        line = next((x for x in out.splitlines() if x.startswith(f"FAIL {check}")), None)
+        self.assertIsNotNone(line, out)
+        return out.split(line, 1)[1].splitlines()[1]
+
     def test_missing_interpreter(self):
         self.settings.write_text(self.settings.read_text().replace(sys.executable, "/nonexistent/python3"))
-        self.assert_fails("钩子解释器 /nonexistent/python3", "foremind init --yes")
-        self.assert_fails("钩子已装", "foremind init --yes")  # no longer the expected command either
+        out = self.hooks_line("interpreter /nonexistent/python3 not found")
+        self.assertNotIn("FAIL 钩子已装", out)  # one hook per event still: which Foremind they run is the line above
 
     def test_package_path_that_cannot_import_foremind(self):
         bad = self.env.tmp / "shadow"
@@ -57,14 +84,81 @@ class DoctorTest(unittest.TestCase):
         (bad / "foremind" / "__init__.py").write_text("raise ImportError('shadowed')\n")
         pkg = claude.foremind_command("x").split(" ", 1)[0].split("=", 1)[1]
         self.settings.write_text(self.settings.read_text().replace(f"PYTHONPATH={pkg}", f"PYTHONPATH={bad}"))
-        self.assert_fails("钩子能导入 foremind", "重装钩子")
+        self.hooks_line(f"PYTHONPATH {bad}", "cannot import foremind: ImportError: shadowed")
+        self.assertFalse(list(bad.rglob("__pycache__")))  # probed without writing bytecode
+
+    def test_a_pythonpath_gone_although_the_import_finds_this_package(self):  # r1: an installed wheel, say
+        pkg = claude.foremind_command("x").split(" ", 1)[0].split("=", 1)[1]
+        gone = self.env.tmp / "gone"
+        self.settings.write_text(self.settings.read_text().replace(f"PYTHONPATH={pkg}", f"PYTHONPATH={gone}:{pkg}"))
+        self.hooks_line(f"PYTHONPATH {gone}:{pkg} ({gone} gone)", f"this CLI: {sys.executable}, PYTHONPATH {pkg}, ")
+
+    def test_an_interpreter_that_does_not_know_P_is_older_than_3_11(self):  # r1
+        old = self.env.tmp / "python3.9"
+        old.write_text("#!/bin/sh\nprintf 'Unknown option: -P\\nTry python -h for more information.\\n' >&2\nexit 2\n")
+        old.chmod(0o755)
+        self.settings.write_text(self.settings.read_text().replace(sys.executable, str(old)))
+        self.hooks_line(f"interpreter {old} is Python older than 3.11 (it does not know -P); Foremind needs 3.11+")
+
+    def test_a_newer_manifest_s_hooks_are_its_own(self):  # r1: neither moved to this older CLI nor reinstalled over
+        m = next((self.root / ".foremind" / "install").glob("settings-*.json"))
+        m.write_text(json.dumps({**json.loads(m.read_text()), "format_version": 2}))
+        s = json.loads(self.settings.read_text().replace(sys.executable, "/newer/python"))
+        del s["hooks"]["StopFailure"]
+        self.settings.write_text(json.dumps(s))
+        rc, out = self.doctor()
+        self.assertEqual(rc, 1, out)
+        self.assertEqual([x for x in out.splitlines() if x.startswith("FAIL")],
+                         [f"FAIL install manifest {m.name}：{m}: install manifest format_version 2 is newer than this "
+                          "Foremind reads (1)"], out)
+        self.assertIn("use the Foremind that wrote it", out)
+        self.assertNotIn("upgrade --check", out)
+        self.assertNotIn("init", out)
 
     def test_hooks_without_P_are_shadowed_by_a_foremind_in_their_cwd(self):
         (self.root / "foremind").mkdir()
         (self.root / "foremind" / "__init__.py").write_text("raise ImportError('shadowed')\n")
         self.assertEqual(self.doctor()[0], 0)  # -P: the hooks' cwd does not matter
         self.settings.write_text(self.settings.read_text().replace(" -P -m foremind", " -m foremind"))
-        self.assert_fails("钩子能导入 foremind", "-P")
+        self.hooks_line("without -P", "cannot import foremind")
+        shutil.rmtree(self.root / "foremind")
+        self.hooks_line("without -P")  # imports now, still not the command this CLI writes
+
+    def test_a_line_of_another_shape_is_not_run(self):
+        mark = self.env.tmp / "ran"
+        self.settings.write_text(self.settings.read_text().replace(
+            "PYTHONPATH=", f"touch {mark}; PYTHONPATH=", 1))
+        self.hooks_line("is not a command line Foremind writes: not run", fix="check them and remove them yourself")
+        self.assertFalse(mark.exists())
+
+    def test_lines_no_manifest_records_are_not_moved(self):  # r1: upgrade moves only recorded entries
+        next((self.root / ".foremind" / "install").glob("settings-*.json")).unlink()
+        self.settings.write_text(self.settings.read_text().replace(sys.executable, "/nonexistent/python3"))
+        self.hooks_line("interpreter /nonexistent/python3 not found", fix="no install record covers these lines")
+
+    def test_consent_is_asked_only_for_the_project_s_status_line(self):  # r1, REQ-6
+        s = json.loads(self.settings.read_text())
+        s["hooks"]["Stop"].append(s["hooks"]["Stop"][0])  # a doubled hook
+        s["statusLine"] = {"type": "command", "command": "echo local"}
+        self.settings.write_text(json.dumps(s))
+        fix = self.fix_of(f"钩子已装 {self.settings}")
+        self.assertIn("foremind init --yes", fix)
+        self.assertNotIn("interactively", fix)
+        del s["statusLine"]
+        self.settings.write_text(json.dumps(s))
+        (self.root / ".claude" / "settings.json").write_text('{"statusLine": {"type": "command", "command": "x"}}')
+        self.assertIn("run foremind init interactively", self.fix_of(f"钩子已装 {self.settings}"))
+
+    def test_packaged_templates(self):  # REQ-1
+        rc, out = self.doctor()
+        self.assertIn(f"ok   packaged templates：{len(foremind.TEMPLATES)} readable", out)
+        with tempfile.TemporaryDirectory() as d, mock.patch("foremind.template_path", lambda n: Path(d) / n):
+            (Path(d) / "PROTOCOL.md").write_text(" \n")
+            self.assert_fails("packaged templates", "pip install --no-index --force-reinstall <wheel>")
+            rc, out = self.doctor()
+        line = next(x for x in out.splitlines() if x.startswith("FAIL packaged templates"))
+        self.assertIn("PROTOCOL.md is blank", line)
+        self.assertIn("roles/seat.md cannot be read", line)
 
     def test_tracked_settings(self):
         sh(self.root, "git", "add", "-f", ".claude/settings.local.json")

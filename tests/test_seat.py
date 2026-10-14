@@ -82,7 +82,9 @@ class FakeCarrier(Carrier):
         return list(self.created)
 
 
-class SeatTest(unittest.TestCase):
+class SeatBase(unittest.TestCase):
+    """Project with repos api and app, fake gh and carrier (test_offline_seat reuses it)."""
+
     def setUp(self):
         self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         bin_ = self.tmp / "bin"
@@ -153,6 +155,8 @@ class SeatTest(unittest.TestCase):
     def open(self, bid, **kw):
         return seat.open_seat(self.root, bid, carrier=self.carrier, **kw)
 
+
+class SeatTest(SeatBase):
     # --- fresh open --------------------------------------------------------
 
     def test_fresh_open_single_repo(self):

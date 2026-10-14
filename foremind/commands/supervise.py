@@ -7,7 +7,15 @@ command (GIT_SSH_COMMAND, else `git config --global --includes core.sshCommand`,
 `-o BatchMode=yes`. A repository-level core.sshCommand is overridden by it (the environment wins over git config):
 put that one in the global config or the environment. So is a per-directory one under `includeIf`: the one
 matching where the pass runs (if any) is used for every repository. `confirm-exit` is the user's: refused inside a Foremind
-session (§20 I52③)."""
+session (§20 I52③).
+
+REQ-5: `supervise` holds the project's shared admission (upgrade.admitted) for its whole life, from before it writes
+supervisor.json: it does not start while the project is blocked, and `foremind upgrade` cannot run beside it. A re-exec
+carries the same lock descriptor over (job.ADMISSION_FD), so there is no moment without it; it is refused (the old
+code goes on) while the project is blocked, checked before the try run and again before exec, and the try run
+(`supervise --try`) is the new code taking admission itself: new code that would refuse to start is not switched to.
+The successor job (_successor) takes admission of its own: it does not go through `foremind`."""
+import argparse
 import contextlib
 import json
 import os
@@ -17,7 +25,7 @@ import sys
 import time
 from datetime import datetime
 
-from foremind import carriers, cli, config, lock, review, seat, worktree
+from foremind import carriers, cli, config, job, lock, review, seat, upgrade, worktree
 from foremind import notify as notifier
 from foremind.defaults import TABLE
 from foremind.events import EventLog
@@ -26,13 +34,15 @@ from foremind.paths import ProjectNotFound, find_project_root, state_dir
 from foremind.supervisor import tick as sv
 
 _ERRORS = (OSError, ProjectNotFound, ValueError, config.ConfigError, seat.SeatError)
-TRY = ("supervise", "--help")  # _reexec's try run
+TRY = ("supervise", "--try")  # _reexec's try run
 
 
 def register(sub):
     sub.add_parser("tick", help="one supervisor pass (what `supervise` repeats)").set_defaults(func=_tick)
-    sub.add_parser("supervise", help="run the supervisor in the foreground, a tick every supervisor.tick_s "
-                                     "seconds").set_defaults(func=_supervise)
+    p = sub.add_parser("supervise", help="run the supervisor in the foreground, a tick every supervisor.tick_s "
+                                         "seconds")
+    p.add_argument("--try", dest="try_run", action="store_true", help=argparse.SUPPRESS)  # _reexec's try run
+    p.set_defaults(func=_supervise)
     sub.add_parser("pause", help="pause every automatic action of this project").set_defaults(func=_pause, on=True)
     sub.add_parser("resume", help="undo `foremind pause`").set_defaults(func=_pause, on=False)
     p = sub.add_parser("run", help="start these batches now (dependencies, decisions, quota, locks still apply)")
@@ -83,13 +93,27 @@ def _tick(args):
 
 def _supervise(args):
     """Finding 23: records itself in supervisor.json; once the package's code changed and then held still for one
-    interval, tries the new code (`foremind supervise --help`, 30 s: it imports this module and the tick; the cli
-    skips a module that does not import) and re-executes itself on it (`supervisor_reexec`), else keeps the old code
+    interval, tries the new code (`foremind supervise --try`, 30 s: it imports this module and the tick, the cli
+    skipping a module that does not import, and takes admission) and re-executes itself on it (`supervisor_reexec`), else keeps the old code
     (`supervisor_reexec_failed`, one notice per new fingerprint)."""
     try:
         root = find_project_root()
     except ProjectNotFound as e:
         return _fail("supervise", e)
+    try_run = getattr(args, "try_run", False)
+    inherited = None if try_run else os.environ.pop(job.ADMISSION_FD, None)  # a re-exec's lock, not passed on
+    try:
+        with upgrade.admitted(root, None if inherited is None else int(inherited)) as fd:
+            if try_run:
+                return 0
+            if fd is not None:
+                os.set_inheritable(fd, False)  # until a re-exec
+            return _loop(root, fd)
+    except (upgrade.Blocked, OSError, ValueError) as e:
+        return _fail("supervise", e)
+
+
+def _loop(root, fd):
     env = dict(os.environ)  # as started: _unattended adds to GIT_SSH_COMMAND
     env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(filter(None, [str(sv.PKG_PARENT),
                                                                     *env.get("PYTHONPATH", "").split(os.pathsep)])))
@@ -109,7 +133,7 @@ def _supervise(args):
             try:
                 if (now := sv.code_fingerprint()) != code and now == seen and now != failed:  # after each sleep
                     failed = now
-                    _reexec(root, argv, env, code, now)  # returns only when the new code does not run
+                    _reexec(root, argv, env, code, now, fd)  # returns only when the new code does not run
                 seen = now
                 sv.tick(root)
                 interval = sv.setting(config.load(root), "supervisor.tick_s")
@@ -120,24 +144,33 @@ def _supervise(args):
         return 0
 
 
-def _reexec(root, argv, env, frm, to):
+def _reexec(root, argv, env, frm, to, fd=None):
     log = EventLog(state_dir(root) / "events.jsonl")
-    try:
-        r = subprocess.run(sv.fm(*TRY), env=env, cwd=root, capture_output=True, text=True, timeout=30,
-                           stdin=subprocess.DEVNULL)
-        lines = r.stderr.strip().splitlines() or [""]  # the cli's skip line says more than argparse's invalid choice
-        err = None if r.returncode == 0 else (next((x for x in lines if x.startswith(cli.SKIPPED)), lines[-1])
-                                              or f"exit {r.returncode}")
-    except (OSError, subprocess.SubprocessError) as e:
-        err = str(e)
+    err = upgrade.blocked(root)  # REQ-5: not while the project is blocked
+    if err is None:
+        try:
+            r = subprocess.run(sv.fm(*TRY), env=env, cwd=root, capture_output=True, text=True, timeout=30,
+                               stdin=subprocess.DEVNULL)
+            lines = r.stderr.strip().splitlines() or [""]  # the cli's skip line says more than argparse's choice error
+            err = None if r.returncode == 0 else (next((x for x in lines if x.startswith(cli.SKIPPED)), lines[-1])
+                                                  or f"exit {r.returncode}")
+        except (OSError, subprocess.SubprocessError) as e:
+            err = str(e)
+    if err is None:
+        err = upgrade.blocked(root)  # again, right before the switch
     if err is None:
         log.append("supervisor_reexec", **{"from": frm, "to": to})
         print(f"foremind supervise: new code ({to}), re-executing", file=sys.stderr)
         sys.stdout.flush()  # a pipe's buffer does not survive exec
         try:
+            if fd is not None:  # the same lock goes on in the new code: no gap
+                os.set_inheritable(fd, True)
+                env = {**env, job.ADMISSION_FD: str(fd)}
             os.execve(sys.executable, argv, env)
         except OSError as e:
             err = f"exec: {e}"
+            if fd is not None:
+                os.set_inheritable(fd, False)
     log.append("supervisor_reexec_failed", **{"from": frm, "to": to}, error=err[-300:])
     print(f"foremind supervise: new code does not run, keeping the old one: {err}", file=sys.stderr)
     with contextlib.suppress(config.ConfigError, ValueError):  # a bad config: the tick records it
@@ -188,10 +221,12 @@ def _confirm_exit(args):
 def _successor(batch) -> int:
     try:
         root = find_project_root()
-        cfg = config.load(root, config.task_layer(seat.read_header(root, batch)))  # as `foremind seat` does
-        res = seat.open_seat(root, batch, carrier=carriers.get(seat.setting(cfg, "carrier.kind"), root, cfg),
-                             successor=True)
-    except (*_ERRORS, lock.LockError, worktree.WorktreeError, carriers.CarrierError, NotImplementedError) as e:
+        with upgrade.admitted(root):  # REQ-5: this entry is not `foremind`'s, so it takes admission itself
+            cfg = config.load(root, config.task_layer(seat.read_header(root, batch)))  # as `foremind seat` does
+            res = seat.open_seat(root, batch, carrier=carriers.get(seat.setting(cfg, "carrier.kind"), root, cfg),
+                                 successor=True)
+    except (*_ERRORS, upgrade.Blocked, lock.LockError, worktree.WorktreeError, carriers.CarrierError,
+            NotImplementedError) as e:
         return _fail("successor", e)
     if not res["ok"]:
         return _fail("successor", f"{batch}: " + "; ".join(res["problems"]))

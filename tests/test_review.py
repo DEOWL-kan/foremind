@@ -4,16 +4,41 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+import foremind
 from foremind import acceptance, batchlog, delivery, gate, inbox, lock, oneshot, review, schemas, seat, worktree
 from foremind import header as hdr
 from foremind.cli import main
 from foremind.fsutil import sha256_bytes
 from foremind.paths import state_dir
 from test_gate_fixture import APPROVED, Project, sh
+
+# m3a.9 (REQ-11, L365): no test here reads the user's own layer. Project points FOREMIND_CONFIG_HOME (config, quota,
+# registered projects' telemetry) at its temp dir; setUpModule does for the tests without one, and hides a real codex
+# from shutil.which (reviewer() picks codex by it). UserLayerTest checks a whole review opens none of REAL.
+REAL = tuple(os.path.join(os.path.expanduser("~"), d) for d in (".config/foremind", ".claude", ".codex"))
+_opened = None  # paths under REAL opened while a list (an audit hook stays for the process)
+
+
+def _audit(event, args):
+    if _opened is not None and event == "open" and args and isinstance(args[0], (str, bytes, os.PathLike)) \
+            and os.fsdecode(args[0]).startswith(REAL):
+        _opened.append(os.fsdecode(args[0]))
+
+
+def setUpModule():
+    sys.addaudithook(_audit)
+    home = tempfile.mkdtemp()
+    unittest.addModuleCleanup(shutil.rmtree, home, ignore_errors=True)
+    which = shutil.which  # r1: only codex is hidden; PATH (git, gh) stays as it is
+    for p in (mock.patch.dict(os.environ, {"FOREMIND_CONFIG_HOME": home}),
+              mock.patch.object(shutil, "which", lambda name, *a, **k: None if name == "codex" else which(name, *a, **k))):
+        p.start()
+        unittest.addModuleCleanup(p.stop)
 
 
 def cli(argv):
@@ -195,6 +220,28 @@ class ReviewerTest(unittest.TestCase):
         self.assertEqual((mat / "goal.md").read_text(), "REQ-1: 冻结目标\n")
         self.assertIn("./api/", (mat / "prompt.md").read_text())
         self.assertIn("+x = 1", (mat / "api.diff").read_text())
+        self.assertIn(foremind.template("roles/reviewer.md"), (mat / "prompt.md").read_text())  # REQ-1: in full
+
+    def test_unusable_card_starts_no_reviewer(self):
+        """REQ-1: a missing, blank or unreadable packaged reviewer card fails the start; no one-line stand-in."""
+        p = Project(self)
+        p.batch()
+        p.commit()
+        review.request(p.root, "shop.1", p.cfg, session="fm-shop-shop.1-1")
+        calls = len(p.claude_calls())
+        with tempfile.TemporaryDirectory() as d:
+            fake = Path(d, "reviewer.md")
+            for data in (None, b"\n \n", b"\xff\xfe"):
+                fake.unlink(missing_ok=True)
+                if data is not None:
+                    fake.write_bytes(data)
+                with self.subTest(data=data), mock.patch("foremind.template_path", lambda n: fake):
+                    self.assertRaisesRegex(review.FlowError, "packaged template", review.start, p.root, "shop.1",
+                                           p.cfg)
+        self.assertEqual(p.state(), "review_ready")
+        self.assertEqual(p.events("review_started"), [])
+        self.assertEqual(len(p.claude_calls()), calls)
+        self.assertFalse(any((state_dir(p.root) / "reviews").glob("*/prompt.md")))
 
     def test_reviewer_reads_a_checkout_of_the_requested_heads(self):
         p = Project(self)
@@ -695,6 +742,31 @@ def result(out=APPROVED, usd=1.0, **kw):
             "total_cost_usd": usd, "usage": {"input_tokens": 10, "output_tokens": 5}, "num_turns": 3, **kw}
 
 
+class OneshotCardTest(unittest.TestCase):  # REQ-1
+    def test_prompt_carries_the_packaged_card(self):
+        p = Project(self)
+        for role in ("decider", "auditor", "cataloger", "controller"):
+            with self.subTest(role=role):
+                session, _, env = oneshot.prepare(p.root, role, p.cfg, {"facts.json": {"a": 1}})
+                prompt = (state_dir(p.root) / "oneshots" / session / "prompt.md").read_text(encoding="utf-8")
+                self.assertTrue(prompt.startswith(foremind.template(f"roles/{role}.md") + "\n\n## 材料"))
+                self.assertEqual(env["FOREMIND_ROLE"], role)
+
+    def test_unusable_card_prepares_nothing(self):
+        p = Project(self)
+        with tempfile.TemporaryDirectory() as d:
+            fake = Path(d, "card.md")
+            for data in (None, b"\t\n", b"\xff"):
+                fake.unlink(missing_ok=True)
+                if data is not None:
+                    fake.write_bytes(data)
+                with self.subTest(data=data), mock.patch("foremind.template_path", lambda n: fake):
+                    self.assertRaisesRegex(ValueError, "packaged template", oneshot.prepare, p.root, "decider", p.cfg,
+                                           {"facts.json": {}})
+        self.assertFalse((state_dir(p.root) / "oneshots").exists())
+        self.assertRaisesRegex(ValueError, "cannot be read", oneshot.prepare, p.root, "nobody", p.cfg, {})
+
+
 class CostTest(unittest.TestCase):  # REQ-13
     def test_argv_flags_only_when_configured(self):
         p = Project(self)
@@ -860,6 +932,62 @@ class TokenCapTest(unittest.TestCase):  # m2e REQ-2
         self.assertEqual((ab["quota_start"], p.events("ab_review")[-1]["quota_end"]), (both, both))
         (tel / "s.statusline.json").unlink()
         self.assertEqual(review.reading(p.root, p.cfg), {"five_hour_pct": None, "seven_day_pct": None, "ts": None})
+
+
+class UserLayerTest(unittest.TestCase):  # m3a.9 REQ-11 (L365)
+    def test_a_review_reads_no_real_user_layer(self):
+        global _opened
+        p = Project(self)
+        raw_claude(p)
+        p.batch()
+        p.commit()
+        self.assertIsNone(shutil.which("codex"))
+        _opened = []
+        try:
+            p.run_review(result(CHANGES))
+        finally:
+            opened, _opened = _opened, None
+        self.assertEqual(opened, [])
+        none = {"five_hour_pct": None, "seven_day_pct": None, "ts": None}  # no telemetry injected: none read
+        self.assertEqual(p.events("review_started")[-1]["quota_start"], none)
+        self.assertEqual(p.events("review_receipt")[-1]["quota_end"], none)
+
+
+class GateRerunRequestTest(unittest.TestCase):  # m3a.9 REQ-11
+    def test_same_heads_after_a_local_gate_failure(self):
+        p = Project(self)
+        p.batch()
+        head = p.commit()
+        p.run_review()
+        self.assertEqual(p.state(), "in_review")
+        out = review.request(p.root, "shop.1", p.cfg, session="fm-shop-shop.1-1")
+        self.assertEqual((out["unchanged"], "gate_rerun" in out), (True, False), "no gate answer yet")
+        review.events(p.root).append("gate_result", batch="shop.1", heads={"api": head}, verdict="fail",
+                                     failing=["acceptance"], pending=[], path="g.json")
+        for _ in range(2):
+            out = review.request(p.root, "shop.1", p.cfg, session="fm-shop-shop.1-1")
+            self.assertEqual(out, {"state": "in_review", "heads": {"api": head}, "prs": {}, "unchanged": True,
+                                   "gate_rerun": {"used": 0, "limit": 2, "failing": ["acceptance"]}})
+        [req] = p.events("gate_rerun_requested")
+        self.assertEqual((req["round"], req["heads"], req["failing"]), (1, {"api": head}, ["acceptance"]))
+        self.assertEqual((len(p.events("review_started")), p.state()), (1, "in_review"), "no model review")
+        log = review.events(p.root)
+        for i in range(2):
+            req = p.events("gate_rerun_requested")[-1]
+            did = f"sv_gate:x{i}"
+            log.append("sv_gate", phase="intent", dedupe_id=did, batch="shop.1", explicit=True, heads={"api": head},
+                       request=req["id"])
+            out = review.request(p.root, "shop.1", p.cfg)["gate_rerun"]  # r1: running, the last one too: no refusal
+            self.assertEqual((out["used"], out.get("running")), (i + 1, True))
+            log.append("sv_gate", dedupe_id=did, batch="shop.1", ok=False, exit_code=2)  # no answer: spent
+            if i == 0:
+                self.assertEqual(review.request(p.root, "shop.1", p.cfg)["gate_rerun"]["used"], 1)
+                self.assertEqual(len(p.events("gate_rerun_requested")), 2, "a new request for the same failure")
+        p.cfg["supervisor.seat_retries"] = 3  # r1: the batch's task layer does not raise the cap
+        with self.assertRaisesRegex(review.FlowError, r"2 of 2 times .* fails acceptance \(see g.json\)"):
+            review.request(p.root, "shop.1", p.cfg)
+        (p.root / "foremind.toml").write_text("[supervisor]\nseat_retries = 3\n")  # the project's does
+        self.assertEqual(review.request(p.root, "shop.1", p.cfg)["gate_rerun"]["limit"], 3)
 
 
 class RunTest(unittest.TestCase):
